@@ -12,7 +12,7 @@ wk — a tmux-based workspace manager modeled on Conductor / Superset.
 Each workspace is:
   - a git worktree on its own branch
   - a tmux session of the same name
-  - a 3-pane layout: Claude Code | files | shell
+  - a 5-pane layout: (sidebar over shell) | Claude Code | (lazygit over terminal)
 """
 
 from __future__ import annotations
@@ -56,6 +56,11 @@ DASHBOARD_SESSION = "wk-dashboard"
 
 # Default base branch for new worktrees.
 DEFAULT_BASE = "origin/main"
+
+# Marker directory placed in each wk-managed worktree. Its presence
+# distinguishes wk workspaces from worktrees created directly with
+# `git worktree add`, so the sidebar can show only what wk owns.
+WK_MARKER_DIR = ".wk"
 
 
 # ---------------------------------------------------------------------------
@@ -143,7 +148,8 @@ class Workspace:
 def list_worktrees() -> list[tuple[str, Path]]:
     """Parse `git worktree list --porcelain`. Returns (branch, path) pairs.
 
-    Skips the main checkout and detached HEADs.
+    Skips the main checkout and detached HEADs. Includes every worktree
+    git knows about — use `list_wk_worktrees()` to filter to wk-owned ones.
     """
     out = run(["git", "worktree", "list", "--porcelain"]).stdout
     main = repo_root()
@@ -165,11 +171,75 @@ def list_worktrees() -> list[tuple[str, Path]]:
     return results
 
 
+def is_wk_workspace(
+    branch: str,
+    path: Path,
+    wk_sessions: Optional[set[str]] = None,
+) -> bool:
+    """Worktree is a wk workspace if it has a .wk/ marker OR a wk-tagged
+    tmux session is currently running for it.
+
+    "wk-tagged" means the session has the `@wk` user option set, which
+    `build_session` does. A plain tmux session that happens to share the
+    branch name does NOT make the worktree a wk workspace.
+
+    The session check covers worktrees created with `wk open` before the
+    marker existed — they show up in the sidebar as long as the session is
+    alive, and get marked permanently next time `build_session` runs.
+    """
+    if (path / WK_MARKER_DIR).is_dir():
+        return True
+    if wk_sessions is None:
+        return False
+    return session_name(branch) in wk_sessions
+
+
+def list_wk_worktrees() -> list[tuple[str, Path]]:
+    """Like `list_worktrees`, but only worktrees wk owns (marker or wk session)."""
+    wk_sessions = wk_tmux_sessions()
+    return [
+        (b, p) for b, p in list_worktrees()
+        if is_wk_workspace(b, p, wk_sessions)
+    ]
+
+
+def mark_wk_workspace(path: Path) -> None:
+    """Create the .wk/ marker (idempotent). Also writes a .gitignore inside
+    so the marker dir doesn't end up tracked in the worktree's git history."""
+    marker = path / WK_MARKER_DIR
+    marker.mkdir(exist_ok=True)
+    gi = marker / ".gitignore"
+    if not gi.exists():
+        gi.write_text("*\n!.gitignore\n", encoding="utf-8")
+
+
 def tmux_sessions() -> set[str]:
     r = run(["tmux", "ls", "-F", "#{session_name}"], check=False)
     if r.returncode != 0:
         return set()
     return {line.strip() for line in r.stdout.splitlines() if line.strip()}
+
+
+def wk_tmux_sessions() -> set[str]:
+    """Only sessions that wk created (have the `@wk` user option set).
+
+    Distinguishes a wk-managed session from a plain tmux session that
+    happens to share a name with a git branch.
+    """
+    r = run(
+        ["tmux", "ls", "-F", "#{session_name}\t#{@wk}"],
+        check=False,
+    )
+    if r.returncode != 0:
+        return set()
+    out: set[str] = set()
+    for line in r.stdout.splitlines():
+        if "\t" not in line:
+            continue
+        name, marker = line.split("\t", 1)
+        if marker.strip() == "1":
+            out.add(name.strip())
+    return out
 
 
 def workspace_status(branch: str, path: Path, sessions: set[str]) -> Workspace:
@@ -201,8 +271,10 @@ def workspace_status(branch: str, path: Path, sessions: set[str]) -> Workspace:
 
 
 def all_workspaces() -> list[Workspace]:
-    sessions = tmux_sessions()
-    return [workspace_status(b, p, sessions) for b, p in list_worktrees()]
+    # Use wk-only sessions so `has_session` reflects "wk session is running",
+    # not "any tmux session with this name exists".
+    sessions = wk_tmux_sessions()
+    return [workspace_status(b, p, sessions) for b, p in list_wk_worktrees()]
 
 
 def in_tmux() -> bool:
@@ -222,60 +294,77 @@ def attach_or_switch(session: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-FILES_CMD = (
-    # Best-effort: prefer eza, fall back to ls. Loop refreshes every 2s.
-    "while true; do clear; "
-    "(command -v eza >/dev/null && eza --tree --level=2 --git-ignore --color=always) "
-    '|| ls -la; echo; echo "── git status ──"; git status -sb; sleep 2; done'
-)
-
-
 def _wk_bin() -> str:
     """Path to this script for sub-invocations from tmux panes."""
     return shutil.which("wk") or os.path.abspath(sys.argv[0])
 
 
 def _shell_wrap(cmd: str) -> list[str]:
-    """Wrap a command in the user's preferred shell for tmux."""
-    if shutil.which("fish"):
-        return ["fish", "-c", cmd]
+    """Wrap a synthetic command for tmux. Always sh — these strings are sh
+    syntax (loops, inline env vars, `&&`/`||` between subshells), which fish
+    won't parse. Interactive panes inherit the user's default shell elsewhere."""
     return ["sh", "-c", cmd]
 
 
-# Target widths (cols) and proportions for the 4-pane Conductor layout.
-# Tuned for ~290-col widescreen tmux windows (UWQHD 3440px).
-SIDEBAR_COLS = 32
-RIGHT_COL_COLS = 100  # files + shell column
-FILES_PCT = 55  # files pane gets 55% of the right column's height
+# Target widths (cols) and height percentages for the 5-pane layout.
+# Tuned for ~290-col widescreen tmux windows (UWQHD 3440px); tmux scales
+# proportionally when attached to a smaller terminal.
+LEFT_COL_COLS = 42      # sidebar + shell column
+RIGHT_COL_COLS = 75     # lazygit + terminal column
+SIDEBAR_PCT = 20        # sidebar gets this percent of left col height
+LAZYGIT_PCT = 60        # lazygit gets this percent of right col height
+
+
+# sh command that launches lazygit with wk's narrow-pane config if it exists,
+# otherwise plain lazygit. If lazygit isn't installed, falls back to a shell.
+LAZYGIT_CMD = (
+    'WK_LG_CFG="${XDG_CONFIG_HOME:-$HOME/.config}/wk/lazygit.yml"; '
+    "if command -v lazygit >/dev/null; then "
+    '  if [ -f "$WK_LG_CFG" ]; then exec lazygit -ucf "$WK_LG_CFG"; '
+    "  else exec lazygit; fi; "
+    "else "
+    '  echo "lazygit not installed — install it or use the terminal pane"; '
+    "  exec ${SHELL:-sh}; "
+    "fi"
+)
 
 
 def build_session(session: str, wt: Path, agent: str) -> None:
-    """Create a detached session with the 4-pane sidebar layout.
+    """Create a detached session with the 5-pane layout.
 
     Panes are 1-indexed (matches user's `pane-base-index 1` tmux setting):
 
-        ┌──────────┬─────────────────────────┬──────────────┐
-        │ sidebar  │   agent (Claude Code)   │   files      │
-        │ pane 1   │   pane 2                │   pane 3     │
-        │          │                         ├──────────────┤
-        │          │                         │   shell      │
-        │          │                         │   pane 4     │
-        └──────────┴─────────────────────────┴──────────────┘
+        ┌──────────┬──────────────────────────┬──────────────────┐
+        │ sidebar  │                          │   lazygit        │
+        │ pane.1   │                          │   pane.3         │
+        ├──────────┤   agent (Claude Code)    ├──────────────────┤
+        │          │   pane.2                 │                  │
+        │ shell    │                          │   terminal       │
+        │ pane.4   │                          │   pane.5         │
+        └──────────┴──────────────────────────┴──────────────────┘
     """
     wk = _wk_bin()
     total_cols = 290
 
-    # Pane 1: sidebar (initial pane). Starts with `wk sidebar` running.
-    run(
+    # Mark this worktree as a wk workspace before we touch tmux — the sidebar
+    # filters on this, and `wk task` may also write its own files under .wk/.
+    mark_wk_workspace(wt)
+
+    # Sidebar (initial pane). Starts with `wk sidebar` running.
+    # `-P -F #{pane_id}` prints the new pane's stable `%NN` id; we use that
+    # for subsequent splits instead of numeric indices, which tmux renumbers
+    # via tree-traversal order whenever the layout changes.
+    sidebar_id = run(
         [
             "tmux", "new-session", "-d",
             "-s", session,
             "-c", str(wt),
             "-x", str(total_cols), "-y", "75",  # reshaped on attach
             "-n", "work",
+            "-P", "-F", "#{pane_id}",
             *_shell_wrap(f"WK_CURRENT={session} {wk} sidebar"),
         ]
-    )
+    ).stdout.strip()
 
     # Tag the session as wk-managed so tmux-resurrect filters and other tools
     # can identify it. Stored as a tmux user option (`@wk`), readable via
@@ -284,43 +373,54 @@ def build_session(session: str, wt: Path, agent: str) -> None:
     run(["tmux", "set-option", "-t", session, "@wk-branch", session])  # branch name
     run(["tmux", "set-option", "-t", session, "@wk-path", str(wt)])
 
-    # Pane 2: agent. Split right of sidebar; new pane takes the remaining
-    # width (everything except the sidebar's 32 cols).
-    agent_width = total_cols - SIDEBAR_COLS
-    run(
+    # Agent. Split right of sidebar; new pane takes everything except the
+    # left column.
+    agent_width = total_cols - LEFT_COL_COLS
+    agent_id = run(
         [
             "tmux", "split-window", "-h",
-            "-t", f"{session}:work.1",
+            "-t", sidebar_id,
             "-c", str(wt),
             "-l", str(agent_width),
+            "-P", "-F", "#{pane_id}",
             agent,
         ]
-    )
+    ).stdout.strip()
 
-    # Pane 3: files. Split right of agent; new pane takes RIGHT_COL_COLS,
-    # leaving the agent pane with the rest of its prior width.
-    run(
+    # Lazygit — right column, top. Split right of agent.
+    lazygit_id = run(
         [
             "tmux", "split-window", "-h",
-            "-t", f"{session}:work.2",
+            "-t", agent_id,
             "-c", str(wt),
             "-l", str(RIGHT_COL_COLS),
-            *_shell_wrap(FILES_CMD),
+            "-P", "-F", "#{pane_id}",
+            *_shell_wrap(LAZYGIT_CMD),
         ]
-    )
+    ).stdout.strip()
 
-    # Pane 4: shell. Split below files.
+    # Shell — left column, bottom. Split below sidebar.
     run(
         [
             "tmux", "split-window", "-v",
-            "-t", f"{session}:work.3",
+            "-t", sidebar_id,
             "-c", str(wt),
-            "-p", str(100 - FILES_PCT),
+            "-l", f"{100 - SIDEBAR_PCT}%",
+        ]
+    )
+
+    # Terminal — right column, bottom. Split below lazygit.
+    run(
+        [
+            "tmux", "split-window", "-v",
+            "-t", lazygit_id,
+            "-c", str(wt),
+            "-l", f"{100 - LAZYGIT_PCT}%",
         ]
     )
 
     # Land in the agent pane on attach.
-    run(["tmux", "select-pane", "-t", f"{session}:work.2"])
+    run(["tmux", "select-pane", "-t", agent_id])
 
 
 import json
@@ -698,13 +798,10 @@ def task(
 
     # Write the task file. This is the durable record of what the workspace
     # is for, surfaced in the sidebar and readable by `claude` later.
-    wk_dir = wt / ".wk"
-    wk_dir.mkdir(exist_ok=True)
-    task_file = wk_dir / "task.md"
+    # `mark_wk_workspace` creates the .wk/ dir and its .gitignore.
+    mark_wk_workspace(wt)
+    task_file = wt / WK_MARKER_DIR / "task.md"
     task_file.write_text(prompt.strip() + "\n", encoding="utf-8")
-    # And a .gitignore inside .wk so the task notes don't accidentally
-    # land in commits.
-    (wk_dir / ".gitignore").write_text("*\n!.gitignore\n", encoding="utf-8")
 
     # Build the session. Agent command depends on --auto.
     if auto:
@@ -869,7 +966,16 @@ def switch(
             for w in workspaces
         ]
         proc = subprocess.run(
-            ["fzf", "--with-nth=1..", "--delimiter=\t", "--prompt=workspace> "],
+            [
+                "fzf",
+                "--with-nth=1..",
+                "--delimiter=\t",
+                "--prompt=workspace> ",
+                "--disabled",
+                "--bind=j:down,k:up,g:first,G:last",
+                "--bind=/:unbind(j,k,g,G)+enable-search+clear-query",
+                "--bind=esc:rebind(j,k,g,G)+disable-search",
+            ],
             input="\n".join(lines),
             text=True,
             capture_output=True,
@@ -987,7 +1093,7 @@ def sidebar() -> None:
             ab = f"+{w.ahead}/-{w.behind}" if (w.ahead or w.behind) else " "
             status = "✱" if w.dirty else " "
             # session\tdisplay
-            display = f"{marker} {w.branch[:18]:<18} {ab:>8} {status}"
+            display = f"{marker} {w.branch[:24]:<24} {ab:>8} {status}"
             lines.append(f"{w.session}\t{display}")
 
         # fzf in "loop" mode: returns selected session name on Enter, exits on Esc.
@@ -996,15 +1102,27 @@ def sidebar() -> None:
         proc = subprocess.run(
             [
                 "fzf",
-                "--with-nth=2..",
+                "--with-nth=2",
                 "--delimiter=\t",
                 "--no-info",
                 "--no-scrollbar",
                 "--prompt=workspaces❯ ",
-                "--header=enter=switch  ctrl-n=new  ctrl-d=rm",
+                "--header=enter=switch  j/k=move  g/G=top/bot  /=filter  ctrl-n=new  ctrl-d=rm  ctrl-p=preview",
                 "--reverse",
                 "--height=100%",
                 "--cycle",
+                # Preview shows task + recent commits + status for the
+                # highlighted workspace. Hidden by default to keep the sidebar
+                # readable in the narrow pane; ctrl-p toggles it open.
+                f"--preview={wk} _preview {{1}}",
+                "--preview-window=right:60%:hidden:wrap",
+                "--bind=ctrl-p:toggle-preview",
+                # Disable type-to-filter; bind j/k/g/G for vim-style nav.
+                # `/` enters filter mode; Esc returns to nav mode.
+                "--disabled",
+                "--bind=j:down,k:up,g:first,G:last",
+                "--bind=/:unbind(j,k,g,G)+enable-search+clear-query",
+                "--bind=esc:rebind(j,k,g,G)+disable-search",
                 # Ctrl-N prompts for a new branch (via tmux) and creates it
                 f"--bind=ctrl-n:execute(tmux command-prompt -p 'new branch:' 'run-shell \"{wk} new %%\"')+abort",
                 # Ctrl-D removes the highlighted workspace (force)
@@ -1037,8 +1155,51 @@ def list_once() -> None:
         marker = "▶" if w.session == current else (" " if w.has_session else "·")
         ab = f"+{w.ahead}/-{w.behind}" if (w.ahead or w.behind) else " "
         status = "✱" if w.dirty else " "
-        display = f"{marker} {w.branch[:18]:<18} {ab:>8} {status}"
+        display = f"{marker} {w.branch[:24]:<24} {ab:>8} {status}"
         print(f"{w.session}\t{display}")
+
+
+@app.command("_preview", hidden=True)
+def preview(session: str = typer.Argument(...)) -> None:
+    """Internal: render the sidebar preview pane for SESSION.
+
+    Shows the task prompt (if any), recent commits, and `git status` for
+    the worktree associated with SESSION. Designed to be invoked by fzf's
+    --preview, so output is plain text + ANSI color (no Rich markup).
+    """
+    target = next(
+        (w for w in all_workspaces() if w.session == session),
+        None,
+    )
+    if target is None:
+        print(f"(no workspace for {session!r})")
+        return
+
+    p = target.path
+    print(f"\033[1m{target.branch}\033[0m  ({p})")
+    print(f"+{target.ahead}/-{target.behind}  {'dirty' if target.dirty else 'clean'}"
+          f"  {'session running' if target.has_session else 'no session'}")
+    print()
+
+    task_file = p / WK_MARKER_DIR / "task.md"
+    if task_file.exists():
+        print("\033[1m── task ──\033[0m")
+        try:
+            print(task_file.read_text(encoding="utf-8").strip())
+        except OSError:
+            pass
+        print()
+
+    print("\033[1m── recent commits ──\033[0m")
+    subprocess.run(
+        ["git", "-C", str(p), "log", "--color=always",
+         "--pretty=format:%C(auto)%h %s %C(dim)(%ar)%C(reset)", "-15"],
+        check=False,
+    )
+    print()
+    print()
+    print("\033[1m── git status ──\033[0m")
+    subprocess.run(["git", "-C", str(p), "status", "-sb"], check=False)
 
 
 @app.command()

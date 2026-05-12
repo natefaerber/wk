@@ -1,0 +1,39 @@
+# lazygit config for wk's narrow side pane (~100 cols).
+# Installed by ./install.sh to ~/.config/wk/lazygit.yml.
+# wk launches lazygit with `-ucf` so it picks up this file instead of
+# your global ~/.config/lazygit/config.yml.
+
+gui:
+  # Lazygit lives in a ~42-col-wide pane below the wk sidebar. Portrait
+  # mode (always) stacks panels vertically; half screenMode focuses the
+  # active panel so neighboring panels collapse to titles — the only
+  # built-in way to "hide" Status / Local Branches when you're not using
+  # them. Press `+` / `_` to cycle screen modes if you want all panels back.
+  portraitMode: always
+  screenMode: half
+
+  # In half/full screen mode, put the enlarged side panel on TOP and the
+  # main (diff/preview) panel BELOW it, rather than side-by-side.
+  enlargedSideViewLocation: top
+
+  # Stack diff above status when a panel is expanded.
+  mainPanelSplitMode: horizontal
+
+  # Focused panel expands, others collapse — pairs with screenMode: half.
+  expandFocusedSidePanel: true
+  expandedSidePanelWeight: 4
+  sidePanelWidth: 0.5
+
+  # Reclaim chrome that costs rows we don't have.
+  showCommandLog: false
+  showBottomLine: false
+  showRandomTip: false
+  showListFooter: false
+  showPanelJumps: false      # hides the `[1]` `[2]` bracket prefixes on titles
+
+  # Keep file tree (toggle with `).
+  showFileTree: true
+  showFileIcons: true
+  nerdFontsVersion: "3"
+
+  border: rounded
