@@ -1,0 +1,701 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "typer>=0.12",
+#     "rich>=13",
+# ]
+# ///
+"""
+wk — a tmux-based workspace manager modeled on Conductor / Superset.
+
+Each workspace is:
+  - a git worktree on its own branch
+  - a tmux session of the same name
+  - a 3-pane layout: Claude Code | files | shell
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+import typer
+from rich.console import Console
+from rich.table import Table
+
+app = typer.Typer(
+    add_completion=False,
+    no_args_is_help=True,
+    help="Workspace manager: git worktree + tmux session per branch.",
+    rich_markup_mode="rich",
+)
+console = Console()
+err = Console(stderr=True)
+
+
+# ---------------------------------------------------------------------------
+# config
+# ---------------------------------------------------------------------------
+
+# Where worktrees live. Default: sibling dir next to the main repo,
+# named `<repo>.worktrees/<branch>`. Override with WK_WORKTREE_ROOT.
+WORKTREE_ROOT_ENV = "WK_WORKTREE_ROOT"
+
+# Command to run in the main (chat) pane. Override with WK_AGENT_CMD.
+AGENT_CMD_ENV = "WK_AGENT_CMD"
+DEFAULT_AGENT_CMD = "claude"
+
+# Name of the cross-workspace dashboard session.
+DASHBOARD_SESSION = "wk-dashboard"
+
+# Default base branch for new worktrees.
+DEFAULT_BASE = "origin/main"
+
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+
+def run(
+    cmd: list[str],
+    *,
+    check: bool = True,
+    capture: bool = True,
+    cwd: Optional[Path] = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run a command, returning the completed process."""
+    return subprocess.run(
+        cmd,
+        check=check,
+        capture_output=capture,
+        text=True,
+        cwd=cwd,
+    )
+
+
+def die(msg: str, code: int = 1) -> None:
+    err.print(f"[red]error:[/red] {msg}")
+    raise typer.Exit(code)
+
+
+def require(tool: str) -> None:
+    if shutil.which(tool) is None:
+        die(f"{tool!r} not found on PATH")
+
+
+def repo_root() -> Path:
+    """Toplevel of the *main* repo (not the worktree we may be in)."""
+    try:
+        r = run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"])
+    except subprocess.CalledProcessError:
+        die("not inside a git repository")
+    common_dir = Path(r.stdout.strip())
+    # common_dir is .../<repo>/.git — parent is the main checkout
+    return common_dir.parent
+
+
+def repo_name() -> str:
+    return repo_root().name
+
+
+def worktree_root() -> Path:
+    """Where all worktrees for this repo live."""
+    override = os.environ.get(WORKTREE_ROOT_ENV)
+    if override:
+        return Path(override).expanduser()
+    main = repo_root()
+    return main.parent / f"{main.name}.worktrees"
+
+
+def worktree_path(branch: str) -> Path:
+    # branches like `feat/foo` become `feat-foo` on disk to avoid nested dirs
+    safe = branch.replace("/", "-")
+    return worktree_root() / safe
+
+
+def session_name(branch: str) -> str:
+    # tmux session names can't contain `.` or `:`. Normalize.
+    return branch.replace("/", "-").replace(".", "-").replace(":", "-")
+
+
+def agent_cmd() -> str:
+    return os.environ.get(AGENT_CMD_ENV, DEFAULT_AGENT_CMD)
+
+
+@dataclass
+class Workspace:
+    branch: str
+    path: Path
+    session: str
+    has_session: bool
+    dirty: bool
+    ahead: int
+    behind: int
+
+
+def list_worktrees() -> list[tuple[str, Path]]:
+    """Parse `git worktree list --porcelain`. Returns (branch, path) pairs.
+
+    Skips the main checkout and detached HEADs.
+    """
+    out = run(["git", "worktree", "list", "--porcelain"]).stdout
+    main = repo_root()
+    results: list[tuple[str, Path]] = []
+    cur_path: Optional[Path] = None
+    cur_branch: Optional[str] = None
+    for line in out.splitlines() + [""]:  # trailing blank flushes last record
+        if line.startswith("worktree "):
+            cur_path = Path(line[len("worktree ") :])
+            cur_branch = None
+        elif line.startswith("branch "):
+            ref = line[len("branch ") :]
+            cur_branch = ref.removeprefix("refs/heads/")
+        elif line == "":
+            if cur_path and cur_branch and cur_path != main:
+                results.append((cur_branch, cur_path))
+            cur_path = None
+            cur_branch = None
+    return results
+
+
+def tmux_sessions() -> set[str]:
+    r = run(["tmux", "ls", "-F", "#{session_name}"], check=False)
+    if r.returncode != 0:
+        return set()
+    return {line.strip() for line in r.stdout.splitlines() if line.strip()}
+
+
+def workspace_status(branch: str, path: Path, sessions: set[str]) -> Workspace:
+    name = session_name(branch)
+    # dirty?
+    dirty = bool(
+        run(["git", "-C", str(path), "status", "--porcelain"]).stdout.strip()
+    )
+    # ahead/behind vs base
+    ahead = behind = 0
+    base = os.environ.get("WK_BASE", DEFAULT_BASE)
+    rev = run(
+        ["git", "-C", str(path), "rev-list", "--left-right", "--count", f"{base}...HEAD"],
+        check=False,
+    )
+    if rev.returncode == 0 and rev.stdout.strip():
+        parts = rev.stdout.split()
+        if len(parts) == 2:
+            behind, ahead = int(parts[0]), int(parts[1])
+    return Workspace(
+        branch=branch,
+        path=path,
+        session=name,
+        has_session=name in sessions,
+        dirty=dirty,
+        ahead=ahead,
+        behind=behind,
+    )
+
+
+def all_workspaces() -> list[Workspace]:
+    sessions = tmux_sessions()
+    return [workspace_status(b, p, sessions) for b, p in list_worktrees()]
+
+
+def in_tmux() -> bool:
+    return "TMUX" in os.environ
+
+
+def attach_or_switch(session: str) -> None:
+    """Attach if outside tmux, switch-client if inside."""
+    if in_tmux():
+        os.execvp("tmux", ["tmux", "switch-client", "-t", session])
+    else:
+        os.execvp("tmux", ["tmux", "attach", "-t", session])
+
+
+# ---------------------------------------------------------------------------
+# tmux session construction
+# ---------------------------------------------------------------------------
+
+
+FILES_CMD = (
+    # Best-effort: prefer eza, fall back to ls. Loop refreshes every 2s.
+    "while true; do clear; "
+    "(command -v eza >/dev/null && eza --tree --level=2 --git-ignore --color=always) "
+    '|| ls -la; echo; echo "── git status ──"; git status -sb; sleep 2; done'
+)
+
+
+def _wk_bin() -> str:
+    """Path to this script for sub-invocations from tmux panes."""
+    return shutil.which("wk") or os.path.abspath(sys.argv[0])
+
+
+def _shell_wrap(cmd: str) -> list[str]:
+    """Wrap a command in the user's preferred shell for tmux."""
+    if shutil.which("fish"):
+        return ["fish", "-c", cmd]
+    return ["sh", "-c", cmd]
+
+
+# Target widths (cols) and proportions for the 4-pane Conductor layout.
+# Tuned for ~290-col widescreen tmux windows (UWQHD 3440px).
+SIDEBAR_COLS = 32
+RIGHT_COL_COLS = 100  # files + shell column
+FILES_PCT = 55  # files pane gets 55% of the right column's height
+
+
+def build_session(session: str, wt: Path, agent: str) -> None:
+    """Create a detached session with the 4-pane sidebar layout.
+
+    Panes are 1-indexed (matches user's `pane-base-index 1` tmux setting):
+
+        ┌──────────┬─────────────────────────┬──────────────┐
+        │ sidebar  │   agent (Claude Code)   │   files      │
+        │ pane 1   │   pane 2                │   pane 3     │
+        │          │                         ├──────────────┤
+        │          │                         │   shell      │
+        │          │                         │   pane 4     │
+        └──────────┴─────────────────────────┴──────────────┘
+    """
+    wk = _wk_bin()
+    total_cols = 290
+
+    # Pane 1: sidebar (initial pane). Starts with `wk sidebar` running.
+    run(
+        [
+            "tmux", "new-session", "-d",
+            "-s", session,
+            "-c", str(wt),
+            "-x", str(total_cols), "-y", "75",  # reshaped on attach
+            "-n", "work",
+            *_shell_wrap(f"WK_CURRENT={session} {wk} sidebar"),
+        ]
+    )
+
+    # Tag the session as wk-managed so tmux-resurrect filters and other tools
+    # can identify it. Stored as a tmux user option (`@wk`), readable via
+    # `tmux show-options -v -t <session> @wk`.
+    run(["tmux", "set-option", "-t", session, "@wk", "1"])
+    run(["tmux", "set-option", "-t", session, "@wk-branch", session])  # branch name
+    run(["tmux", "set-option", "-t", session, "@wk-path", str(wt)])
+
+    # Pane 2: agent. Split right of sidebar; new pane takes the remaining
+    # width (everything except the sidebar's 32 cols).
+    agent_width = total_cols - SIDEBAR_COLS
+    run(
+        [
+            "tmux", "split-window", "-h",
+            "-t", f"{session}:work.1",
+            "-c", str(wt),
+            "-l", str(agent_width),
+            agent,
+        ]
+    )
+
+    # Pane 3: files. Split right of agent; new pane takes RIGHT_COL_COLS,
+    # leaving the agent pane with the rest of its prior width.
+    run(
+        [
+            "tmux", "split-window", "-h",
+            "-t", f"{session}:work.2",
+            "-c", str(wt),
+            "-l", str(RIGHT_COL_COLS),
+            *_shell_wrap(FILES_CMD),
+        ]
+    )
+
+    # Pane 4: shell. Split below files.
+    run(
+        [
+            "tmux", "split-window", "-v",
+            "-t", f"{session}:work.3",
+            "-c", str(wt),
+            "-p", str(100 - FILES_PCT),
+        ]
+    )
+
+    # Land in the agent pane on attach.
+    run(["tmux", "select-pane", "-t", f"{session}:work.2"])
+
+
+# ---------------------------------------------------------------------------
+# commands
+# ---------------------------------------------------------------------------
+
+
+@app.command()
+def new(
+    branch: str = typer.Argument(..., help="Branch name for the new workspace."),
+    base: str = typer.Option(
+        DEFAULT_BASE, "--base", "-b", help="Base ref to branch from."
+    ),
+    no_attach: bool = typer.Option(False, "--no-attach", help="Don't attach."),
+    no_fetch: bool = typer.Option(False, "--no-fetch", help="Skip `git fetch`."),
+) -> None:
+    """Create a worktree + tmux session for [bold]BRANCH[/bold] and attach."""
+    require("git")
+    require("tmux")
+
+    main = repo_root()
+    wt = worktree_path(branch)
+    session = session_name(branch)
+
+    if wt.exists():
+        die(f"worktree already exists: {wt}")
+    if session in tmux_sessions():
+        die(f"tmux session already exists: {session}")
+
+    if not no_fetch:
+        console.print("[dim]fetching…[/dim]")
+        run(["git", "-C", str(main), "fetch", "--prune"], check=False, capture=True)
+
+    wt.parent.mkdir(parents=True, exist_ok=True)
+
+    # Create branch from base; if branch already exists locally, just check it out
+    existing = run(
+        ["git", "-C", str(main), "rev-parse", "--verify", f"refs/heads/{branch}"],
+        check=False,
+    )
+    if existing.returncode == 0:
+        console.print(f"[dim]branch exists; checking out into worktree[/dim]")
+        run(["git", "-C", str(main), "worktree", "add", str(wt), branch])
+    else:
+        console.print(f"[dim]creating branch {branch} from {base}[/dim]")
+        run(
+            ["git", "-C", str(main), "worktree", "add", "-b", branch, str(wt), base]
+        )
+
+    build_session(session, wt, agent_cmd())
+    console.print(f"[green]✓[/green] workspace [bold]{branch}[/bold] ready at {wt}")
+
+    if not no_attach:
+        attach_or_switch(session)
+
+
+@app.command()
+def restore(
+    branch: Optional[str] = typer.Argument(
+        None, help="Branch to restore. Omit to restore all worktrees missing a session."
+    ),
+    no_attach: bool = typer.Option(False, "--no-attach", help="Don't attach."),
+) -> None:
+    """Rebuild tmux session(s) for existing worktree(s).
+
+    Use after a reboot or `tmux kill-server` to re-create the 4-pane layout
+    on top of worktrees that still exist on disk. No git operations; the
+    branch must already have a worktree.
+
+    With no argument, rebuilds sessions for every wk worktree that currently
+    lacks one — the "resurrect for wk" workflow.
+    """
+    require("git")
+    require("tmux")
+
+    sessions = tmux_sessions()
+    worktrees = list_worktrees()
+    if not worktrees:
+        die("no worktrees to restore")
+
+    targets: list[tuple[str, Path]] = []
+    if branch is None:
+        targets = [
+            (b, p) for b, p in worktrees if session_name(b) not in sessions
+        ]
+        if not targets:
+            console.print("[dim]all worktrees already have sessions[/dim]")
+            return
+    else:
+        match = next(
+            ((b, p) for b, p in worktrees if b == branch or session_name(b) == branch),
+            None,
+        )
+        if match is None:
+            die(f"no worktree for {branch!r}")
+        b, p = match
+        if session_name(b) in sessions:
+            die(f"session {session_name(b)} already exists; use `wk switch` to attach")
+        targets = [match]
+
+    rebuilt: list[str] = []
+    for b, p in targets:
+        s = session_name(b)
+        console.print(f"[dim]restoring {b}…[/dim]")
+        build_session(s, p, agent_cmd())
+        rebuilt.append(s)
+
+    console.print(f"[green]✓[/green] restored {len(rebuilt)} workspace(s)")
+
+    if not no_attach and len(rebuilt) == 1:
+        attach_or_switch(rebuilt[0])
+
+
+@app.command()
+def is_wk_session(
+    session: str = typer.Argument(..., help="Session name to check.")
+) -> None:
+    """Exit 0 if SESSION is a wk-managed session, 1 otherwise.
+
+    For use in tmux-resurrect post-save hooks and shell scripts.
+    """
+    require("tmux")
+    r = run(
+        ["tmux", "show-options", "-v", "-t", session, "@wk"],
+        check=False,
+    )
+    if r.returncode == 0 and r.stdout.strip() == "1":
+        raise typer.Exit(0)
+    raise typer.Exit(1)
+
+
+@app.command("list")
+@app.command("ls", hidden=True)
+def list_cmd() -> None:
+    """Show all workspaces with branch, status, and session state."""
+    require("git")
+    workspaces = all_workspaces()
+    if not workspaces:
+        console.print("[dim]no workspaces[/dim]")
+        return
+
+    table = Table(box=None, pad_edge=False)
+    table.add_column("branch", style="bold")
+    table.add_column("session")
+    table.add_column("ahead/behind", justify="right")
+    table.add_column("status")
+    table.add_column("path", style="dim")
+
+    for w in workspaces:
+        sess = "[green]●[/green] " + w.session if w.has_session else f"[dim]○ {w.session}[/dim]"
+        ab = f"+{w.ahead}/-{w.behind}" if (w.ahead or w.behind) else "[dim]·[/dim]"
+        status = "[yellow]dirty[/yellow]" if w.dirty else "[green]clean[/green]"
+        try:
+            shown = "~/" + str(w.path.relative_to(Path.home()))
+        except ValueError:
+            shown = str(w.path)
+        table.add_row(w.branch, sess, ab, status, shown)
+    console.print(table)
+
+
+@app.command()
+def switch(
+    branch: Optional[str] = typer.Argument(None, help="Branch; omit for fzf picker."),
+) -> None:
+    """Switch to an existing workspace."""
+    require("tmux")
+    workspaces = all_workspaces()
+    if not workspaces:
+        die("no workspaces to switch to")
+
+    target: Optional[Workspace] = None
+    if branch:
+        for w in workspaces:
+            if w.branch == branch or w.session == branch:
+                target = w
+                break
+        if target is None:
+            die(f"no workspace matching {branch!r}")
+    else:
+        require("fzf")
+        lines = [
+            f"{w.branch}\t{'●' if w.has_session else '○'}\t"
+            f"{'dirty' if w.dirty else 'clean'}\t+{w.ahead}/-{w.behind}"
+            for w in workspaces
+        ]
+        proc = subprocess.run(
+            ["fzf", "--with-nth=1..", "--delimiter=\t", "--prompt=workspace> "],
+            input="\n".join(lines),
+            text=True,
+            capture_output=True,
+        )
+        if proc.returncode != 0 or not proc.stdout.strip():
+            raise typer.Exit(0)
+        picked = proc.stdout.strip().split("\t", 1)[0]
+        target = next(w for w in workspaces if w.branch == picked)
+
+    # Ensure the session actually exists; rebuild if not
+    if not target.has_session:
+        console.print(f"[dim]session missing; rebuilding…[/dim]")
+        build_session(target.session, target.path, agent_cmd())
+
+    attach_or_switch(target.session)
+
+
+@app.command()
+def rm(
+    branch: str = typer.Argument(..., help="Branch / workspace to remove."),
+    force: bool = typer.Option(False, "--force", "-f", help="Remove even if dirty."),
+    keep_branch: bool = typer.Option(
+        False, "--keep-branch", help="Keep the branch ref after removing the worktree."
+    ),
+) -> None:
+    """Kill the tmux session and remove the worktree."""
+    require("git")
+    require("tmux")
+    main = repo_root()
+    workspaces = {w.branch: w for w in all_workspaces()}
+    w = workspaces.get(branch)
+    if w is None:
+        die(f"no workspace for {branch!r}")
+
+    if w.dirty and not force:
+        die(f"worktree is dirty; use --force or commit first")
+
+    if w.has_session:
+        run(["tmux", "kill-session", "-t", w.session], check=False)
+
+    args = ["git", "-C", str(main), "worktree", "remove", str(w.path)]
+    if force:
+        args.append("--force")
+    run(args)
+
+    if not keep_branch:
+        run(["git", "-C", str(main), "branch", "-D", branch], check=False)
+
+    console.print(f"[green]✓[/green] removed {branch}")
+
+
+@app.command()
+def cd(
+    branch: Optional[str] = typer.Argument(
+        None, help="Print path for BRANCH; omit to use current tmux session."
+    ),
+) -> None:
+    """Print the worktree path (for shell `cd`).
+
+    Usage in fish:  cd (wk cd feature-x)
+    """
+    if branch is None:
+        # Infer from current tmux session
+        sess = os.environ.get("TMUX_PANE")
+        if not sess:
+            die("not inside tmux; pass a branch name")
+        r = run(["tmux", "display-message", "-p", "#S"])
+        session = r.stdout.strip()
+        for w in all_workspaces():
+            if w.session == session:
+                print(w.path)
+                return
+        die(f"no workspace for current session {session!r}")
+    else:
+        for w in all_workspaces():
+            if w.branch == branch or w.session == branch:
+                print(w.path)
+                return
+        die(f"no workspace for {branch!r}")
+
+
+@app.command()
+def sidebar() -> None:
+    """Interactive workspace sidebar (runs inside the leftmost tmux pane).
+
+    Continuously lists workspaces and lets you switch by selecting one.
+    Reads $WK_CURRENT to mark the active workspace.
+    """
+    require("fzf")
+    require("tmux")
+    current = os.environ.get("WK_CURRENT", "")
+    wk = _wk_bin()
+
+    # The preview script renders the workspace list with the current row marked.
+    # We rebuild the list each loop iteration so dirty/ahead counts stay fresh.
+    while True:
+        workspaces = all_workspaces()
+        if not workspaces:
+            # No workspaces yet — show a hint and wait.
+            console.clear()
+            console.print("[dim](no workspaces)\nUse `wk new <branch>`[/dim]")
+            try:
+                # Sleep but allow Ctrl-C
+                import time
+                time.sleep(3)
+                continue
+            except KeyboardInterrupt:
+                return
+
+        # Build fzf input. Each line: marker, branch, ahead/behind, status.
+        # We tab-delimit and hide the leading session-name field for switching.
+        lines: list[str] = []
+        for w in workspaces:
+            marker = "▶" if w.session == current else (" " if w.has_session else "·")
+            ab = f"+{w.ahead}/-{w.behind}" if (w.ahead or w.behind) else " "
+            status = "✱" if w.dirty else " "
+            # session\tdisplay
+            display = f"{marker} {w.branch[:18]:<18} {ab:>8} {status}"
+            lines.append(f"{w.session}\t{display}")
+
+        # fzf in "loop" mode: returns selected session name on Enter, exits on Esc.
+        # The outer Python loop re-renders the data each iteration, so Esc just
+        # falls through to a re-render.
+        proc = subprocess.run(
+            [
+                "fzf",
+                "--with-nth=2..",
+                "--delimiter=\t",
+                "--no-info",
+                "--no-scrollbar",
+                "--prompt=workspaces❯ ",
+                "--header=enter=switch  ctrl-n=new  ctrl-d=rm",
+                "--reverse",
+                "--height=100%",
+                "--cycle",
+                # Ctrl-N prompts for a new branch (via tmux) and creates it
+                f"--bind=ctrl-n:execute(tmux command-prompt -p 'new branch:' 'run-shell \"{wk} new %%\"')+abort",
+                # Ctrl-D removes the highlighted workspace (force)
+                f"--bind=ctrl-d:execute({wk} rm {{1}} --force)+reload(sleep 0.2 && {wk} _list-once)",
+            ],
+            input="\n".join(lines),
+            text=True,
+            capture_output=True,
+            env={**os.environ, "WK_CURRENT": current},
+        )
+        if proc.returncode == 130:  # Esc / Ctrl-C — just re-render the loop
+            continue
+        if proc.returncode != 0 or not proc.stdout.strip():
+            # Sleep briefly to avoid busy-loop if fzf is unavailable mid-run
+            import time
+            time.sleep(0.2)
+            continue
+
+        picked_session = proc.stdout.strip().split("\t", 1)[0]
+        if picked_session and picked_session != current:
+            subprocess.run(["tmux", "switch-client", "-t", picked_session], check=False)
+        # Loop continues — sidebar re-renders.
+
+
+@app.command("_list-once", hidden=True)
+def list_once() -> None:
+    """Internal: dump a single sidebar listing (for fzf --reload)."""
+    current = os.environ.get("WK_CURRENT", "")
+    for w in all_workspaces():
+        marker = "▶" if w.session == current else (" " if w.has_session else "·")
+        ab = f"+{w.ahead}/-{w.behind}" if (w.ahead or w.behind) else " "
+        status = "✱" if w.dirty else " "
+        display = f"{marker} {w.branch[:18]:<18} {ab:>8} {status}"
+        print(f"{w.session}\t{display}")
+
+
+@app.command()
+def dashboard() -> None:
+    """Open the cross-workspace overview session."""
+    require("tmux")
+    if DASHBOARD_SESSION not in tmux_sessions():
+        # Build it: one pane running `watch wk list`
+        wk_path = shutil.which("wk") or sys.argv[0]
+        run(
+            [
+                "tmux", "new-session", "-d",
+                "-s", DASHBOARD_SESSION,
+                "-n", "overview",
+                "sh", "-c", f"while true; do clear; {wk_path} list; sleep 3; done",
+            ]
+        )
+    attach_or_switch(DASHBOARD_SESSION)
+
+
+if __name__ == "__main__":
+    app()

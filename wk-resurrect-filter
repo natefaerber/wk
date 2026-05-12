@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# wk-resurrect-filter — strip wk-managed sessions from a tmux-resurrect dump.
+#
+# Usage (from .tmux.conf):
+#   set -g @resurrect-hook-post-save-all \
+#     'WK_FILTER=$HOME/.config/tmux/bin/wk-resurrect-filter; $WK_FILTER'
+#
+# tmux-resurrect writes to ~/.tmux/resurrect/last (a symlink to the timestamped
+# dump). The dump is a TSV-ish file where each line starts with a record type:
+#   pane\t<session>\t<window>\t...
+#   window\t<session>\t<window>\t...
+#   state\t<session>\t<window>.<pane>
+#
+# This script reads $HOME/.tmux/resurrect/last, determines which sessions are
+# wk-managed by querying tmux directly (via `tmux show-options -v @wk`), and
+# rewrites the dump to omit lines belonging to those sessions.
+#
+# Safe to run when no wk sessions exist (no-op). Safe to re-run.
+
+set -euo pipefail
+
+RESURRECT_DIR="${WK_RESURRECT_DIR:-$HOME/.tmux/resurrect}"
+DUMP_LINK="$RESURRECT_DIR/last"
+
+# If there's no dump yet (first save in progress?), bail quietly.
+[ -L "$DUMP_LINK" ] || exit 0
+DUMP_FILE="$(readlink -f "$DUMP_LINK")"
+[ -f "$DUMP_FILE" ] || exit 0
+
+# Collect wk session names by asking tmux which currently-running sessions
+# carry the @wk user option. (We only filter live sessions; sessions that
+# existed in a previous dump but are gone now are already absent from the
+# new dump being saved.)
+wk_sessions=$(
+  tmux list-sessions -F '#{session_name}' 2>/dev/null \
+    | while IFS= read -r s; do
+        v=$(tmux show-options -v -t "$s" @wk 2>/dev/null || true)
+        [ "$v" = "1" ] && printf '%s\n' "$s"
+      done
+)
+
+# Nothing to strip — leave the dump untouched.
+[ -n "$wk_sessions" ] || exit 0
+
+# Build a pipe-separated regex of session names, anchored to the 2nd TSV field.
+# Resurrect lines look like:  <type>\t<session>\t<rest...>
+pattern=$(printf '%s\n' "$wk_sessions" | paste -sd'|' -)
+
+tmp="$DUMP_FILE.wk.tmp"
+awk -v pat="^[^\t]+\t($pattern)\t" '$0 !~ pat' "$DUMP_FILE" > "$tmp"
+mv "$tmp" "$DUMP_FILE"
