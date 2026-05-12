@@ -323,6 +323,238 @@ def build_session(session: str, wt: Path, agent: str) -> None:
     run(["tmux", "select-pane", "-t", f"{session}:work.2"])
 
 
+import json
+import re
+import time as _time
+
+
+# ---------------------------------------------------------------------------
+# branch-name + task helpers
+# ---------------------------------------------------------------------------
+
+
+# A valid branch name for our purposes: lowercase, hyphen-separated,
+# starts with a letter, 3–60 chars. Loose enough to accept what Claude
+# typically produces, strict enough to keep filesystem paths sane.
+_BRANCH_RE = re.compile(r"^[a-z][a-z0-9-]{2,59}$")
+
+
+def slugify(text: str, max_words: int = 5) -> str:
+    """Deterministic fallback: take first words, lowercase, dash-separate.
+
+    Used when the AI branch picker fails or is skipped. Always returns
+    a string that matches _BRANCH_RE (min 3 chars, leading letter).
+    """
+    # Replace non-alphanumeric runs with spaces, then take the first N words.
+    cleaned = re.sub(r"[^a-zA-Z0-9]+", " ", text).strip().lower()
+    words = cleaned.split()[:max_words]
+    slug = "-".join(words) if words else ""
+    # Collapse repeated dashes, trim to 60.
+    slug = re.sub(r"-+", "-", slug).strip("-")[:60]
+    # Ensure leading letter and minimum length (3 chars per _BRANCH_RE).
+    if not slug or not slug[0].isalpha():
+        slug = f"task-{slug}".strip("-") if slug else f"task-{int(_time.time())}"
+    if len(slug) < 3:
+        slug = f"task-{slug}"
+    return slug
+
+
+_BRANCH_PROMPT = """\
+You are naming a git branch for the following task. Reply with ONLY the
+branch name — no quotes, no explanation, no markdown. Rules:
+
+- lowercase
+- 2 to 6 words joined by hyphens
+- start with a letter
+- describe the task (not the verb): "fix-flaky-session-test", not "fix"
+- no slashes, no spaces, no underscores
+
+Task:
+{prompt}
+
+Branch name:"""
+
+
+def pick_branch_name(prompt: str, timeout_seconds: int = 30) -> tuple[str, str]:
+    """Ask `claude -p` to suggest a branch name. Returns (name, source).
+
+    `source` is "claude" on success, "slug" on fallback. Never raises;
+    falls back to slugify() on timeout, network, parse, or validation errors.
+    """
+    if shutil.which("claude") is None:
+        return slugify(prompt), "slug"
+    try:
+        proc = subprocess.run(
+            ["claude", "-p", "--output-format", "json", _BRANCH_PROMPT.format(prompt=prompt)],
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return slugify(prompt), "slug"
+
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return slugify(prompt), "slug"
+
+    try:
+        payload = json.loads(proc.stdout)
+        raw = str(payload.get("result", "")).strip()
+    except (json.JSONDecodeError, AttributeError):
+        return slugify(prompt), "slug"
+
+    # Claude sometimes wraps the name in backticks, quotes, or extra prose.
+    # Take the last non-empty line, strip surrounding punctuation.
+    last_line = raw.splitlines()[-1].strip() if raw.splitlines() else ""
+    candidate = last_line.strip("`\"' \t.,").lower().replace(" ", "-").replace("_", "-")
+    candidate = re.sub(r"-+", "-", candidate).strip("-")
+
+    if _BRANCH_RE.match(candidate):
+        return candidate, "claude"
+    return slugify(prompt), "slug"
+
+
+@dataclass
+class WorkspaceState:
+    """Result of resolving what to do for a `wk open` request.
+
+    `wt` is the worktree path that should be used (may be wk's preferred path,
+    or an external path picked up from `git worktree list`).
+    `created` is True if we created the worktree in this call.
+    `branch_created` is True if we created the branch ref in this call.
+    """
+    wt: Path
+    session: str
+    created: bool
+    branch_created: bool
+
+
+def find_existing_worktree(branch: str) -> Optional[Path]:
+    """Look up the path of an existing worktree for BRANCH, if any.
+
+    Returns the path from `git worktree list` (which may be at wk's preferred
+    path or anywhere else), or None if no worktree currently checks out the
+    branch.
+    """
+    out = run(["git", "worktree", "list", "--porcelain"]).stdout
+    cur_path: Optional[Path] = None
+    for line in out.splitlines() + [""]:
+        if line.startswith("worktree "):
+            cur_path = Path(line[len("worktree ") :])
+        elif line.startswith("branch "):
+            ref = line[len("branch ") :].removeprefix("refs/heads/")
+            if ref == branch and cur_path is not None:
+                return cur_path
+        elif line == "":
+            cur_path = None
+    return None
+
+
+def branch_exists_locally(branch: str) -> bool:
+    main = repo_root()
+    r = run(
+        ["git", "-C", str(main), "rev-parse", "--verify", f"refs/heads/{branch}"],
+        check=False,
+    )
+    return r.returncode == 0
+
+
+def branch_exists_on_remote(branch: str, remote: str = "origin") -> bool:
+    """Does the branch exist on `remote` (after most-recent fetch)?"""
+    main = repo_root()
+    r = run(
+        [
+            "git", "-C", str(main),
+            "rev-parse", "--verify", f"refs/remotes/{remote}/{branch}",
+        ],
+        check=False,
+    )
+    return r.returncode == 0
+
+
+def resolve_workspace(
+    branch: str,
+    base: str,
+    fetch: bool = True,
+    strict_new: bool = False,
+) -> WorkspaceState:
+    """Resolve everything needed to open a workspace for BRANCH.
+
+    Walks the six-case state space:
+
+    1/2.  Branch + worktree exist (anywhere)         → use that worktree
+    3.    Branch exists, no worktree                 → add worktree at wk's path
+    4.    Branch missing locally, exists on remote   → fetch, create from remote
+    5.    Branch missing entirely                    → create from BASE
+    6.    (Same as 1/2 — external worktrees included)
+
+    When `strict_new=True`, errors if the branch already exists. Used by
+    `wk new` so it preserves its "I want a fresh thing" semantics.
+
+    Does not build the tmux session — that's the caller's job. Returns
+    a WorkspaceState describing what's now true on disk.
+    """
+    main = repo_root()
+    session = session_name(branch)
+
+    # 1/2/6. Existing worktree (wk-created or external).
+    existing_wt = find_existing_worktree(branch)
+    if existing_wt is not None:
+        if strict_new:
+            die(f"branch {branch!r} already has a worktree at {existing_wt}")
+        return WorkspaceState(
+            wt=existing_wt, session=session,
+            created=False, branch_created=False,
+        )
+
+    # No worktree exists. Decide where to put one and how to create the branch.
+    if fetch:
+        console.print("[dim]fetching…[/dim]")
+        run(
+            ["git", "-C", str(main), "fetch", "--prune"],
+            check=False, capture=True,
+        )
+
+    wt = worktree_path(branch)
+    # Defensive: refuse to create on top of a non-empty directory that git
+    # doesn't know about. That's almost always leftover crud worth surfacing.
+    if wt.exists():
+        die(
+            f"path exists but isn't a registered git worktree: {wt}\n"
+            f"  remove or rename it, then re-run"
+        )
+
+    wt.parent.mkdir(parents=True, exist_ok=True)
+
+    if branch_exists_locally(branch):
+        if strict_new:
+            die(
+                f"branch {branch!r} already exists locally; "
+                f"use `wk open {branch}` to use it"
+            )
+        # Case 3.
+        console.print(f"[dim]branch exists; checking out into worktree[/dim]")
+        run(["git", "-C", str(main), "worktree", "add", str(wt), branch])
+        return WorkspaceState(wt=wt, session=session, created=True, branch_created=False)
+
+    if branch_exists_on_remote(branch):
+        # Case 4. `git worktree add` with a local branch name that matches
+        # a remote-tracking ref will set up tracking automatically.
+        console.print(f"[dim]branch on remote; creating tracking branch[/dim]")
+        run(
+            ["git", "-C", str(main), "worktree", "add",
+             "--track", "-b", branch, str(wt), f"origin/{branch}"],
+        )
+        return WorkspaceState(wt=wt, session=session, created=True, branch_created=True)
+
+    # Case 5.
+    console.print(f"[dim]creating branch {branch} from {base}[/dim]")
+    run(
+        ["git", "-C", str(main), "worktree", "add", "-b", branch, str(wt), base]
+    )
+    return WorkspaceState(wt=wt, session=session, created=True, branch_created=True)
+
+
 # ---------------------------------------------------------------------------
 # commands
 # ---------------------------------------------------------------------------
@@ -337,41 +569,171 @@ def new(
     no_attach: bool = typer.Option(False, "--no-attach", help="Don't attach."),
     no_fetch: bool = typer.Option(False, "--no-fetch", help="Skip `git fetch`."),
 ) -> None:
-    """Create a worktree + tmux session for [bold]BRANCH[/bold] and attach."""
+    """Create a [bold]new[/bold] worktree + tmux session for BRANCH and attach.
+
+    Errors if the branch already exists. For a forgiving "open whatever's
+    there, or make it if not" command, use `wk open` instead.
+    """
     require("git")
     require("tmux")
 
-    main = repo_root()
-    wt = worktree_path(branch)
     session = session_name(branch)
-
-    if wt.exists():
-        die(f"worktree already exists: {wt}")
     if session in tmux_sessions():
         die(f"tmux session already exists: {session}")
 
-    if not no_fetch:
-        console.print("[dim]fetching…[/dim]")
-        run(["git", "-C", str(main), "fetch", "--prune"], check=False, capture=True)
+    state = resolve_workspace(branch, base, fetch=not no_fetch, strict_new=True)
 
-    wt.parent.mkdir(parents=True, exist_ok=True)
+    build_session(state.session, state.wt, agent_cmd())
+    console.print(f"[green]✓[/green] workspace [bold]{branch}[/bold] ready at {state.wt}")
 
-    # Create branch from base; if branch already exists locally, just check it out
-    existing = run(
-        ["git", "-C", str(main), "rev-parse", "--verify", f"refs/heads/{branch}"],
-        check=False,
-    )
-    if existing.returncode == 0:
-        console.print(f"[dim]branch exists; checking out into worktree[/dim]")
-        run(["git", "-C", str(main), "worktree", "add", str(wt), branch])
+    if not no_attach:
+        attach_or_switch(state.session)
+
+
+@app.command("open")
+def open_cmd(
+    branch: str = typer.Argument(..., help="Branch name to open."),
+    base: str = typer.Option(
+        DEFAULT_BASE, "--base", "-b",
+        help="Base ref (used only if creating a new branch).",
+    ),
+    no_attach: bool = typer.Option(False, "--no-attach", help="Don't attach."),
+    no_fetch: bool = typer.Option(False, "--no-fetch", help="Skip `git fetch`."),
+) -> None:
+    """Open BRANCH — attach if running, rebuild if not, create if missing.
+
+    Forgiving counterpart to `wk new`. Handles every case:
+
+    \b
+      branch + worktree + session all exist  →  attach
+      branch + worktree exist, no session    →  rebuild session, attach
+      branch exists, no worktree             →  add worktree, build, attach
+      branch on remote, not local            →  fetch, track, build, attach
+      branch nowhere                         →  create from --base, build, attach
+
+    Worktrees created outside `wk` (e.g. `git worktree add ...` directly)
+    are recognized; their existing path is used, not wk's preferred path.
+    """
+    require("git")
+    require("tmux")
+
+    state = resolve_workspace(branch, base, fetch=not no_fetch, strict_new=False)
+
+    if state.session in tmux_sessions():
+        console.print(f"[dim]session running; attaching[/dim]")
     else:
-        console.print(f"[dim]creating branch {branch} from {base}[/dim]")
-        run(
-            ["git", "-C", str(main), "worktree", "add", "-b", branch, str(wt), base]
-        )
+        build_session(state.session, state.wt, agent_cmd())
+        # Set tags. (resolve_workspace doesn't touch tmux, so we do it here
+        # after build_session has created the session.)
+        if state.created:
+            console.print(f"[green]✓[/green] workspace [bold]{branch}[/bold] ready at {state.wt}")
+        else:
+            console.print(f"[green]✓[/green] rebuilt session for [bold]{branch}[/bold]")
 
-    build_session(session, wt, agent_cmd())
-    console.print(f"[green]✓[/green] workspace [bold]{branch}[/bold] ready at {wt}")
+    if not no_attach:
+        attach_or_switch(state.session)
+
+
+@app.command()
+def task(
+    prompt: str = typer.Argument(..., help="The task description / prompt for Claude."),
+    branch: Optional[str] = typer.Option(
+        None, "--branch", "-B",
+        help="Branch name (skips AI naming). If omitted, Claude picks one.",
+    ),
+    base: str = typer.Option(
+        DEFAULT_BASE, "--base", "-b", help="Base ref to branch from."
+    ),
+    auto: bool = typer.Option(
+        False, "--auto",
+        help="Non-interactive: run `claude -p`, stream output to .wk/output.md, exit when done.",
+    ),
+    yes: bool = typer.Option(
+        False, "--yes", "-y",
+        help="Skip the confirm-branch-name prompt.",
+    ),
+    no_fetch: bool = typer.Option(False, "--no-fetch", help="Skip `git fetch`."),
+    no_attach: bool = typer.Option(
+        False, "--no-attach",
+        help="Don't attach the tmux session (still creates it).",
+    ),
+) -> None:
+    """Create a workspace and kick off Claude Code with [bold]PROMPT[/bold]."""
+    require("git")
+    require("tmux")
+    require("claude")
+
+    # Pick a branch name. Use the explicit one if given, otherwise ask Claude,
+    # falling back to a deterministic slug.
+    if branch is not None:
+        if not _BRANCH_RE.match(branch):
+            die(f"invalid branch name {branch!r}; want [a-z][a-z0-9-]{{2,59}}")
+        source = "user"
+    else:
+        console.print("[dim]picking a branch name…[/dim]")
+        branch, source = pick_branch_name(prompt)
+
+    console.print(f"branch: [bold]{branch}[/bold] [dim]({source})[/dim]")
+
+    if not yes and source != "user":
+        # Let the user override before we touch git.
+        # typer.prompt returns the user's input; empty = accept default.
+        chosen = typer.prompt(
+            "use this name? [enter to accept, or type a different name]",
+            default=branch,
+            show_default=False,
+        ).strip() or branch
+        if chosen != branch:
+            if not _BRANCH_RE.match(chosen):
+                die(f"invalid branch name {chosen!r}; want [a-z][a-z0-9-]{{2,59}}")
+            branch = chosen
+
+    session = session_name(branch)
+    if session in tmux_sessions():
+        die(f"tmux session already exists: {session}")
+
+    # Create the worktree (strict: error if branch already exists).
+    state = resolve_workspace(branch, base, fetch=not no_fetch, strict_new=True)
+    wt = state.wt
+
+    # Write the task file. This is the durable record of what the workspace
+    # is for, surfaced in the sidebar and readable by `claude` later.
+    wk_dir = wt / ".wk"
+    wk_dir.mkdir(exist_ok=True)
+    task_file = wk_dir / "task.md"
+    task_file.write_text(prompt.strip() + "\n", encoding="utf-8")
+    # And a .gitignore inside .wk so the task notes don't accidentally
+    # land in commits.
+    (wk_dir / ".gitignore").write_text("*\n!.gitignore\n", encoding="utf-8")
+
+    # Build the session. Agent command depends on --auto.
+    if auto:
+        # Non-interactive: pane 2 runs claude -p, output piped to .wk/output.md.
+        # `tee` streams to both the pane and the file so the user can watch.
+        # `read -n 1` keeps the pane open after exit for review.
+        auto_cmd = (
+            "claude -p \"$(cat .wk/task.md)\" 2>&1 | tee .wk/output.md; "
+            "echo; echo '── task complete ── press any key to close ──'; "
+            "read -n 1"
+        )
+        build_session(session, wt, " ".join(_shell_wrap(auto_cmd)))
+    else:
+        # Interactive: launch claude with the prompt as a positional arg so
+        # it's pre-filled in the input buffer. Claude handles the launch
+        # timing itself — no send-keys race condition.
+        # We use shell-quoting via shlex for safety against unusual chars.
+        import shlex
+        agent = f"claude {shlex.quote(prompt.strip())}"
+        build_session(session, wt, agent)
+
+    # Tag the session as a task workspace so the sidebar can mark it.
+    run(["tmux", "set-option", "-t", session, "@wk-task", "1"])
+    run(["tmux", "set-option", "-t", session, "@wk-task-prompt", prompt.strip()[:200]])
+
+    console.print(f"[green]✓[/green] task workspace [bold]{branch}[/bold] ready")
+    console.print(f"  [dim]task file: {task_file}[/dim]")
+    if auto:
+        console.print(f"  [dim]output:    {wt}/.wk/output.md[/dim]")
 
     if not no_attach:
         attach_or_switch(session)
