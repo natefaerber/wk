@@ -48,8 +48,12 @@ err = Console(stderr=True)
 WORKTREE_ROOT_ENV = "WK_WORKTREE_ROOT"
 
 # Command to run in the main (chat) pane. Override with WK_AGENT_CMD.
+# Tries `claude -c` first to resume the most recent conversation for this
+# worktree; if there's no prior session, claude exits non-zero and the
+# `|| claude` fallback starts a fresh one. Net effect: open keeps your
+# thread, new workspaces still get a clean start.
 AGENT_CMD_ENV = "WK_AGENT_CMD"
-DEFAULT_AGENT_CMD = "claude"
+DEFAULT_AGENT_CMD = "claude -c || claude"
 
 # Name of the cross-workspace dashboard session.
 DASHBOARD_SESSION = "wk-dashboard"
@@ -205,12 +209,64 @@ def list_wk_worktrees() -> list[tuple[str, Path]]:
 
 def mark_wk_workspace(path: Path) -> None:
     """Create the .wk/ marker (idempotent). Also writes a .gitignore inside
-    so the marker dir doesn't end up tracked in the worktree's git history."""
+    so the marker dir doesn't end up tracked in the worktree's git history,
+    and an AGENTS.md so coding agents (Claude, etc.) can self-orient."""
     marker = path / WK_MARKER_DIR
     marker.mkdir(exist_ok=True)
     gi = marker / ".gitignore"
     if not gi.exists():
         gi.write_text("*\n!.gitignore\n", encoding="utf-8")
+    agents = marker / "AGENTS.md"
+    if not agents.exists():
+        agents.write_text(_AGENTS_MD, encoding="utf-8")
+
+
+_AGENTS_MD = """\
+# wk workspace context
+
+This worktree is managed by `wk` (a tmux + git-worktree workspace manager).
+When you read this file you can assume you're running inside the agent pane
+of a wk tmux session.
+
+## Runtime signals
+
+These environment variables are set on every pane of the session:
+
+- `WK_IN_WORKSPACE=1` — fast check that wk is active
+- `WK_SESSION` — the tmux session name (slug form, no slashes)
+- `WK_BRANCH` — the canonical git branch (may contain slashes)
+- `WK_PATH` — the worktree root (typically equal to your starting cwd)
+
+## Layout
+
+The wk session has 5 panes:
+
+  ┌──────────┬──────────────────────────┬──────────────────┐
+  │ sidebar  │                          │   lazygit        │
+  │ pane.1   │   agent (you)            │   pane.4         │
+  ├──────────┤   pane.2 (visual idx 3)  ├──────────────────┤
+  │ shell    │                          │   terminal       │
+  │ pane.4   │                          │   pane.5         │
+  └──────────┴──────────────────────────┴──────────────────┘
+
+## Useful wk commands
+
+- `wk lg-cd [path]` — retarget the lazygit pane at a directory. Run this
+  when you start working in a different repo, submodule, or subrepo than
+  where wk started, so the user's git UI follows along. Defaults to the
+  active pane's cwd if no path is given.
+- `wk task <prompt>` — spawn another wk workspace on a new branch for an
+  independent task. Useful when the user asks for parallel work.
+- `wk list` — show all wk workspaces with branch/status.
+- `wk cd [branch]` — print the worktree path for `cd` integration.
+
+## Conventions
+
+- The `.wk/` directory in this worktree is wk-managed and gitignored. You
+  can write notes here (e.g. `.wk/notes.md`) that won't pollute the repo.
+- The `.wk/task.md` file, if present, is the original task prompt that
+  `wk task` was invoked with — useful as ground-truth context.
+"""
 
 
 def tmux_sessions() -> set[str]:
@@ -329,7 +385,12 @@ LAZYGIT_CMD = (
 )
 
 
-def build_session(session: str, wt: Path, agent: str) -> None:
+def build_session(
+    session: str,
+    wt: Path,
+    agent: str,
+    branch: Optional[str] = None,
+) -> None:
     """Create a detached session with the 5-pane layout.
 
     Panes are 1-indexed (matches user's `pane-base-index 1` tmux setting):
@@ -345,10 +406,23 @@ def build_session(session: str, wt: Path, agent: str) -> None:
     """
     wk = _wk_bin()
     total_cols = 290
+    real_branch = branch or session
 
     # Mark this worktree as a wk workspace before we touch tmux — the sidebar
     # filters on this, and `wk task` may also write its own files under .wk/.
     mark_wk_workspace(wt)
+
+    # Environment exposed to every pane in the session. Lets agents (claude,
+    # etc.) detect they're inside wk and find the workspace context. tmux's
+    # -e flag on new-session applies to all panes split off this session.
+    env_flags: list[str] = []
+    for k, v in [
+        ("WK_IN_WORKSPACE", "1"),
+        ("WK_SESSION", session),
+        ("WK_BRANCH", real_branch),
+        ("WK_PATH", str(wt)),
+    ]:
+        env_flags.extend(["-e", f"{k}={v}"])
 
     # Sidebar (initial pane). Starts with `wk sidebar` running.
     # `-P -F #{pane_id}` prints the new pane's stable `%NN` id; we use that
@@ -361,16 +435,17 @@ def build_session(session: str, wt: Path, agent: str) -> None:
             "-c", str(wt),
             "-x", str(total_cols), "-y", "75",  # reshaped on attach
             "-n", "work",
+            *env_flags,
             "-P", "-F", "#{pane_id}",
             *_shell_wrap(f"WK_CURRENT={session} {wk} sidebar"),
         ]
     ).stdout.strip()
 
     # Tag the session as wk-managed so tmux-resurrect filters and other tools
-    # can identify it. Stored as a tmux user option (`@wk`), readable via
+    # can identify it. Stored as tmux user options, readable via
     # `tmux show-options -v -t <session> @wk`.
     run(["tmux", "set-option", "-t", session, "@wk", "1"])
-    run(["tmux", "set-option", "-t", session, "@wk-branch", session])  # branch name
+    run(["tmux", "set-option", "-t", session, "@wk-branch", real_branch])
     run(["tmux", "set-option", "-t", session, "@wk-path", str(wt)])
 
     # Agent. Split right of sidebar; new pane takes everything except the
@@ -398,6 +473,10 @@ def build_session(session: str, wt: Path, agent: str) -> None:
             *_shell_wrap(LAZYGIT_CMD),
         ]
     ).stdout.strip()
+
+    # Remember the lazygit pane id so `wk lg-cd` can retarget it later,
+    # even after the layout has been resized or rearranged.
+    run(["tmux", "set-option", "-t", session, "@wk-lazygit-pane", lazygit_id])
 
     # Shell — left column, bottom. Split below sidebar.
     run(
@@ -518,23 +597,27 @@ def pick_branch_name(prompt: str, timeout_seconds: int = 30) -> tuple[str, str]:
 class WorkspaceState:
     """Result of resolving what to do for a `wk open` request.
 
+    `branch` is the canonical git branch name (may contain slashes).
     `wt` is the worktree path that should be used (may be wk's preferred path,
     or an external path picked up from `git worktree list`).
     `created` is True if we created the worktree in this call.
     `branch_created` is True if we created the branch ref in this call.
     """
+    branch: str
     wt: Path
     session: str
     created: bool
     branch_created: bool
 
 
-def find_existing_worktree(branch: str) -> Optional[Path]:
-    """Look up the path of an existing worktree for BRANCH, if any.
+def find_existing_worktree(branch: str) -> Optional[tuple[str, Path]]:
+    """Look up an existing worktree for BRANCH, if any.
 
-    Returns the path from `git worktree list` (which may be at wk's preferred
-    path or anywhere else), or None if no worktree currently checks out the
-    branch.
+    Matches against the real branch name AND the session-form alias
+    (`feat/admin-phase-1` matches input `feat-admin-phase-1`), since users
+    often type the session-style name when invoking `wk open`.
+
+    Returns (real_branch_name, path) on hit, or None.
     """
     out = run(["git", "worktree", "list", "--porcelain"]).stdout
     cur_path: Optional[Path] = None
@@ -543,11 +626,34 @@ def find_existing_worktree(branch: str) -> Optional[Path]:
             cur_path = Path(line[len("worktree ") :])
         elif line.startswith("branch "):
             ref = line[len("branch ") :].removeprefix("refs/heads/")
-            if ref == branch and cur_path is not None:
-                return cur_path
+            if cur_path is not None and (ref == branch or session_name(ref) == branch):
+                return ref, cur_path
         elif line == "":
             cur_path = None
     return None
+
+
+def resolve_branch_alias(branch: str) -> str:
+    """If BRANCH is a session-form alias (hyphens) of a real branch (slashes),
+    return the real branch name. Otherwise return BRANCH unchanged.
+
+    Looks across all local branches, not just ones with worktrees — so this
+    works for branches the user hasn't checked out yet.
+    """
+    main = repo_root()
+    r = run(
+        ["git", "-C", str(main), "for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+        check=False,
+    )
+    if r.returncode != 0:
+        return branch
+    for ref in r.stdout.splitlines():
+        ref = ref.strip()
+        if ref == branch:
+            return ref  # exact match wins
+        if session_name(ref) == branch:
+            return ref  # session-form alias
+    return branch
 
 
 def branch_exists_locally(branch: str) -> bool:
@@ -595,15 +701,22 @@ def resolve_workspace(
     a WorkspaceState describing what's now true on disk.
     """
     main = repo_root()
+
+    # Normalize the input: if the user typed a session-form alias (hyphens),
+    # find the real branch name (with slashes) so all downstream git ops use
+    # the canonical ref. Prevents creating duplicate hyphen-named branches.
+    branch = resolve_branch_alias(branch)
     session = session_name(branch)
 
     # 1/2/6. Existing worktree (wk-created or external).
-    existing_wt = find_existing_worktree(branch)
-    if existing_wt is not None:
+    existing = find_existing_worktree(branch)
+    if existing is not None:
+        real_branch, existing_wt = existing
         if strict_new:
-            die(f"branch {branch!r} already has a worktree at {existing_wt}")
+            die(f"branch {real_branch!r} already has a worktree at {existing_wt}")
         return WorkspaceState(
-            wt=existing_wt, session=session,
+            branch=real_branch,
+            wt=existing_wt, session=session_name(real_branch),
             created=False, branch_created=False,
         )
 
@@ -635,7 +748,7 @@ def resolve_workspace(
         # Case 3.
         console.print(f"[dim]branch exists; checking out into worktree[/dim]")
         run(["git", "-C", str(main), "worktree", "add", str(wt), branch])
-        return WorkspaceState(wt=wt, session=session, created=True, branch_created=False)
+        return WorkspaceState(branch=branch, wt=wt, session=session, created=True, branch_created=False)
 
     if branch_exists_on_remote(branch):
         # Case 4. `git worktree add` with a local branch name that matches
@@ -645,14 +758,14 @@ def resolve_workspace(
             ["git", "-C", str(main), "worktree", "add",
              "--track", "-b", branch, str(wt), f"origin/{branch}"],
         )
-        return WorkspaceState(wt=wt, session=session, created=True, branch_created=True)
+        return WorkspaceState(branch=branch, wt=wt, session=session, created=True, branch_created=True)
 
     # Case 5.
     console.print(f"[dim]creating branch {branch} from {base}[/dim]")
     run(
         ["git", "-C", str(main), "worktree", "add", "-b", branch, str(wt), base]
     )
-    return WorkspaceState(wt=wt, session=session, created=True, branch_created=True)
+    return WorkspaceState(branch=branch, wt=wt, session=session, created=True, branch_created=True)
 
 
 # ---------------------------------------------------------------------------
@@ -683,8 +796,8 @@ def new(
 
     state = resolve_workspace(branch, base, fetch=not no_fetch, strict_new=True)
 
-    build_session(state.session, state.wt, agent_cmd())
-    console.print(f"[green]✓[/green] workspace [bold]{branch}[/bold] ready at {state.wt}")
+    build_session(state.session, state.wt, agent_cmd(), branch=state.branch)
+    console.print(f"[green]✓[/green] workspace [bold]{state.branch}[/bold] ready at {state.wt}")
 
     if not no_attach:
         attach_or_switch(state.session)
@@ -722,13 +835,11 @@ def open_cmd(
     if state.session in tmux_sessions():
         console.print(f"[dim]session running; attaching[/dim]")
     else:
-        build_session(state.session, state.wt, agent_cmd())
-        # Set tags. (resolve_workspace doesn't touch tmux, so we do it here
-        # after build_session has created the session.)
+        build_session(state.session, state.wt, agent_cmd(), branch=state.branch)
         if state.created:
-            console.print(f"[green]✓[/green] workspace [bold]{branch}[/bold] ready at {state.wt}")
+            console.print(f"[green]✓[/green] workspace [bold]{state.branch}[/bold] ready at {state.wt}")
         else:
-            console.print(f"[green]✓[/green] rebuilt session for [bold]{branch}[/bold]")
+            console.print(f"[green]✓[/green] rebuilt session for [bold]{state.branch}[/bold]")
 
     if not no_attach:
         attach_or_switch(state.session)
@@ -813,7 +924,7 @@ def task(
             "echo; echo '── task complete ── press any key to close ──'; "
             "read -n 1"
         )
-        build_session(session, wt, " ".join(_shell_wrap(auto_cmd)))
+        build_session(session, wt, " ".join(_shell_wrap(auto_cmd)), branch=branch)
     else:
         # Interactive: launch claude with the prompt as a positional arg so
         # it's pre-filled in the input buffer. Claude handles the launch
@@ -821,7 +932,7 @@ def task(
         # We use shell-quoting via shlex for safety against unusual chars.
         import shlex
         agent = f"claude {shlex.quote(prompt.strip())}"
-        build_session(session, wt, agent)
+        build_session(session, wt, agent, branch=branch)
 
     # Tag the session as a task workspace so the sidebar can mark it.
     run(["tmux", "set-option", "-t", session, "@wk-task", "1"])
@@ -884,7 +995,7 @@ def restore(
     for b, p in targets:
         s = session_name(b)
         console.print(f"[dim]restoring {b}…[/dim]")
-        build_session(s, p, agent_cmd())
+        build_session(s, p, agent_cmd(), branch=b)
         rebuilt.append(s)
 
     console.print(f"[green]✓[/green] restored {len(rebuilt)} workspace(s)")
@@ -960,35 +1071,62 @@ def switch(
             die(f"no workspace matching {branch!r}")
     else:
         require("fzf")
-        lines = [
-            f"{w.branch}\t{'●' if w.has_session else '○'}\t"
-            f"{'dirty' if w.dirty else 'clean'}\t+{w.ahead}/-{w.behind}"
-            for w in workspaces
-        ]
+        wk = _wk_bin()
+        current = os.environ.get("WK_CURRENT", "")
+        # Compute it ourselves if not exported (e.g. when run from a popup).
+        if not current and in_tmux():
+            r = run(["tmux", "display-message", "-p", "#S"], check=False)
+            current = r.stdout.strip()
+
+        lines: list[str] = []
+        for w in workspaces:
+            marker = "▶" if w.session == current else ("●" if w.has_session else "·")
+            ab = f"+{w.ahead}/-{w.behind}" if (w.ahead or w.behind) else " "
+            status = "✱" if w.dirty else " "
+            display = f"{marker} {w.branch[:30]:<30} {ab:>8} {status}"
+            lines.append(f"{w.session}\t{display}")
+
         proc = subprocess.run(
             [
                 "fzf",
-                "--with-nth=1..",
+                "--with-nth=2",
                 "--delimiter=\t",
-                "--prompt=workspace> ",
+                "--no-info",
+                "--no-scrollbar",
+                "--prompt=workspace❯ ",
+                "--header=enter=switch  j/k=move  /=filter  ctrl-n=new  ctrl-d=rm",
+                "--reverse",
+                "--height=100%",
+                "--cycle",
+                # Preview shows task + recent commits + status. Visible by
+                # default since the popup has room.
+                f"--preview={wk} _preview {{1}}",
+                "--preview-window=right:60%:wrap",
+                "--bind=ctrl-p:toggle-preview",
+                # Vim-style nav by default; `/` enters filter mode where
+                # typing filters as usual. Esc keeps its fzf default (abort),
+                # which is what dismisses the popup.
                 "--disabled",
                 "--bind=j:down,k:up,g:first,G:last",
                 "--bind=/:unbind(j,k,g,G)+enable-search+clear-query",
-                "--bind=esc:rebind(j,k,g,G)+disable-search",
+                # ctrl-n / ctrl-d quick actions on the highlighted workspace
+                f"--bind=ctrl-n:execute(tmux command-prompt -p 'new branch:' 'run-shell \"{wk} new %%\"')+abort",
+                f"--bind=ctrl-d:execute({wk} rm {{1}} --force)+reload({wk} _list-once)",
             ],
             input="\n".join(lines),
             text=True,
             capture_output=True,
+            env={**os.environ, "WK_CURRENT": current},
         )
         if proc.returncode != 0 or not proc.stdout.strip():
             raise typer.Exit(0)
-        picked = proc.stdout.strip().split("\t", 1)[0]
-        target = next(w for w in workspaces if w.branch == picked)
+        picked_session = proc.stdout.strip().split("\t", 1)[0]
+        target = next(w for w in workspaces if w.session == picked_session)
 
     # Ensure the session actually exists; rebuild if not
     if not target.has_session:
         console.print(f"[dim]session missing; rebuilding…[/dim]")
-        build_session(target.session, target.path, agent_cmd())
+        build_session(target.session, target.path, agent_cmd(), branch=target.branch)
 
     attach_or_switch(target.session)
 
@@ -1057,105 +1195,205 @@ def cd(
         die(f"no workspace for {branch!r}")
 
 
+def _active_pane_cwd() -> Optional[str]:
+    """The cwd of the currently focused tmux pane (None if not inside tmux)."""
+    if not in_tmux():
+        return None
+    r = run(
+        ["tmux", "display-message", "-p", "#{pane_current_path}"],
+        check=False,
+    )
+    return r.stdout.strip() or None
+
+
+def _pick_zoxide() -> Optional[Path]:
+    """Open zoxide's fzf-based jump list. Returns the selected dir, or None."""
+    if shutil.which("zoxide") is None:
+        die("zoxide not installed (https://github.com/ajeetdsouza/zoxide)")
+    # `zoxide query -i` opens fzf over the frecency database. fzf does its UI
+    # on the tty, prints the chosen path to stdout. capture_output=True is
+    # safe — fzf reads/writes /dev/tty directly for the UI.
+    r = run(["zoxide", "query", "-i"], check=False)
+    if r.returncode != 0 or not r.stdout.strip():
+        return None
+    return Path(r.stdout.strip()).expanduser().resolve()
+
+
+def _pick_yazi(starting_dir: Path) -> Optional[Path]:
+    """Open yazi as a directory browser. Returns the dir yazi exited from.
+
+    Uses yazi's --cwd-file flag: on exit, yazi writes its last cwd to the
+    given file. So the user navigates to wherever, presses `q`, and we
+    read out where they ended up.
+    """
+    if shutil.which("yazi") is None:
+        die("yazi not installed (https://github.com/sxyazi/yazi)")
+    import tempfile
+    fd, tmpname = tempfile.mkstemp(prefix="wk-yazi-", suffix=".cwd")
+    os.close(fd)
+    try:
+        # capture=False → yazi takes over the terminal (it's a full TUI).
+        run(
+            ["yazi", "--cwd-file", tmpname, str(starting_dir)],
+            check=False, capture=False,
+        )
+        try:
+            content = Path(tmpname).read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        return Path(content).expanduser().resolve() if content else None
+    finally:
+        try:
+            os.unlink(tmpname)
+        except OSError:
+            pass
+
+
+@app.command("lg-cd")
+def lg_cd(
+    path: Optional[str] = typer.Argument(
+        None,
+        help="Directory to point lazygit at. Defaults to the active pane's cwd.",
+    ),
+    pick: Optional[str] = typer.Option(
+        None, "--pick", "-p",
+        help="Pop a picker instead of taking PATH. 'zoxide' = frecency jump list, "
+             "'yazi' = filesystem browser.",
+    ),
+    session: Optional[str] = typer.Option(
+        None, "--session", "-s",
+        help="Target session. Defaults to the current tmux session.",
+    ),
+) -> None:
+    """Retarget the lazygit pane to PATH (default: active pane's cwd).
+
+    Useful when you're working in a subrepo, submodule, or sibling repo and
+    want lazygit to follow you there. Safe to call from anywhere (the agent
+    pane, a shell, or `claude` via Bash) — looks up the lazygit pane by id
+    that `build_session` stored as @wk-lazygit-pane.
+    """
+    require("tmux")
+
+    # Resolve target dir. Priority: explicit path > interactive picker >
+    # active pane's cwd > process cwd.
+    if pick:
+        if path:
+            die("pass either PATH or --pick, not both")
+        if pick == "zoxide":
+            target = _pick_zoxide()
+        elif pick == "yazi":
+            start = (
+                Path(_active_pane_cwd() or os.getcwd()).resolve()
+            )
+            target = _pick_yazi(start)
+        else:
+            die(f"unknown picker {pick!r}; expected 'zoxide' or 'yazi'")
+        if target is None:
+            console.print("[dim](cancelled)[/dim]")
+            return
+    elif path:
+        target = Path(path).expanduser().resolve()
+    elif in_tmux():
+        target = Path(_active_pane_cwd() or os.getcwd()).resolve()
+    else:
+        target = Path.cwd().resolve()
+    if not target.is_dir():
+        die(f"not a directory: {target}")
+
+    # Resolve target session.
+    sess = session
+    if sess is None and in_tmux():
+        r = run(["tmux", "display-message", "-p", "#S"], check=False)
+        sess = r.stdout.strip()
+    if not sess:
+        die("specify --session or run inside a tmux session")
+
+    # Look up the lazygit pane id stored at build time.
+    r = run(
+        ["tmux", "show-options", "-v", "-t", sess, "@wk-lazygit-pane"],
+        check=False,
+    )
+    pane_id = r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
+    if not pane_id:
+        # Pre-marker sessions (or non-wk sessions) fall back to visual index.
+        pane_id = f"{sess}:work.4"
+
+    run(
+        [
+            "tmux", "respawn-pane", "-k",
+            "-t", pane_id,
+            "-c", str(target),
+            *_shell_wrap(LAZYGIT_CMD),
+        ]
+    )
+    console.print(f"[green]✓[/green] lazygit → [dim]{target}[/dim]")
+
+
 @app.command()
 def sidebar() -> None:
-    """Interactive workspace sidebar (runs inside the leftmost tmux pane).
+    """Passive workspace dashboard (runs inside the leftmost tmux pane).
 
-    Continuously lists workspaces and lets you switch by selecting one.
-    Reads $WK_CURRENT to mark the active workspace.
+    Auto-refreshing read-only view of all wk workspaces. Not interactive —
+    use `prefix W` (popup) to actually switch. The pane is a glance,
+    not an input surface.
+
+    Reads $WK_CURRENT to mark the active workspace. Refreshes every 3s.
     """
-    require("fzf")
-    require("tmux")
+    import time as _time
     current = os.environ.get("WK_CURRENT", "")
-    wk = _wk_bin()
+    refresh = float(os.environ.get("WK_SIDEBAR_REFRESH", "3"))
 
-    # The preview script renders the workspace list with the current row marked.
-    # We rebuild the list each loop iteration so dirty/ahead counts stay fresh.
     while True:
-        workspaces = all_workspaces()
-        if not workspaces:
-            # No workspaces yet — show a hint and wait.
+        try:
+            workspaces = all_workspaces()
             console.clear()
-            console.print("[dim](no workspaces)\nUse `wk new <branch>`[/dim]")
-            try:
-                # Sleep but allow Ctrl-C
-                import time
-                time.sleep(3)
-                continue
-            except KeyboardInterrupt:
-                return
-
-        # Build fzf input. Each line: marker, branch, ahead/behind, status.
-        # We tab-delimit and hide the leading session-name field for switching.
-        lines: list[str] = []
-        for w in workspaces:
-            marker = "▶" if w.session == current else (" " if w.has_session else "·")
-            ab = f"+{w.ahead}/-{w.behind}" if (w.ahead or w.behind) else " "
-            status = "✱" if w.dirty else " "
-            # session\tdisplay
-            display = f"{marker} {w.branch[:24]:<24} {ab:>8} {status}"
-            lines.append(f"{w.session}\t{display}")
-
-        # fzf in "loop" mode: returns selected session name on Enter, exits on Esc.
-        # The outer Python loop re-renders the data each iteration, so Esc just
-        # falls through to a re-render.
-        proc = subprocess.run(
-            [
-                "fzf",
-                "--with-nth=2",
-                "--delimiter=\t",
-                "--no-info",
-                "--no-scrollbar",
-                "--prompt=workspaces❯ ",
-                "--header=enter=switch  j/k=move  g/G=top/bot  /=filter  ctrl-n=new  ctrl-d=rm  ctrl-p=preview",
-                "--reverse",
-                "--height=100%",
-                "--cycle",
-                # Preview shows task + recent commits + status for the
-                # highlighted workspace. Hidden by default to keep the sidebar
-                # readable in the narrow pane; ctrl-p toggles it open.
-                f"--preview={wk} _preview {{1}}",
-                "--preview-window=right:60%:hidden:wrap",
-                "--bind=ctrl-p:toggle-preview",
-                # Disable type-to-filter; bind j/k/g/G for vim-style nav.
-                # `/` enters filter mode; Esc returns to nav mode.
-                "--disabled",
-                "--bind=j:down,k:up,g:first,G:last",
-                "--bind=/:unbind(j,k,g,G)+enable-search+clear-query",
-                "--bind=esc:rebind(j,k,g,G)+disable-search",
-                # Ctrl-N prompts for a new branch (via tmux) and creates it
-                f"--bind=ctrl-n:execute(tmux command-prompt -p 'new branch:' 'run-shell \"{wk} new %%\"')+abort",
-                # Ctrl-D removes the highlighted workspace (force)
-                f"--bind=ctrl-d:execute({wk} rm {{1}} --force)+reload(sleep 0.2 && {wk} _list-once)",
-            ],
-            input="\n".join(lines),
-            text=True,
-            capture_output=True,
-            env={**os.environ, "WK_CURRENT": current},
-        )
-        if proc.returncode == 130:  # Esc / Ctrl-C — just re-render the loop
-            continue
-        if proc.returncode != 0 or not proc.stdout.strip():
-            # Sleep briefly to avoid busy-loop if fzf is unavailable mid-run
-            import time
-            time.sleep(0.2)
-            continue
-
-        picked_session = proc.stdout.strip().split("\t", 1)[0]
-        if picked_session and picked_session != current:
-            subprocess.run(["tmux", "switch-client", "-t", picked_session], check=False)
-        # Loop continues — sidebar re-renders.
+            if not workspaces:
+                console.print("[dim](no workspaces)[/dim]")
+                console.print()
+                console.print("[dim]wk new <branch>[/dim]")
+            else:
+                console.print(
+                    f"[bold]workspaces[/bold] [dim]({len(workspaces)})[/dim]"
+                )
+                console.print()
+                for w in workspaces:
+                    if w.session == current:
+                        marker = "[green]▶[/green]"
+                        name_style = "bold"
+                    elif w.has_session:
+                        marker = "[cyan]●[/cyan]"
+                        name_style = ""
+                    else:
+                        marker = "[dim]·[/dim]"
+                        name_style = "dim"
+                    ab = (
+                        f"[yellow]+{w.ahead}/-{w.behind}[/yellow]"
+                        if (w.ahead or w.behind) else " " * 8
+                    )
+                    status = "[red]✱[/red]" if w.dirty else " "
+                    name = w.branch[:24]
+                    if name_style:
+                        name = f"[{name_style}]{name:<24}[/{name_style}]"
+                    else:
+                        name = f"{name:<24}"
+                    console.print(f"{marker} {name} {ab} {status}")
+            console.print()
+            console.print("[dim]prefix W to switch[/dim]")
+            _time.sleep(refresh)
+        except KeyboardInterrupt:
+            return
 
 
 @app.command("_list-once", hidden=True)
 def list_once() -> None:
-    """Internal: dump a single sidebar listing (for fzf --reload)."""
+    """Internal: dump one workspace list line per workspace, tab-delimited
+    `session\\tdisplay`. Used by fzf --reload after destructive actions."""
     current = os.environ.get("WK_CURRENT", "")
     for w in all_workspaces():
-        marker = "▶" if w.session == current else (" " if w.has_session else "·")
+        marker = "▶" if w.session == current else ("●" if w.has_session else "·")
         ab = f"+{w.ahead}/-{w.behind}" if (w.ahead or w.behind) else " "
         status = "✱" if w.dirty else " "
-        display = f"{marker} {w.branch[:24]:<24} {ab:>8} {status}"
+        display = f"{marker} {w.branch[:30]:<30} {ab:>8} {status}"
         print(f"{w.session}\t{display}")
 
 
