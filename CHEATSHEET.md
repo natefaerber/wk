@@ -117,15 +117,15 @@ started.
 |---|---|
 | `prefix M-g` | command-prompt pre-filled with the active pane's cwd; Enter to follow |
 | `prefix M-z` | zoxide popup (frecency-sorted jump list) |
-| `prefix M-y` | yazi popup (full filesystem TUI) |
+| `prefix M-y` | fd + fzf fuzzy picker, rooted at the active pane's cwd |
 
 CLI equivalents (Claude can call any of these):
 
 ```fish
 wk lg-cd                              # follow the calling pane's cwd
 wk lg-cd ~/some/other/repo            # exact path
-wk lg-cd --pick=zoxide                # interactive zoxide
-wk lg-cd --pick=yazi                  # interactive yazi
+wk lg-cd --pick=zoxide                # zoxide jump list
+wk lg-cd --pick=fd                    # fd + fzf, scoped to cwd
 wk lg-cd ~/some/repo --session=feat-foo  # target a specific session
 ```
 

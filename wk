@@ -1219,34 +1219,60 @@ def _pick_zoxide() -> Optional[Path]:
     return Path(r.stdout.strip()).expanduser().resolve()
 
 
-def _pick_yazi(starting_dir: Path) -> Optional[Path]:
-    """Open yazi as a directory browser. Returns the dir yazi exited from.
+def _pick_fd(starting_dir: Path) -> Optional[Path]:
+    """Filesystem-explore picker built on `fd | fzf`. Lists directories
+    rooted at STARTING_DIR (skipping the usual noise: .git, node_modules,
+    build dirs) and lets the user fuzzy-pick one. Returns the selected
+    absolute path, or None on cancel.
 
-    Uses yazi's --cwd-file flag: on exit, yazi writes its last cwd to the
-    given file. So the user navigates to wherever, presses `q`, and we
-    read out where they ended up.
+    Faster and more predictable than a TUI file manager: no terminal probes,
+    no config schema gotchas. fzf does the UI on /dev/tty, fd pipes paths.
     """
-    if shutil.which("yazi") is None:
-        die("yazi not installed (https://github.com/sxyazi/yazi)")
-    import tempfile
-    fd, tmpname = tempfile.mkstemp(prefix="wk-yazi-", suffix=".cwd")
-    os.close(fd)
+    if shutil.which("fd") is None:
+        die("fd not installed (https://github.com/sharkdp/fd)")
+    if shutil.which("fzf") is None:
+        die("fzf not installed")
+
+    fd_cmd = [
+        "fd", "--type", "d",
+        "--hidden",
+        "--max-depth", "8",
+        "--exclude", ".git",
+        "--exclude", "node_modules",
+        "--exclude", ".venv",
+        "--exclude", "venv",
+        "--exclude", "target",
+        "--exclude", "build",
+        "--exclude", "dist",
+        "--exclude", ".next",
+        "--exclude", ".cache",
+        ".",
+        str(starting_dir),
+    ]
+    fd_proc = subprocess.Popen(fd_cmd, stdout=subprocess.PIPE, text=True)
     try:
-        # capture=False → yazi takes over the terminal (it's a full TUI).
-        run(
-            ["yazi", "--cwd-file", tmpname, str(starting_dir)],
-            check=False, capture=False,
+        fzf_proc = subprocess.run(
+            [
+                "fzf",
+                "--prompt=dir❯ ",
+                "--reverse",
+                "--height=100%",
+                "--no-info",
+                "--cycle",
+                "--header", f"pick a directory  (root: {starting_dir})",
+            ],
+            stdin=fd_proc.stdout,
+            capture_output=True,
+            text=True,
         )
-        try:
-            content = Path(tmpname).read_text(encoding="utf-8").strip()
-        except OSError:
-            return None
-        return Path(content).expanduser().resolve() if content else None
     finally:
-        try:
-            os.unlink(tmpname)
-        except OSError:
-            pass
+        if fd_proc.stdout:
+            fd_proc.stdout.close()
+        fd_proc.wait()
+
+    if fzf_proc.returncode != 0 or not fzf_proc.stdout.strip():
+        return None
+    return Path(fzf_proc.stdout.strip()).expanduser().resolve()
 
 
 @app.command("lg-cd")
@@ -1258,7 +1284,7 @@ def lg_cd(
     pick: Optional[str] = typer.Option(
         None, "--pick", "-p",
         help="Pop a picker instead of taking PATH. 'zoxide' = frecency jump list, "
-             "'yazi' = filesystem browser.",
+             "'fd' = fuzzy-pick a directory under the current root via fd+fzf.",
     ),
     session: Optional[str] = typer.Option(
         None, "--session", "-s",
@@ -1281,13 +1307,11 @@ def lg_cd(
             die("pass either PATH or --pick, not both")
         if pick == "zoxide":
             target = _pick_zoxide()
-        elif pick == "yazi":
-            start = (
-                Path(_active_pane_cwd() or os.getcwd()).resolve()
-            )
-            target = _pick_yazi(start)
+        elif pick == "fd":
+            start = Path(_active_pane_cwd() or os.getcwd()).resolve()
+            target = _pick_fd(start)
         else:
-            die(f"unknown picker {pick!r}; expected 'zoxide' or 'yazi'")
+            die(f"unknown picker {pick!r}; expected 'zoxide' or 'fd'")
         if target is None:
             console.print("[dim](cancelled)[/dim]")
             return
