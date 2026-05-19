@@ -207,18 +207,61 @@ def list_wk_worktrees() -> list[tuple[str, Path]]:
     ]
 
 
-def mark_wk_workspace(path: Path) -> None:
+# Branches treated as orchestrator workspaces (gets the orchestrator AGENTS).
+# Extend via WK_ORCHESTRATOR_BRANCHES env var (comma-separated).
+ORCHESTRATOR_BRANCHES = {"main", "master", "develop", "trunk"}
+
+
+def is_orchestrator_branch(branch: str) -> bool:
+    extra = os.environ.get("WK_ORCHESTRATOR_BRANCHES", "")
+    branches = ORCHESTRATOR_BRANCHES | {
+        b.strip() for b in extra.split(",") if b.strip()
+    }
+    return branch in branches
+
+
+def _write_agents_md(path: Path, force: bool = False) -> bool:
+    """Write .wk/AGENTS.md. Returns True if a write happened.
+
+    With force=False, only writes if the file is missing — so users who've
+    edited it locally aren't clobbered. With force=True, unconditional.
+    """
+    target = path / WK_MARKER_DIR / "AGENTS.md"
+    if target.exists() and not force:
+        return False
+    target.parent.mkdir(exist_ok=True)
+    target.write_text(_AGENTS_MD, encoding="utf-8")
+    return True
+
+
+def _write_orchestrator_md(path: Path, branch: str, force: bool = False) -> bool:
+    """Write .wk/ORCHESTRATOR.md if BRANCH is an orchestrator branch.
+    Returns True if a write happened, False if skipped or not applicable."""
+    if not is_orchestrator_branch(branch):
+        return False
+    target = path / WK_MARKER_DIR / "ORCHESTRATOR.md"
+    if target.exists() and not force:
+        return False
+    target.parent.mkdir(exist_ok=True)
+    target.write_text(_ORCHESTRATOR_MD, encoding="utf-8")
+    return True
+
+
+def mark_wk_workspace(path: Path, branch: Optional[str] = None) -> None:
     """Create the .wk/ marker (idempotent). Also writes a .gitignore inside
     so the marker dir doesn't end up tracked in the worktree's git history,
-    and an AGENTS.md so coding agents (Claude, etc.) can self-orient."""
+    an AGENTS.md so coding agents (Claude, etc.) can self-orient, and an
+    ORCHESTRATOR.md when BRANCH is one of the orchestrator branches.
+
+    Existing agent docs are preserved — `wk refresh-agents` overwrites."""
     marker = path / WK_MARKER_DIR
     marker.mkdir(exist_ok=True)
     gi = marker / ".gitignore"
     if not gi.exists():
         gi.write_text("*\n!.gitignore\n", encoding="utf-8")
-    agents = marker / "AGENTS.md"
-    if not agents.exists():
-        agents.write_text(_AGENTS_MD, encoding="utf-8")
+    _write_agents_md(path)
+    if branch:
+        _write_orchestrator_md(path, branch)
 
 
 _AGENTS_MD = """\
@@ -249,16 +292,66 @@ The wk session has 5 panes:
   │ pane.4   │                          │   pane.5         │
   └──────────┴──────────────────────────┴──────────────────┘
 
+## Keep the lazygit pane following you
+
+The lazygit pane in the user's tmux layout is pointed at this worktree
+by default. Whenever you shift your working context to a different
+directory or repository, retarget it so the user's git UI follows along.
+Don't make them notice the mismatch and fix it themselves.
+
+**Run `wk lg-cd <path>` whenever:**
+
+- You create a new worktree with `git worktree add <path> <branch>` — the
+  user will want to see THAT worktree in lazygit, not the one wk started in.
+- You `cd` into a subrepo, submodule, or sibling repository to work there.
+- You create or clone a fresh repo for the user during the session.
+- You're about to do git operations (commit, rebase, push) in a directory
+  other than the one wk started in.
+
+The path arg is required for the lazygit pane to actually move to a new
+location — `wk lg-cd` with no arg follows the *active pane's* cwd, which
+is fine when called from a shell but isn't useful when you (the agent)
+are creating a new directory and want lazygit to jump there.
+
+```sh
+# After: git worktree add ../sibling-repo.worktrees/fix-thing fix-thing
+wk lg-cd ../sibling-repo.worktrees/fix-thing
+```
+
 ## Useful wk commands
 
-- `wk lg-cd [path]` — retarget the lazygit pane at a directory. Run this
-  when you start working in a different repo, submodule, or subrepo than
-  where wk started, so the user's git UI follows along. Defaults to the
-  active pane's cwd if no path is given.
-- `wk task <prompt>` — spawn another wk workspace on a new branch for an
-  independent task. Useful when the user asks for parallel work.
+Lifecycle (when the user asks you to do something with a workspace):
+
+- `wk open <branch>` — switch to an existing wk workspace for that branch,
+  or create one if it doesn't exist yet. Forgiving: works for local
+  branches, remote-only branches, or fresh branches off `main`.
+- `wk close [branch]` — kill the workspace's tmux session but keep the
+  worktree on disk. Default: current session.
+- `wk rm [branch]` — full destruction: kill session, remove worktree,
+  delete branch. Default: current session (user binding is `prefix D`).
+
+Lazygit:
+
+- `wk lg-cd <path>` — retarget the lazygit pane at a directory. See the
+  "Keep the lazygit pane following you" section above for when to call.
+
+Parallel work (only from an orchestrator workspace — see ORCHESTRATOR.md):
+
+- `wk task <prompt>` — spawn another wk workspace on a new branch.
+- `wk task-status [branch]` — running / done / failed for task workspaces.
+- `wk task-output <branch> [--tail N] [--follow]` — read a task's
+  `.wk/output.md` (the `--auto` Claude's stdout).
+- `wk task-merge <branch> [--squash]` — merge a finished task branch
+  back into the current workspace's branch.
+
+Inspection / housekeeping:
+
 - `wk list` — show all wk workspaces with branch/status.
 - `wk cd [branch]` — print the worktree path for `cd` integration.
+- `wk refresh-agents` — regenerate this AGENTS.md (and ORCHESTRATOR.md
+  if applicable) for the current workspace. Use when wk itself ships
+  updated agent docs and you want to pick them up without rebuilding
+  the session.
 
 ## Conventions
 
@@ -266,6 +359,93 @@ The wk session has 5 panes:
   can write notes here (e.g. `.wk/notes.md`) that won't pollute the repo.
 - The `.wk/task.md` file, if present, is the original task prompt that
   `wk task` was invoked with — useful as ground-truth context.
+- If `.wk/ORCHESTRATOR.md` exists, you are an orchestrator workspace
+  (not a worker). Read it for additional instructions about spawning
+  and harvesting parallel tasks.
+"""
+
+
+_ORCHESTRATOR_MD = """\
+# orchestrator workspace
+
+You are running in an **orchestrator** wk workspace — a workspace on a
+long-lived branch (`main`, `master`, `develop`, `trunk`) from which the
+user spawns and supervises parallel task workspaces. Different rules
+apply here than to a worker workspace.
+
+## Your job
+
+When the user describes work that can be parallelized (multiple
+independent bugs, several scoped features, exploration in different
+directions), you should:
+
+1. **Scope** — decompose the request into independent units, each
+   small enough to be a single PR. Talk through the decomposition
+   before spawning anything.
+2. **Spawn** — for each unit, run:
+   ```
+   wk task "<self-contained prompt>" --base <this branch> --auto
+   ```
+   Each `--auto` task spawns a sibling wk workspace + tmux session,
+   runs `claude -p` headlessly with the prompt, and streams output
+   to that workspace's `.wk/output.md`.
+3. **Poll** — periodically check status:
+   ```
+   wk task-status                 # one-line summary of all tasks
+   wk task-output <branch> --tail 50
+   ```
+   Don't poll in a tight loop. Wait for the user to ask for a check,
+   or naturally check at decision points.
+4. **Review** — when a task is `done`, read its full output, inspect
+   the diff (`git diff <base>..<task-branch>`), and decide whether
+   it's mergeable, needs revision, or should be abandoned.
+5. **Integrate** — for mergeable tasks:
+   ```
+   wk task-merge <task-branch>          # --no-ff merge commit
+   wk task-merge <task-branch> --squash # squash into one commit
+   ```
+   The merge happens in *this* worktree, against the current branch.
+6. **Clean up** — after a task is merged, the child workspace is no
+   longer needed. Either `wk close <task-branch>` (kill the session but
+   keep the worktree on disk, in case you want to revisit) or
+   `wk rm <task-branch>` (full destruction). Don't leave dozens of
+   merged-and-done sessions sitting around — they clutter `wk
+   task-status` and the popup picker.
+
+## Rules
+
+- **Keep lazygit pointed at this orchestrator.** When you spawn child
+  workspaces with `wk task`, those get their own tmux sessions and their
+  own lazygit panes. *Your* lazygit pane should stay focused on this
+  orchestrator's worktree — that's where merges happen. Don't `wk lg-cd`
+  to a child's path unless you specifically want to inspect its diff
+  visually, and `wk lg-cd` back to `$WK_PATH` when you're done.
+- **Don't recurse.** Never run `wk task` from inside a child workspace.
+  If a worker needs sub-tasks, surface that back to the user — let them
+  decide whether to split further from the orchestrator.
+- **Don't run blocking commands** while supervising. The orchestrator
+  is meant to be reactive: check status when asked, harvest when ready.
+- **Tasks are immutable until merged.** Don't edit a child workspace's
+  code from the orchestrator. If you want to revise, spawn a fresh task
+  or instruct the user to enter that workspace.
+- **Prompts must be self-contained.** Worker workspaces don't share your
+  conversation history. Write each `wk task` prompt as if briefing a
+  fresh engineer: include file paths, what to change, what to avoid.
+
+## Useful state checks
+
+- `wk list` — what workspaces exist right now
+- `wk task-status` — running/done/failed per task workspace
+- `git -C <task-worktree> log --oneline <base>..HEAD` — what changed
+- `git -C <task-worktree> diff --stat <base>..HEAD` — at a glance
+- `cat <task-worktree>/.wk/output.md` — the worker Claude's stdout
+
+## When NOT to use parallel tasks
+
+- Cross-cutting refactors that touch many files (merges will conflict)
+- Anything that needs the user in the loop mid-task
+- Quick edits you can do faster yourself in this workspace
+- Exploratory questions where you don't know the answer yet
 """
 
 
@@ -410,7 +590,7 @@ def build_session(
 
     # Mark this worktree as a wk workspace before we touch tmux — the sidebar
     # filters on this, and `wk task` may also write its own files under .wk/.
-    mark_wk_workspace(wt)
+    mark_wk_workspace(wt, branch=real_branch)
 
     # Environment exposed to every pane in the session. Lets agents (claude,
     # etc.) detect they're inside wk and find the workspace context. tmux's
@@ -805,10 +985,16 @@ def new(
 
 @app.command("open")
 def open_cmd(
-    branch: str = typer.Argument(..., help="Branch name to open."),
+    branch: Optional[str] = typer.Argument(
+        None, help="Branch name to open. Omit with --pick to fzf-pick one."
+    ),
     base: str = typer.Option(
         DEFAULT_BASE, "--base", "-b",
         help="Base ref (used only if creating a new branch).",
+    ),
+    pick: bool = typer.Option(
+        False, "--pick", "-p",
+        help="fzf over all local + remote branches and open the one chosen.",
     ),
     no_attach: bool = typer.Option(False, "--no-attach", help="Don't attach."),
     no_fetch: bool = typer.Option(False, "--no-fetch", help="Skip `git fetch`."),
@@ -829,6 +1015,16 @@ def open_cmd(
     """
     require("git")
     require("tmux")
+
+    if pick:
+        if branch:
+            die("pass either BRANCH or --pick, not both")
+        branch = _pick_branch()
+        if not branch:
+            console.print("[dim](cancelled)[/dim]")
+            return
+    if not branch:
+        die("missing BRANCH (or pass --pick)")
 
     state = resolve_workspace(branch, base, fetch=not no_fetch, strict_new=False)
 
@@ -910,7 +1106,7 @@ def task(
     # Write the task file. This is the durable record of what the workspace
     # is for, surfaced in the sidebar and readable by `claude` later.
     # `mark_wk_workspace` creates the .wk/ dir and its .gitignore.
-    mark_wk_workspace(wt)
+    mark_wk_workspace(wt, branch=branch)
     task_file = wt / WK_MARKER_DIR / "task.md"
     task_file.write_text(prompt.strip() + "\n", encoding="utf-8")
 
@@ -945,6 +1141,288 @@ def task(
 
     if not no_attach:
         attach_or_switch(session)
+
+
+# ---------------------------------------------------------------------------
+# orchestrator support — status / output / merge for spawned task workspaces
+# ---------------------------------------------------------------------------
+
+
+# Sentinel string that `wk task --auto` writes when claude -p exits cleanly.
+# Used by task-status to distinguish "done" from "running / crashed mid-run".
+_TASK_COMPLETE_MARKER = "── task complete ──"
+
+
+def _is_task_workspace_session(session: str) -> bool:
+    """Did `wk task` create this session? (checks the @wk-task user option)."""
+    r = run(
+        ["tmux", "show-options", "-v", "-t", session, "@wk-task"],
+        check=False,
+    )
+    return r.returncode == 0 and r.stdout.strip() == "1"
+
+
+def _tail_text(path: Path, max_bytes: int = 8192) -> str:
+    """Read the last ~max_bytes of a file; useful for status snapshots
+    without slurping multi-MB logs."""
+    try:
+        with path.open("rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - max_bytes), os.SEEK_SET)
+            return f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+@dataclass
+class TaskStatus:
+    branch: str
+    session: str
+    has_session: bool
+    is_task: bool
+    state: str  # running | done | failed | idle
+    ahead: int
+    behind: int
+    dirty: bool
+    output_path: Path
+    output_size: int
+    last_line: Optional[str]
+    prompt_excerpt: Optional[str]
+
+
+def _task_status(w: Workspace) -> TaskStatus:
+    """Build a status snapshot for one workspace."""
+    is_task = w.has_session and _is_task_workspace_session(w.session)
+    output_path = w.path / WK_MARKER_DIR / "output.md"
+    output_size = output_path.stat().st_size if output_path.exists() else 0
+    last_line: Optional[str] = None
+    state = "idle"
+
+    if output_size > 0:
+        tail = _tail_text(output_path)
+        # Last non-empty line, stripped of ANSI/control chars best-effort.
+        lines = [ln.rstrip() for ln in tail.splitlines() if ln.strip()]
+        last_line = lines[-1] if lines else None
+        if _TASK_COMPLETE_MARKER in tail:
+            state = "done"
+        elif w.has_session:
+            state = "running"
+        else:
+            state = "failed"  # session gone but no completion marker
+    elif is_task and w.has_session:
+        # Auto task with no output yet, or interactive task — call it running.
+        state = "running"
+    elif is_task and not w.has_session:
+        state = "idle"  # task workspace whose session got killed pre-output
+
+    prompt_excerpt: Optional[str] = None
+    r = run(
+        ["tmux", "show-options", "-v", "-t", w.session, "@wk-task-prompt"],
+        check=False,
+    )
+    if r.returncode == 0 and r.stdout.strip():
+        prompt_excerpt = r.stdout.strip().strip('"')
+
+    return TaskStatus(
+        branch=w.branch,
+        session=w.session,
+        has_session=w.has_session,
+        is_task=is_task,
+        state=state,
+        ahead=w.ahead,
+        behind=w.behind,
+        dirty=w.dirty,
+        output_path=output_path,
+        output_size=output_size,
+        last_line=last_line,
+        prompt_excerpt=prompt_excerpt,
+    )
+
+
+_STATE_STYLE = {
+    "running": "yellow",
+    "done": "green",
+    "failed": "red",
+    "idle": "dim",
+}
+
+
+@app.command("task-status")
+def task_status(
+    branch: Optional[str] = typer.Argument(
+        None, help="Specific workspace; omit for a table of all task workspaces."
+    ),
+    all_workspaces_flag: bool = typer.Option(
+        False, "--all", "-a",
+        help="Include non-task wk workspaces too (default: task workspaces only).",
+    ),
+) -> None:
+    """Show status of `wk task` workspaces.
+
+    Designed for orchestrator polling: tells you which tasks are still
+    running, which finished, which crashed, and what each one last said.
+    """
+    workspaces = all_workspaces()
+    if branch:
+        target = next(
+            (w for w in workspaces if w.branch == branch or w.session == branch),
+            None,
+        )
+        if target is None:
+            die(f"no workspace matching {branch!r}")
+        targets = [target]
+    else:
+        targets = workspaces
+
+    rows = [_task_status(w) for w in targets]
+    if not all_workspaces_flag and not branch:
+        rows = [r for r in rows if r.is_task]
+    if not rows:
+        console.print("[dim](no task workspaces)[/dim]")
+        return
+
+    if branch:
+        # Detailed single-workspace render.
+        s = rows[0]
+        style = _STATE_STYLE.get(s.state, "white")
+        console.print(f"[bold]{s.branch}[/bold]  [{style}]{s.state}[/{style}]")
+        console.print(f"  session:  {s.session}  [{'alive' if s.has_session else 'gone'}]")
+        console.print(f"  +{s.ahead}/-{s.behind}   {'dirty' if s.dirty else 'clean'}")
+        if s.prompt_excerpt:
+            console.print(f"  prompt:   [dim]{s.prompt_excerpt}[/dim]")
+        if s.output_size:
+            console.print(f"  output:   {s.output_path} ({s.output_size} bytes)")
+            if s.last_line:
+                console.print(f"  last:     [dim]{s.last_line[:160]}[/dim]")
+        return
+
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("branch")
+    table.add_column("state")
+    table.add_column("session")
+    table.add_column("±", justify="right")
+    table.add_column("dirty", justify="center")
+    table.add_column("last output")
+    for s in rows:
+        style = _STATE_STYLE.get(s.state, "white")
+        table.add_row(
+            s.branch[:36],
+            f"[{style}]{s.state}[/{style}]",
+            "●" if s.has_session else "·",
+            f"+{s.ahead}/-{s.behind}",
+            "✱" if s.dirty else " ",
+            (s.last_line or "")[:80],
+        )
+    console.print(table)
+
+
+@app.command("task-output")
+def task_output(
+    branch: str = typer.Argument(..., help="Branch / session of the task workspace."),
+    tail: Optional[int] = typer.Option(
+        None, "--tail", "-n", help="Show only the last N lines."
+    ),
+    follow: bool = typer.Option(
+        False, "--follow", "-f", help="Stream new output (tail -f style)."
+    ),
+) -> None:
+    """Dump a task workspace's `.wk/output.md` (the `--auto` claude's stdout)."""
+    target = next(
+        (w for w in all_workspaces() if w.branch == branch or w.session == branch),
+        None,
+    )
+    if target is None:
+        die(f"no workspace matching {branch!r}")
+    output_path = target.path / WK_MARKER_DIR / "output.md"
+    if not output_path.exists():
+        die(f"no output yet at {output_path}")
+
+    if follow:
+        # Hand off to `tail -f` so we don't reimplement the inotify dance.
+        os.execvp("tail", ["tail", "-f", str(output_path)])
+    if tail is not None:
+        # Read last N lines without slurping the whole file.
+        text = _tail_text(output_path, max_bytes=max(8192, tail * 200))
+        lines = text.splitlines()
+        sys.stdout.write("\n".join(lines[-tail:]) + "\n")
+        return
+    sys.stdout.write(output_path.read_text(encoding="utf-8", errors="replace"))
+
+
+@app.command("task-merge")
+def task_merge(
+    branch: str = typer.Argument(..., help="Task branch to merge into the current workspace's branch."),
+    squash: bool = typer.Option(
+        False, "--squash", help="Squash-merge (one commit) instead of --no-ff merge."
+    ),
+    ff_only: bool = typer.Option(
+        False, "--ff-only", help="Fast-forward-only merge (fail if not a fast-forward)."
+    ),
+    no_commit: bool = typer.Option(
+        False, "--no-commit",
+        help="Merge but don't commit (lets you inspect before finalizing).",
+    ),
+) -> None:
+    """Merge a task branch into the *current* wk workspace's branch.
+
+    Run from inside the orchestrator's tmux session. The merge happens in
+    that worktree, against its current branch. Errors if either side has
+    uncommitted changes or the task workspace has unsaved work.
+    """
+    require("git")
+    if not in_tmux():
+        die("run from inside a wk session (the orchestrator workspace)")
+    r = run(["tmux", "display-message", "-p", "#S"], check=False)
+    orch_session = r.stdout.strip()
+    workspaces = all_workspaces()
+    orch = next((w for w in workspaces if w.session == orch_session), None)
+    if orch is None:
+        die("current tmux session isn't a wk workspace")
+    task = next(
+        (w for w in workspaces if w.branch == branch or w.session == branch),
+        None,
+    )
+    if task is None:
+        die(f"no workspace matching {branch!r}")
+    if task.session == orch.session:
+        die("can't merge a workspace into itself")
+    if task.dirty:
+        die(
+            f"task workspace [bold]{task.branch}[/bold] has uncommitted changes; "
+            "commit or stash before merging"
+        )
+    if orch.dirty:
+        die(
+            f"orchestrator workspace [bold]{orch.branch}[/bold] has uncommitted changes; "
+            "commit or stash before merging"
+        )
+
+    cmd = ["git", "-C", str(orch.path), "merge"]
+    if ff_only:
+        cmd.append("--ff-only")
+    elif squash:
+        cmd.append("--squash")
+    else:
+        cmd.append("--no-ff")
+    if no_commit and not squash:
+        cmd.append("--no-commit")
+    cmd.append(task.branch)
+
+    console.print(f"[dim]$ {' '.join(cmd)}[/dim]")
+    result = run(cmd, check=False, capture=False)
+    if result.returncode != 0:
+        die(
+            f"merge failed (rc={result.returncode}); resolve in {orch.path}"
+        )
+    console.print(
+        f"[green]✓[/green] merged [bold]{task.branch}[/bold] → "
+        f"[bold]{orch.branch}[/bold]"
+    )
+    if squash:
+        console.print(
+            f"[dim]squashed — commit manually in {orch.path}[/dim]"
+        )
 
 
 @app.command()
@@ -1002,6 +1480,64 @@ def restore(
 
     if not no_attach and len(rebuilt) == 1:
         attach_or_switch(rebuilt[0])
+
+
+@app.command("refresh-agents")
+def refresh_agents(
+    branch: Optional[str] = typer.Argument(
+        None, help="Workspace to refresh. Omit for the current session."
+    ),
+    all_workspaces_flag: bool = typer.Option(
+        False, "--all", "-a", help="Refresh every wk workspace."
+    ),
+) -> None:
+    """Regenerate `.wk/AGENTS.md` (and `.wk/ORCHESTRATOR.md` when applicable)
+    in place. Overwrites existing files — useful after `wk` itself ships
+    updated agent docs.
+
+    With no arguments, refreshes the current tmux session's workspace.
+    Pass a branch name to target a specific one, or `--all` for every wk
+    workspace this repo knows about.
+    """
+    workspaces = all_workspaces()
+    if all_workspaces_flag:
+        targets = workspaces
+    elif branch:
+        targets = [
+            w for w in workspaces
+            if w.branch == branch or w.session == branch
+        ]
+        if not targets:
+            die(f"no workspace matching {branch!r}")
+    else:
+        if not in_tmux():
+            die("not inside tmux; pass a branch name or --all")
+        r = run(["tmux", "display-message", "-p", "#S"], check=False)
+        sess = r.stdout.strip()
+        targets = [w for w in workspaces if w.session == sess]
+        if not targets:
+            die(f"current session {sess!r} isn't a wk workspace")
+
+    refreshed = 0
+    for w in targets:
+        wrote_agents = _write_agents_md(w.path, force=True)
+        wrote_orch = _write_orchestrator_md(w.path, w.branch, force=True)
+        parts: list[str] = []
+        if wrote_agents:
+            parts.append("AGENTS.md")
+        if wrote_orch:
+            parts.append("ORCHESTRATOR.md")
+        if parts:
+            refreshed += 1
+            console.print(
+                f"[green]✓[/green] {w.branch}: refreshed {', '.join(parts)}"
+            )
+        else:
+            console.print(f"[dim]·[/dim] {w.branch}: no agent docs apply")
+    if all_workspaces_flag:
+        console.print(
+            f"[dim]refreshed {refreshed}/{len(targets)} workspace(s)[/dim]"
+        )
 
 
 @app.command()
@@ -1131,38 +1667,253 @@ def switch(
     attach_or_switch(target.session)
 
 
+def _set_last_wk_session(session: str) -> None:
+    """Remember SESSION as the most recently visited wk session, so
+    `wk cycle last` can toggle back to it. Stored as a server-wide tmux
+    user option so it survives detach/re-attach but resets when tmux
+    server exits."""
+    run(
+        ["tmux", "set-option", "-s", "@wk-last-session", session],
+        check=False,
+    )
+
+
+def _get_last_wk_session() -> Optional[str]:
+    r = run(
+        ["tmux", "show-options", "-s", "-v", "@wk-last-session"],
+        check=False,
+    )
+    val = r.stdout.strip() if r.returncode == 0 else ""
+    return val or None
+
+
+@app.command("cycle")
+def cycle(
+    direction: str = typer.Argument(
+        "next",
+        help="'next' / 'prev' / 'last' (or 'n' / 'p' / 'l').",
+    ),
+) -> None:
+    """Switch among *running* wk sessions.
+
+    Three modes:
+
+    \b
+      next / n  →  alphabetically next wk session (wraps)
+      prev / p  →  alphabetically previous wk session (wraps)
+      last / l  →  toggle back to the most recently visited wk session
+                   (alt-tab style)
+
+    Only sessions tagged `@wk` are considered — plain tmux sessions and
+    `wk-dashboard` don't pollute the cycle. Every cycle records the
+    session it's leaving so `last` always has a target.
+
+    Suggested non-prefix tmux bindings (add to your config):
+
+    \b
+        bind-key -n M-]  run-shell "wk cycle next"
+        bind-key -n M-[  run-shell "wk cycle prev"
+        bind-key -n M-m  run-shell "wk cycle last"
+    """
+    require("tmux")
+    if direction in ("n", "next"):
+        delta: Optional[int] = 1
+    elif direction in ("p", "prev"):
+        delta = -1
+    elif direction in ("l", "last"):
+        delta = None  # special: toggle to last visited
+    else:
+        die(f"direction must be next / prev / last; got {direction!r}")
+    if not in_tmux():
+        die("not inside tmux; cycle needs a current session to step from")
+
+    sessions = sorted(wk_tmux_sessions())
+    if not sessions:
+        return
+    r = run(["tmux", "display-message", "-p", "#S"], check=False)
+    current = r.stdout.strip()
+
+    if delta is None:
+        # last: toggle to the previously-recorded wk session.
+        last = _get_last_wk_session()
+        if not last or last == current or last not in sessions:
+            return
+        target = last
+    else:
+        try:
+            idx = sessions.index(current)
+        except ValueError:
+            idx = -1 if delta > 0 else 0
+        target = sessions[(idx + delta) % len(sessions)]
+        if target == current:
+            return  # only one wk session running
+
+    # Record where we were *before* switching, so the next `cycle last`
+    # toggles back here. Done for next/prev/last alike, which makes
+    # last-toggling between two workspaces feel like alt-tab.
+    _set_last_wk_session(current)
+    run(["tmux", "switch-client", "-t", target], check=False)
+
+
+@app.command()
+def close(
+    branch: Optional[str] = typer.Argument(
+        None, help="Workspace to close. Default: current tmux session."
+    ),
+) -> None:
+    """Kill the tmux session but keep the worktree on disk.
+
+    Use this when you're done with a workspace for now but might come
+    back to it. The branch, worktree, and any uncommitted changes survive
+    — `wk open <branch>` rebuilds the session later. For total destruction
+    (kill session + remove worktree + delete branch), use `wk rm`.
+
+    Refuses to kill non-wk tmux sessions (those without the @wk option).
+    """
+    require("tmux")
+
+    if branch:
+        target = next(
+            (w for w in all_workspaces()
+             if w.branch == branch or w.session == branch),
+            None,
+        )
+        if target is None:
+            die(f"no workspace matching {branch!r}")
+        session = target.session
+        label = target.branch
+    else:
+        if not in_tmux():
+            die("not inside tmux; pass a branch / workspace name")
+        r = run(["tmux", "display-message", "-p", "#S"], check=False)
+        session = r.stdout.strip()
+        # Find the branch for nicer output, falling back to the session name.
+        match = next(
+            (w for w in all_workspaces() if w.session == session),
+            None,
+        )
+        label = match.branch if match else session
+
+    # Refuse to kill sessions wk doesn't own — protects plain tmux sessions
+    # that happen to share a name with a branch.
+    r = run(
+        ["tmux", "show-options", "-v", "-t", session, "@wk"],
+        check=False,
+    )
+    if r.returncode != 0 or r.stdout.strip() != "1":
+        die(f"session {session!r} isn't a wk session; refusing to kill")
+
+    run(["tmux", "kill-session", "-t", session], check=False)
+    console.print(
+        f"[green]✓[/green] closed [bold]{label}[/bold] "
+        f"[dim](worktree preserved; `wk open {label}` to resume)[/dim]"
+    )
+
+
+def _do_rm(w: Workspace, main: Path, force: bool, keep_branch: bool) -> None:
+    """The actual destructive work for `wk rm`: kill session, remove worktree,
+    optionally delete the branch. Best-effort — git failures don't bubble up
+    because we've already passed pre-flight checks and partial cleanup is
+    better than a half-done abort."""
+    if w.has_session:
+        run(["tmux", "kill-session", "-t", w.session], check=False)
+    args = ["git", "-C", str(main), "worktree", "remove", str(w.path)]
+    if force:
+        args.append("--force")
+    run(args, check=False)
+    if not keep_branch:
+        run(["git", "-C", str(main), "branch", "-D", w.branch], check=False)
+
+
 @app.command()
 def rm(
-    branch: str = typer.Argument(..., help="Branch / workspace to remove."),
+    branch: Optional[str] = typer.Argument(
+        None, help="Branch / workspace to remove. Default: current tmux session."
+    ),
     force: bool = typer.Option(False, "--force", "-f", help="Remove even if dirty."),
     keep_branch: bool = typer.Option(
         False, "--keep-branch", help="Keep the branch ref after removing the worktree."
     ),
 ) -> None:
-    """Kill the tmux session and remove the worktree."""
+    """Kill the tmux session and remove the worktree.
+
+    With no BRANCH, removes the workspace whose tmux session you're
+    currently in. Killing the session you're attached to needs special
+    handling — the rm work is detached into a background process so it
+    survives the session dying. tmux auto-switches your client to another
+    session (or detaches) when the kill lands.
+    """
+    require("git")
+    require("tmux")
+    main = repo_root()
+    workspaces = {w.branch: w for w in all_workspaces()}
+
+    if branch is None:
+        if not in_tmux():
+            die("not inside tmux; pass a branch name")
+        r = run(["tmux", "display-message", "-p", "#S"], check=False)
+        current_session = r.stdout.strip()
+        match = next(
+            (w for w in workspaces.values() if w.session == current_session),
+            None,
+        )
+        if match is None:
+            die(f"current session {current_session!r} isn't a wk workspace")
+        branch = match.branch
+
+    w = workspaces.get(branch)
+    if w is None:
+        die(f"no workspace for {branch!r}")
+    if w.dirty and not force:
+        die("worktree is dirty; use --force or commit first")
+
+    # Self-destruct? If our tmux session is the one we're killing, our
+    # Python process is doomed too. Re-spawn the rm in a detached child
+    # so it survives the session kill.
+    self_remove = False
+    if in_tmux() and w.has_session:
+        r = run(["tmux", "display-message", "-p", "#S"], check=False)
+        if r.stdout.strip() == w.session:
+            self_remove = True
+
+    if self_remove:
+        wk_bin = _wk_bin()
+        args = [wk_bin, "_rm-detached", w.branch]
+        if force:
+            args.append("--force")
+        if keep_branch:
+            args.append("--keep-branch")
+        subprocess.Popen(
+            args,
+            start_new_session=True,  # become a new session leader → survives parent SIGHUP
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        # No success message — the popup/pane is about to die.
+        return
+
+    _do_rm(w, main, force, keep_branch)
+    console.print(f"[green]✓[/green] removed {branch}")
+
+
+@app.command("_rm-detached", hidden=True)
+def _rm_detached(
+    branch: str = typer.Argument(...),
+    force: bool = typer.Option(False, "--force", "-f"),
+    keep_branch: bool = typer.Option(False, "--keep-branch"),
+) -> None:
+    """Internal: finish the destructive work for `wk rm` from a process
+    detached from the doomed tmux session. Spawned by `wk rm` when the
+    current session is the one being removed."""
     require("git")
     require("tmux")
     main = repo_root()
     workspaces = {w.branch: w for w in all_workspaces()}
     w = workspaces.get(branch)
     if w is None:
-        die(f"no workspace for {branch!r}")
-
-    if w.dirty and not force:
-        die(f"worktree is dirty; use --force or commit first")
-
-    if w.has_session:
-        run(["tmux", "kill-session", "-t", w.session], check=False)
-
-    args = ["git", "-C", str(main), "worktree", "remove", str(w.path)]
-    if force:
-        args.append("--force")
-    run(args)
-
-    if not keep_branch:
-        run(["git", "-C", str(main), "branch", "-D", branch], check=False)
-
-    console.print(f"[green]✓[/green] removed {branch}")
+        return
+    _do_rm(w, main, force, keep_branch)
 
 
 @app.command()
@@ -1204,6 +1955,115 @@ def _active_pane_cwd() -> Optional[str]:
         check=False,
     )
     return r.stdout.strip() or None
+
+
+def _pick_branch() -> Optional[str]:
+    """Fzf over all local + remote branches in this repo, sorted by most
+    recent commit activity. Shows a marker for branches that already have
+    a wk workspace (● = running session, · = worktree but no session). The
+    caller passes the chosen branch to `wk open`, which switches to an
+    existing workspace if there is one or creates a new one otherwise.
+
+    Returns the selected short branch name (origin/ prefix stripped),
+    or None on cancel."""
+    require("fzf")
+    main = repo_root()
+
+    # Map of branch → workspace status, so picks can show whether a wk
+    # workspace already exists.
+    workspaces = {w.branch: w for w in all_workspaces()}
+
+    def _wk_marker(name: str) -> str:
+        w = workspaces.get(name)
+        if w is None:
+            return " "
+        if w.has_session:
+            return "●"  # workspace + tmux session running
+        return "·"      # workspace dir exists, session was closed
+
+    def _format_line(name: str, date: str, subject: str, remote: bool) -> str:
+        # Hidden field 1 = the bare branch name (what fzf returns).
+        # Visible: marker + branch (padded) + date + subject + [remote]?
+        display_name = (name[:32]).ljust(32)
+        tag = " [remote]" if remote else ""
+        visible = (
+            f"{_wk_marker(name)} {display_name}  "
+            f"{(date or '')[:18]:<18}  {(subject or '')[:60]}{tag}"
+        )
+        return f"{name}\t{visible}"
+
+    # Local branches first, most-recent first.
+    local_proc = run(
+        [
+            "git", "-C", str(main), "for-each-ref",
+            "--sort=-committerdate",
+            "--format=%(refname:short)\t%(committerdate:relative)\t%(contents:subject)",
+            "refs/heads/",
+        ],
+        check=False,
+    )
+    local_lines: list[str] = []
+    local_names: set[str] = set()
+    if local_proc.returncode == 0:
+        for ln in local_proc.stdout.splitlines():
+            parts = ln.split("\t", 2)
+            if len(parts) < 1 or not parts[0]:
+                continue
+            name = parts[0]
+            local_names.add(name)
+            date = parts[1] if len(parts) > 1 else ""
+            subject = parts[2] if len(parts) > 2 else ""
+            local_lines.append(_format_line(name, date, subject, remote=False))
+
+    # Remote-only branches (skip ones with a local counterpart).
+    remote_proc = run(
+        [
+            "git", "-C", str(main), "for-each-ref",
+            "--sort=-committerdate",
+            "--format=%(refname:short)\t%(committerdate:relative)\t%(contents:subject)",
+            "refs/remotes/origin/",
+        ],
+        check=False,
+    )
+    remote_lines: list[str] = []
+    if remote_proc.returncode == 0:
+        for ln in remote_proc.stdout.splitlines():
+            parts = ln.split("\t", 2)
+            if not parts or not parts[0]:
+                continue
+            full = parts[0]
+            if full.endswith("/HEAD"):
+                continue
+            short = full.removeprefix("origin/")
+            if short in local_names:
+                continue
+            date = parts[1] if len(parts) > 1 else ""
+            subject = parts[2] if len(parts) > 2 else ""
+            remote_lines.append(_format_line(short, date, subject, remote=True))
+
+    lines = local_lines + remote_lines
+    if not lines:
+        return None
+
+    proc = subprocess.run(
+        [
+            "fzf",
+            "--with-nth=2..",       # hide field 1 (the bare branch name)
+            "--delimiter=\t",
+            "--prompt=branch❯ ",
+            "--header=●=session running  ·=worktree only  enter=open/switch  /=filter",
+            "--reverse",
+            "--cycle",
+            "--height=100%",
+            "--no-info",
+        ],
+        input="\n".join(lines),
+        text=True,
+        capture_output=True,
+    )
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    return proc.stdout.strip().split("\t", 1)[0]
 
 
 def _pick_zoxide() -> Optional[Path]:
@@ -1361,9 +2221,11 @@ def sidebar() -> None:
     use `prefix W` (popup) to actually switch. The pane is a glance,
     not an input surface.
 
-    Reads $WK_CURRENT to mark the active workspace. Refreshes every 3s.
+    Reads $WK_CURRENT to mark the active workspace. Refreshes every 3s
+    (tune with WK_SIDEBAR_REFRESH).
     """
     import time as _time
+
     current = os.environ.get("WK_CURRENT", "")
     refresh = float(os.environ.get("WK_SIDEBAR_REFRESH", "3"))
 
@@ -1395,11 +2257,11 @@ def sidebar() -> None:
                         if (w.ahead or w.behind) else " " * 8
                     )
                     status = "[red]✱[/red]" if w.dirty else " "
-                    name = w.branch[:24]
+                    name = w.branch[:36]
                     if name_style:
-                        name = f"[{name_style}]{name:<24}[/{name_style}]"
+                        name = f"[{name_style}]{name:<36}[/{name_style}]"
                     else:
-                        name = f"{name:<24}"
+                        name = f"{name:<36}"
                     console.print(f"{marker} {name} {ab} {status}")
             console.print()
             console.print("[dim]prefix W to switch[/dim]")
@@ -1465,21 +2327,88 @@ def preview(session: str = typer.Argument(...)) -> None:
 
 
 @app.command()
-def dashboard() -> None:
-    """Open the cross-workspace overview session."""
+def dashboard(
+    refresh: Optional[float] = typer.Option(
+        None, "--refresh", "-r",
+        help="Refresh interval in seconds. Default 30, overridable via "
+             "WK_DASHBOARD_REFRESH env var. Minimum 1s.",
+    ),
+) -> None:
+    """Open the cross-workspace overview session.
+
+    Creates a `wk-dashboard` tmux session running an auto-refreshing
+    `wk list`. Defaults to 30s refresh; `prefix M-r` forces an immediate
+    redraw via SIGUSR1.
+    """
     require("tmux")
+    if refresh is None:
+        env_val = os.environ.get("WK_DASHBOARD_REFRESH")
+        try:
+            refresh = float(env_val) if env_val else 30.0
+        except ValueError:
+            refresh = 30.0
+    refresh = max(1.0, refresh)
+
     if DASHBOARD_SESSION not in tmux_sessions():
-        # Build it: one pane running `watch wk list`
         wk_path = shutil.which("wk") or sys.argv[0]
         run(
             [
                 "tmux", "new-session", "-d",
                 "-s", DASHBOARD_SESSION,
                 "-n", "overview",
-                "sh", "-c", f"while true; do clear; {wk_path} list; sleep 3; done",
+                wk_path, "_dashboard-render", "--refresh", str(refresh),
             ]
         )
+        # Tag so the M-r binding can target this session's renderer.
+        run(["tmux", "set-option", "-t", DASHBOARD_SESSION, "@wk-dashboard", "1"])
     attach_or_switch(DASHBOARD_SESSION)
+
+
+@app.command("_dashboard-render", hidden=True)
+def _dashboard_render(
+    refresh: float = typer.Option(30.0, "--refresh", "-r"),
+) -> None:
+    """Internal: the render loop that runs inside the wk-dashboard session.
+
+    Calls `wk list` on a clock. Handles SIGUSR1 by waking sleep early so the
+    next iteration redraws immediately — bound to `prefix M-r` via pkill.
+    """
+    import time as _time
+    import signal as _signal
+
+    refresh = max(1.0, refresh)
+    _signal.signal(_signal.SIGUSR1, lambda *_: None)
+
+    while True:
+        try:
+            console.clear()
+            # Reuse the `list` command's output by invoking it directly.
+            workspaces = all_workspaces()
+            if not workspaces:
+                console.print("[dim](no workspaces)[/dim]")
+            else:
+                table = Table(show_header=True, header_style="bold")
+                table.add_column("branch")
+                table.add_column("session", justify="center")
+                table.add_column("±", justify="right")
+                table.add_column("dirty", justify="center")
+                table.add_column("path")
+                for w in workspaces:
+                    table.add_row(
+                        w.branch,
+                        "[cyan]●[/cyan]" if w.has_session else "[dim]·[/dim]",
+                        f"+{w.ahead}/-{w.behind}" if (w.ahead or w.behind) else " ",
+                        "[red]✱[/red]" if w.dirty else " ",
+                        f"[dim]{w.path}[/dim]",
+                    )
+                console.print(table)
+            console.print()
+            console.print(
+                f"[dim]auto-refresh every {refresh:g}s · M-r to refresh now[/dim]"
+            )
+            _time.sleep(refresh)
+        except KeyboardInterrupt:
+            return
 
 
 if __name__ == "__main__":

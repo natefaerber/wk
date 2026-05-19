@@ -56,9 +56,28 @@ conversation for that worktree (or starts fresh if there isn't one).
 
 ### Clean up
 
+Three "closes," in order of reversibility:
+
 ```fish
-wk rm release/v35           # kill session + remove worktree
-wk rm release/v35 --force   # skip "are you sure" prompts
+# 1. Detach — keep everything, just stop looking at it
+#    (tmux default: prefix d, or close your terminal)
+
+# 2. Close — kill the tmux session, keep the worktree on disk
+wk close                    # current workspace
+wk close release/v35        # specific workspace
+#    Bound to `prefix X` for the current workspace. Resume with `wk open <branch>`.
+
+# 3. Remove — full destruction (kill session + remove worktree + delete branch)
+wk rm                       # CURRENT workspace (self-destruct, see below)
+wk rm release/v35           # specific; refuses if dirty
+wk rm release/v35 --force   # remove even if dirty
+wk rm release/v35 --keep-branch   # remove worktree but keep the branch ref
+#    From `prefix W`, ctrl-d on the highlighted row does the same.
+#    From inside any wk session, `prefix D` prompts "type yes" and runs
+#    `wk rm --force`. Self-removal: the rm work runs in a detached
+#    background process so it survives tmux killing the session it
+#    was launched from. tmux auto-switches your client to another
+#    session (or detaches) once the kill lands.
 ```
 
 ---
@@ -93,9 +112,18 @@ The sidebar pane is **read-only** — you don't navigate into it. To switch:
 
 | binding | what |
 |---|---|
-| `prefix W` | popup picker (fzf) with preview, j/k nav, `/` to filter |
+| `prefix W` | popup picker (fzf) over **existing wk workspaces**; switch on Enter |
+| `prefix O` | popup picker over **all git branches** (local + remote), sorted by most recent commit. Markers show wk status (●=session running, ·=worktree only). Pick one → if it has a wk workspace, switches to it; otherwise creates one. |
 | `prefix W` then `ctrl-n` | prompt for a new branch and create it |
 | `prefix W` then `ctrl-d` | delete the highlighted workspace |
+| `M-]` / `M-[` | **cycle next/prev running wk session** — no prefix, fires on bare keystroke. Like browser tabs. |
+| `M-m` | **toggle to last visited wk session** — alt-tab style. Repeated presses bounce between two recent workspaces. |
+
+CLI: `wk cycle next` / `wk cycle prev` / `wk cycle last`. Suitable for binding
+to any chord — only @wk-tagged sessions are in the cycle, so plain tmux
+sessions and `wk-dashboard` don't get in the way. The "last visited" pointer
+is stored as a server-wide tmux option (`@wk-last-session`) so it persists
+across detach/re-attach.
 
 Inside the popup: `enter` switches, `esc` dismisses, `ctrl-p` toggles preview.
 
@@ -162,18 +190,67 @@ auto-context:
 
 ---
 
+## Orchestrator pattern
+
+The workspace on your repo's long-lived branch (`main`/`master`/`develop`/
+`trunk`, configurable via `WK_ORCHESTRATOR_BRANCHES`) is treated as the
+**orchestrator**. It gets an extra `.wk/ORCHESTRATOR.md` documenting the
+spawn → poll → review → merge workflow so Claude inside the orchestrator
+knows how to drive parallel work.
+
+Typical flow from the orchestrator:
+
+```fish
+# 1. Spawn parallel tasks (each gets its own wk session + worktree)
+wk task "fix tenant-settings 500s in admin module" --base main --auto
+wk task "add audit log to webhooks endpoint"      --base main --auto
+wk task "extract email service to its own module" --base main --auto
+
+# 2. Poll status
+wk task-status                       # table of all task workspaces
+wk task-status fix-tenant-500s       # detailed view of one
+wk task-output fix-tenant-500s -n 50 # last 50 lines of stdout
+
+# 3. Review and integrate
+git -C ~/_Work/credo-backend.worktrees/fix-tenant-500s diff main..
+wk task-merge fix-tenant-500s         # --no-ff merge commit (default)
+wk task-merge fix-tenant-500s --squash # squash into one commit
+```
+
+| binding | what |
+|---|---|
+| `prefix M-t` | popup showing `wk task-status` (read-only) |
+| `prefix M-r` | force-refresh the `wk dashboard` session (sends SIGUSR1) |
+
+Claude inside an orchestrator workspace can drive all of the above via
+its Bash tool: `wk task`, `wk task-status`, `wk task-output`, `wk task-merge`.
+
+Don't run `wk task` from inside a child workspace — that's recursion and
+the orchestrator pattern breaks. Surface sub-task ideas back to the user
+or to the orchestrator instead.
+
+---
+
 ## Commands reference
 
 ```
 wk new <branch>                  # create + attach (errors if branch exists)
 wk open <branch>                 # create-or-attach (forgiving)
+wk open --pick                   # fzf over all branches, open the chosen one
+wk close [branch]                # kill session, keep worktree (default: current)
+wk rm [branch]                   # destroy session + worktree + branch (default: current)
 wk task <prompt>                 # Claude names a branch, launches with prompt
+wk task --auto <prompt>          # headless task (claude -p, output to .wk/output.md)
 wk switch [branch]               # switch to existing workspace; fzf if no arg
 wk list                          # show all workspaces with status
 wk rm <branch>                   # destroy session + worktree
 wk restore [branch]              # rebuild tmux session(s) for existing worktrees
+wk refresh-agents [branch|--all] # regenerate .wk/AGENTS.md and ORCHESTRATOR.md
 wk cd [branch]                   # print worktree path (for shell cd integration)
 wk lg-cd [path] [--pick=...]     # retarget lazygit pane
+wk task-status [branch]          # status table / detail of task workspaces
+wk task-output <branch> [-n N]   # dump a task's .wk/output.md (--follow streams)
+wk task-merge <branch>           # merge task branch into orchestrator's branch
 wk sidebar                       # the dashboard renderer (runs in pane.1)
 wk dashboard                     # cross-workspace overview session
 ```
@@ -186,7 +263,8 @@ wk dashboard                     # cross-workspace overview session
 |---|---|---|
 | `WK_AGENT_CMD` | `claude -c \|\| claude` | command run in the agent pane |
 | `WK_WORKTREE_ROOT` | `<repo>.worktrees/` | where to put worktrees |
-| `WK_SIDEBAR_REFRESH` | `3` | dashboard refresh interval in seconds |
+| `WK_SIDEBAR_REFRESH` | `3` | sidebar pane refresh interval in seconds |
+| `WK_DASHBOARD_REFRESH` | `30` | `wk dashboard` refresh interval in seconds (min 1) |
 
 ---
 
