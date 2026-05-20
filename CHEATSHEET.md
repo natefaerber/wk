@@ -270,9 +270,34 @@ wk dashboard                     # cross-workspace overview session
 
 ## Install / update
 
+### From source (full setup — installs tmux config, fish helper, lazygit config)
+
 ```fish
 cd ~/path/to/wk
 ./install.sh --link     # symlinks; future edits to wk source take effect immediately
 ./install.sh            # copy mode
 ./install.sh --uninstall
 ```
+
+### Via mise (CLI only)
+
+```fish
+mise use -g "ubi:natefaerber/wk[exe=wk]"
+```
+
+This installs just the `wk` binary. The tmux bindings (`wk.conf`), lazygit
+config, and fish `cdw` helper are not installed — clone the repo and run
+`./install.sh` if you want the full keystroke experience.
+
+Requires `uv` on `PATH` (wk's shebang is `#!/usr/bin/env -S uv run --script`).
+Install with `mise use -g uv` or `brew install uv`.
+
+### Cutting a release (maintainers)
+
+```fish
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The `release` workflow validates the script, then publishes a GitHub release
+with `wk` and `wk.sha256` attached.
