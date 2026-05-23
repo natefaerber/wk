@@ -282,7 +282,7 @@ cd ~/path/to/wk
 ### Via mise (CLI only)
 
 ```fish
-mise use -g "ubi:natefaerber/wk[exe=wk]"
+mise use -g "github:natefaerber/wk[asset_pattern=wk,bin=wk]"
 ```
 
 This installs just the `wk` binary. The tmux bindings (`wk.conf`), lazygit

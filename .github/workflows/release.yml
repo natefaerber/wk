@@ -5,8 +5,14 @@ name: release
 #
 # The job validates the wk script, then publishes a GitHub release with
 # the standalone `wk` file attached. Users install via mise:
-#   mise use -g "ubi:natefaerber/wk[exe=wk]"
+#   mise use -g "github:natefaerber/wk[asset_pattern=wk,bin=wk]"
 # install.sh users get the source from GitHub's auto-generated tarball.
+#
+# The asset_pattern=wk option tells mise's github backend to grab the lone
+# `wk` asset by exact name instead of trying to match a platform suffix —
+# wk is a portable Python script, so one file works on every platform.
+# (We were on the now-deprecated `ubi:` backend, which did this automatically;
+# the replacement `github:` backend requires the explicit pattern.)
 
 on:
   push:
