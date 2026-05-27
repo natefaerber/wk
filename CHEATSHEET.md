@@ -245,6 +245,10 @@ wk switch [branch]               # switch to existing workspace; fzf if no arg
 wk list                          # show all workspaces with status
 wk rm <branch>                   # destroy session + worktree
 wk restore [branch]              # rebuild tmux session(s) for existing worktrees
+wk restore --list                # show which worktrees would be restored (dry-run)
+wk restore                       # on a TTY: fzf multi-select picker (tab to mark)
+wk restore --all                 # rebuild every missing session, skip the picker
+wk relayout                      # rebuild 5-pane layout in the current tmux session
 wk refresh-agents [branch|--all] # regenerate .wk/AGENTS.md and ORCHESTRATOR.md
 wk cd [branch]                   # print worktree path (for shell cd integration)
 wk lg-cd [path] [--pick=...]     # retarget lazygit pane

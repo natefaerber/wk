@@ -565,6 +565,75 @@ LAZYGIT_CMD = (
 )
 
 
+def _layout_splits_from_sidebar(
+    session: str,
+    wt: Path,
+    sidebar_id: str,
+    agent: str,
+    total_cols: int = 290,
+) -> None:
+    """Given an already-existing sidebar pane (running `wk sidebar`), perform
+    the four splits that finish the 5-pane layout. Shared by `build_session`
+    (which creates the session first) and `wk relayout` (which converts an
+    existing session's active window in-place).
+
+    Sets @wk-lazygit-pane on the session so `wk lg-cd` can find the lazygit
+    pane later, and selects the agent pane so the user lands there on attach.
+    """
+    # Agent. Split right of sidebar; new pane takes everything except the
+    # left column.
+    agent_width = total_cols - LEFT_COL_COLS
+    agent_id = run(
+        [
+            "tmux", "split-window", "-h",
+            "-t", sidebar_id,
+            "-c", str(wt),
+            "-l", str(agent_width),
+            "-P", "-F", "#{pane_id}",
+            agent,
+        ]
+    ).stdout.strip()
+
+    # Lazygit — right column, top. Split right of agent.
+    lazygit_id = run(
+        [
+            "tmux", "split-window", "-h",
+            "-t", agent_id,
+            "-c", str(wt),
+            "-l", str(RIGHT_COL_COLS),
+            "-P", "-F", "#{pane_id}",
+            *_shell_wrap(LAZYGIT_CMD),
+        ]
+    ).stdout.strip()
+
+    # Remember the lazygit pane id so `wk lg-cd` can retarget it later,
+    # even after the layout has been resized or rearranged.
+    run(["tmux", "set-option", "-t", session, "@wk-lazygit-pane", lazygit_id])
+
+    # Shell — left column, bottom. Split below sidebar.
+    run(
+        [
+            "tmux", "split-window", "-v",
+            "-t", sidebar_id,
+            "-c", str(wt),
+            "-l", f"{100 - SIDEBAR_PCT}%",
+        ]
+    )
+
+    # Terminal — right column, bottom. Split below lazygit.
+    run(
+        [
+            "tmux", "split-window", "-v",
+            "-t", lazygit_id,
+            "-c", str(wt),
+            "-l", f"{100 - LAZYGIT_PCT}%",
+        ]
+    )
+
+    # Land in the agent pane on attach.
+    run(["tmux", "select-pane", "-t", agent_id])
+
+
 def build_session(
     session: str,
     wt: Path,
@@ -628,58 +697,7 @@ def build_session(
     run(["tmux", "set-option", "-t", session, "@wk-branch", real_branch])
     run(["tmux", "set-option", "-t", session, "@wk-path", str(wt)])
 
-    # Agent. Split right of sidebar; new pane takes everything except the
-    # left column.
-    agent_width = total_cols - LEFT_COL_COLS
-    agent_id = run(
-        [
-            "tmux", "split-window", "-h",
-            "-t", sidebar_id,
-            "-c", str(wt),
-            "-l", str(agent_width),
-            "-P", "-F", "#{pane_id}",
-            agent,
-        ]
-    ).stdout.strip()
-
-    # Lazygit — right column, top. Split right of agent.
-    lazygit_id = run(
-        [
-            "tmux", "split-window", "-h",
-            "-t", agent_id,
-            "-c", str(wt),
-            "-l", str(RIGHT_COL_COLS),
-            "-P", "-F", "#{pane_id}",
-            *_shell_wrap(LAZYGIT_CMD),
-        ]
-    ).stdout.strip()
-
-    # Remember the lazygit pane id so `wk lg-cd` can retarget it later,
-    # even after the layout has been resized or rearranged.
-    run(["tmux", "set-option", "-t", session, "@wk-lazygit-pane", lazygit_id])
-
-    # Shell — left column, bottom. Split below sidebar.
-    run(
-        [
-            "tmux", "split-window", "-v",
-            "-t", sidebar_id,
-            "-c", str(wt),
-            "-l", f"{100 - SIDEBAR_PCT}%",
-        ]
-    )
-
-    # Terminal — right column, bottom. Split below lazygit.
-    run(
-        [
-            "tmux", "split-window", "-v",
-            "-t", lazygit_id,
-            "-c", str(wt),
-            "-l", f"{100 - LAZYGIT_PCT}%",
-        ]
-    )
-
-    # Land in the agent pane on attach.
-    run(["tmux", "select-pane", "-t", agent_id])
+    _layout_splits_from_sidebar(session, wt, sidebar_id, agent, total_cols=total_cols)
 
 
 import json
@@ -1425,21 +1443,78 @@ def task_merge(
         )
 
 
+def _pick_restore_targets(
+    candidates: list[tuple[str, Path]],
+) -> Optional[list[tuple[str, Path]]]:
+    """Fzf multi-select over restorable (branch, path) pairs.
+
+    Prepends a synthetic `<all>` row so a single enter on it picks
+    everything. Otherwise, tab marks individual rows and enter restores
+    just the marked set (or the highlighted row if none are marked).
+    Returns None on cancel.
+    """
+    if shutil.which("fzf") is None:
+        # No fzf → fall back to "restore all", matching the prior behavior.
+        return candidates
+
+    all_marker = "<all>"
+    lines: list[str] = [f"{all_marker}\t<all {len(candidates)} workspace(s)>"]
+    for b, p in candidates:
+        lines.append(f"{b}\t{b[:40]:<40}  {p}")
+
+    proc = subprocess.run(
+        [
+            "fzf",
+            "--with-nth=2..",
+            "--delimiter=\t",
+            "--multi",
+            "--no-info",
+            "--reverse",
+            "--cycle",
+            "--height=100%",
+            "--prompt=restore❯ ",
+            "--header=tab=mark  enter=restore selected (or highlighted)  <all>=everything",
+        ],
+        input="\n".join(lines),
+        text=True,
+        capture_output=True,
+    )
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+
+    picked: list[str] = [
+        ln.split("\t", 1)[0] for ln in proc.stdout.strip().splitlines()
+    ]
+    if all_marker in picked:
+        return candidates
+    pick_set = set(picked)
+    return [(b, p) for b, p in candidates if b in pick_set]
+
+
 @app.command()
 def restore(
     branch: Optional[str] = typer.Argument(
         None, help="Branch to restore. Omit to restore all worktrees missing a session."
     ),
     no_attach: bool = typer.Option(False, "--no-attach", help="Don't attach."),
+    list_only: bool = typer.Option(
+        False, "--list", "-l",
+        help="Print what would be restored and exit. No side effects.",
+    ),
+    all_targets: bool = typer.Option(
+        False, "--all", "-a",
+        help="Restore every missing session without prompting (skips the picker).",
+    ),
 ) -> None:
     """Rebuild tmux session(s) for existing worktree(s).
 
-    Use after a reboot or `tmux kill-server` to re-create the 4-pane layout
+    Use after a reboot or `tmux kill-server` to re-create the 5-pane layout
     on top of worktrees that still exist on disk. No git operations; the
     branch must already have a worktree.
 
-    With no argument, rebuilds sessions for every wk worktree that currently
-    lacks one — the "resurrect for wk" workflow.
+    With no argument, on a TTY with multiple missing sessions, pops an fzf
+    multi-select picker so you can choose a subset. Pass `--all` to skip the
+    picker, or `--list` to just see what would be restored.
     """
     require("git")
     require("tmux")
@@ -1451,12 +1526,30 @@ def restore(
 
     targets: list[tuple[str, Path]] = []
     if branch is None:
-        targets = [
+        candidates = [
             (b, p) for b, p in worktrees if session_name(b) not in sessions
         ]
-        if not targets:
+        if not candidates:
             console.print("[dim]all worktrees already have sessions[/dim]")
             return
+
+        if list_only:
+            for b, p in candidates:
+                console.print(f"  [bold]{b}[/bold]  [dim]{p}[/dim]")
+            console.print(f"[dim]{len(candidates)} worktree(s) without a session[/dim]")
+            return
+
+        if all_targets or len(candidates) == 1 or not sys.stdin.isatty():
+            targets = candidates
+        else:
+            picked = _pick_restore_targets(candidates)
+            if picked is None:
+                console.print("[dim](cancelled)[/dim]")
+                return
+            if not picked:
+                console.print("[dim]nothing selected[/dim]")
+                return
+            targets = picked
     else:
         match = next(
             ((b, p) for b, p in worktrees if b == branch or session_name(b) == branch),
@@ -1465,6 +1558,12 @@ def restore(
         if match is None:
             die(f"no worktree for {branch!r}")
         b, p = match
+        if list_only:
+            if session_name(b) in sessions:
+                console.print(f"  [dim]{b}  (already has session)[/dim]")
+            else:
+                console.print(f"  [bold]{b}[/bold]  [dim]{p}[/dim]")
+            return
         if session_name(b) in sessions:
             die(f"session {session_name(b)} already exists; use `wk switch` to attach")
         targets = [match]
@@ -1480,6 +1579,144 @@ def restore(
 
     if not no_attach and len(rebuilt) == 1:
         attach_or_switch(rebuilt[0])
+
+
+@app.command()
+def relayout(
+    force: bool = typer.Option(
+        False, "--force", "-f",
+        help="Skip confirmation when the current session isn't tagged as wk.",
+    ),
+) -> None:
+    """Rebuild the 5-pane wk layout in the current tmux session's active window.
+
+    Useful when a layout has been mangled by hand, or to convert an arbitrary
+    tmux session into a wk workspace. Kills every other pane in the active
+    window and respawns the active pane as the sidebar, then re-runs the same
+    split sequence `wk open` uses. The session keeps its name.
+
+    The destructive work runs in a detached process — same trick `wk rm` uses
+    for self-removal — because respawning the pane that's running this command
+    would otherwise kill it mid-execution.
+    """
+    require("tmux")
+    require("git")
+    if not in_tmux():
+        die("not inside tmux; run this from within the session you want to relayout")
+
+    info = run(
+        ["tmux", "display-message", "-p",
+         "#S\t#{pane_id}\t#{window_id}\t#{pane_current_path}"]
+    ).stdout.strip()
+    parts = info.split("\t")
+    if len(parts) < 4:
+        die(f"could not parse tmux state: {info!r}")
+    session, cur_pane_id, win_id, cur_path = parts
+
+    is_wk = run(
+        ["tmux", "show-options", "-v", "-t", session, "@wk"], check=False
+    ).stdout.strip() == "1"
+
+    # Prefer the canonical @wk-path / @wk-branch the session was tagged with;
+    # otherwise infer from the active pane's cwd + git HEAD.
+    wt_str = run(
+        ["tmux", "show-options", "-v", "-t", session, "@wk-path"], check=False
+    ).stdout.strip()
+    branch = run(
+        ["tmux", "show-options", "-v", "-t", session, "@wk-branch"], check=False
+    ).stdout.strip()
+
+    wt = Path(wt_str).expanduser() if wt_str else Path(cur_path)
+    if not wt.is_dir():
+        die(f"working tree {wt} does not exist")
+    if not branch:
+        r = run(
+            ["git", "-C", str(wt), "rev-parse", "--abbrev-ref", "HEAD"], check=False
+        )
+        if r.returncode != 0 or not r.stdout.strip() or r.stdout.strip() == "HEAD":
+            die(f"could not determine branch for {wt}")
+        branch = r.stdout.strip()
+
+    if not is_wk and not force:
+        console.print(
+            f"[yellow]![/yellow] session [bold]{session}[/bold] is not a wk session"
+        )
+        console.print(
+            f"  will convert: branch=[bold]{branch}[/bold]  path=[dim]{wt}[/dim]"
+        )
+        if not typer.confirm("Proceed?", default=True):
+            raise typer.Exit(0)
+
+    wk_bin = _wk_bin()
+    subprocess.Popen(
+        [
+            wk_bin, "_relayout-detached",
+            "--session", session,
+            "--pane", cur_pane_id,
+            "--window", win_id,
+            "--wt", str(wt),
+            "--branch", branch,
+        ],
+        start_new_session=True,  # survive the pane respawn that kills our shell
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    # No success message — this pane is about to be respawned.
+
+
+@app.command("_relayout-detached", hidden=True)
+def _relayout_detached(
+    session: str = typer.Option(...),
+    pane: str = typer.Option(..., help="Pane id (%NN) to keep and respawn as sidebar."),
+    window: str = typer.Option(..., help="Window id (@NN) to relayout."),
+    wt: str = typer.Option(..., help="Worktree path."),
+    branch: str = typer.Option(..., help="Branch name."),
+) -> None:
+    """Internal: do the destructive layout rebuild for `wk relayout` from a
+    process detached from the pane being respawned."""
+    require("tmux")
+    wt_path = Path(wt)
+    wk = _wk_bin()
+
+    # Mark the worktree and tag the session so subsequent wk commands (sidebar,
+    # lg-cd, switch, etc.) recognize it.
+    mark_wk_workspace(wt_path, branch=branch)
+    run(["tmux", "set-option", "-t", session, "@wk", "1"])
+    run(["tmux", "set-option", "-t", session, "@wk-branch", branch])
+    run(["tmux", "set-option", "-t", session, "@wk-path", str(wt_path)])
+
+    # Push WK_* into the session environment so newly-spawned panes inherit
+    # them. (build_session uses `-e` on new-session for the same effect at
+    # creation time; we can't do that retroactively, so set-environment is
+    # the equivalent for an existing session.)
+    for k, v in [
+        ("WK_IN_WORKSPACE", "1"),
+        ("WK_SESSION", session),
+        ("WK_BRANCH", branch),
+        ("WK_PATH", str(wt_path)),
+    ]:
+        run(["tmux", "set-environment", "-t", session, k, v])
+
+    # Kill every pane in the target window except the one we're going to
+    # respawn as the sidebar.
+    run(["tmux", "kill-pane", "-a", "-t", pane], check=False)
+
+    # Match build_session's window naming.
+    run(["tmux", "rename-window", "-t", window, "work"], check=False)
+
+    # Respawn the surviving pane as the sidebar. -k force-kills the existing
+    # process (our parent shell, plus its now-exited wk caller).
+    run(
+        [
+            "tmux", "respawn-pane", "-k",
+            "-t", pane,
+            "-c", str(wt_path),
+            *_shell_wrap(f"WK_CURRENT={session} {wk} sidebar"),
+        ]
+    )
+
+    _layout_splits_from_sidebar(session, wt_path, pane, agent_cmd())
 
 
 @app.command("refresh-agents")
