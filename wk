@@ -67,6 +67,11 @@ DEFAULT_BASE = "origin/main"
 PR_REPO_ROOT_ENV = "WK_PR_REPO_ROOT"
 DEFAULT_PR_REPO_ROOT = "~/_Work"
 
+# When `wk pr <issue-link>` searches GitHub org-wide for the PR that
+# references an issue key, it scopes the search to this GitHub org.
+# Defaults to the owner of the current repo's `origin` remote.
+PR_SEARCH_OWNER_ENV = "WK_PR_SEARCH_OWNER"
+
 # Marker directory placed in each wk-managed worktree. Its presence
 # distinguishes wk workspaces from worktrees created directly with
 # `git worktree add`, so the sidebar can show only what wk owns.
@@ -335,6 +340,10 @@ Lifecycle (when the user asks you to do something with a workspace):
   A bare number is looked up in the current repo; a github PR URL is
   looked up in whichever clone under `~/_Work` matches that repo. Handles
   fork PRs by fetching `refs/pull/<n>/head` into a `pr-<n>` branch.
+- `wk pr <issue-url|KEY>` — same, but from an issue tracker. A Jira link
+  or bare key (e.g. `DEV-6266`) is resolved to its PR (searching the
+  current repo, then the repo's GitHub org); if no PR exists yet, a new
+  workspace is started on a branch named after the key.
 - `wk close [branch]` — kill the workspace's tmux session but keep the
   worktree on disk. Default: current session.
 - `wk rm [branch]` — full destruction: kill session, remove worktree,
@@ -1094,6 +1103,180 @@ def gh_pr_info(number: str, repo_slug: Optional[str] = None) -> dict:
         die(f"unexpected gh output looking up PR #{number}")
 
 
+# An issue-tracker URL (Jira cloud) or a bare issue key. Jira keys are
+# uppercase (PROJ-123); the bare-key form requires uppercase so we don't
+# mistake a lowercase branch name like `feat-12` for an issue key.
+_JIRA_URL_RE = re.compile(r"atlassian\.net/browse/(?P<key>[A-Za-z][A-Za-z0-9]+-\d+)")
+_ISSUE_KEY_RE = re.compile(r"^(?P<key>[A-Z][A-Z0-9]+-\d+)$")
+
+
+def parse_issue_ref(ref: str) -> Optional[str]:
+    """Return the uppercased issue key if REF is an issue link / key, else None.
+
+    Accepts a Jira browse URL
+    (``https://site.atlassian.net/browse/DEV-6266``) or a bare uppercase
+    key (``DEV-6266``). A bare PR number falls through to `parse_pr_ref`.
+    """
+    ref = ref.strip()
+    m = _JIRA_URL_RE.search(ref)
+    if m:
+        return m.group("key").upper()
+    m = _ISSUE_KEY_RE.match(ref)
+    return m.group("key").upper() if m else None
+
+
+def _in_git_repo() -> bool:
+    r = run(["git", "rev-parse", "--is-inside-work-tree"], check=False)
+    return r.returncode == 0 and r.stdout.strip() == "true"
+
+
+def _issue_search_owner() -> Optional[str]:
+    """The GitHub org to scope the org-wide PR search to.
+
+    WK_PR_SEARCH_OWNER wins; otherwise the owner of the current repo's
+    `origin` remote. None when neither is available.
+    """
+    env = os.environ.get(PR_SEARCH_OWNER_ENV)
+    if env:
+        return env
+    if _in_git_repo():
+        u = run(["git", "remote", "get-url", "origin"], check=False)
+        if u.returncode == 0:
+            slug = _remote_slug(u.stdout)
+            if slug:
+                return slug.split("/", 1)[0]
+    return None
+
+
+def _pick_issue_pr(items: list[dict], key: str) -> Optional[dict]:
+    """Choose the best PR for an issue from search results.
+
+    Prefers results that genuinely have the key in their title (dropping
+    GitHub full-text false positives), then open PRs, then the most recent
+    (highest number).
+    """
+    key_l = key.lower()
+    titled = [it for it in items if key_l in (it.get("title") or "").lower()]
+    pool = titled or items
+    if not pool:
+        return None
+    pool.sort(
+        key=lambda it: (
+            0 if (it.get("state") or "").lower() == "open" else 1,
+            -int(it["number"]),
+        )
+    )
+    return pool[0]
+
+
+def find_pr_for_issue(key: str) -> Optional[tuple[Optional[str], str]]:
+    """Find the PR referencing issue KEY → (repo_slug, number), or None.
+
+    `repo_slug` is None when the hit came from the current repo (cwd is
+    already correct). Searches the current repo first, then the org
+    (`_issue_search_owner`). Uses an exact-phrase query so the hyphen in
+    the key isn't tokenized into noise.
+    """
+    phrase = f'"{key}"'
+
+    if _in_git_repo():
+        r = run(
+            ["gh", "pr", "list", "--search", phrase, "--state", "all",
+             "--json", "number,title,state", "--limit", "30"],
+            check=False,
+        )
+        if r.returncode == 0:
+            try:
+                items = json.loads(r.stdout)
+            except json.JSONDecodeError:
+                items = []
+            pick = _pick_issue_pr(items, key)
+            if pick is not None:
+                return None, str(pick["number"])
+
+    owner = _issue_search_owner()
+    if owner:
+        r = run(
+            ["gh", "search", "prs", phrase, "--owner", owner,
+             "--json", "repository,number,title,state", "--limit", "30"],
+            check=False,
+        )
+        if r.returncode == 0:
+            try:
+                items = json.loads(r.stdout)
+            except json.JSONDecodeError:
+                items = []
+            pick = _pick_issue_pr(items, key)
+            if pick is not None:
+                slug = (pick.get("repository") or {}).get("nameWithOwner")
+                return slug, str(pick["number"])
+
+    return None
+
+
+def open_pr(
+    number: str, repo_slug: Optional[str], no_attach: bool, no_fetch: bool
+) -> None:
+    """Open a workspace for PR `number`. cwd must already be the target repo.
+
+    `repo_slug` (owner/repo) is forwarded to `gh --repo`; None means cwd's
+    repo. Same-repo PRs become a tracking branch; fork PRs (or deleted head
+    branches) are fetched via the pull ref.
+    """
+    info = gh_pr_info(number, repo_slug)
+    head_ref = info.get("headRefName") or ""
+    cross = bool(info.get("isCrossRepository"))
+    title = info.get("title", "")
+    state_label = info.get("state", "?")
+    console.print(f"PR [bold]#{number}[/bold] {title} [dim]({state_label})[/dim]")
+
+    main = repo_root()
+    if not no_fetch:
+        console.print("[dim]fetching…[/dim]")
+        run(["git", "-C", str(main), "fetch", "--prune"], check=False, capture=True)
+
+    # Same-repo PR whose head branch is still on origin → track it as a
+    # normal branch. Fall through to the pull ref for fork PRs or deleted
+    # head branches.
+    if not cross and head_ref and branch_exists_on_remote(head_ref):
+        state = resolve_workspace(head_ref, DEFAULT_BASE, fetch=False, strict_new=False)
+        _build_and_attach(state, no_attach)
+        return
+
+    open_pr_pull_ref(number, no_attach)
+
+
+def open_issue(key: str, no_attach: bool, no_fetch: bool) -> None:
+    """Open a workspace for issue KEY: its PR if one exists, else a new branch.
+
+    Resolves the issue to a PR (current repo, then org) and opens it. With
+    no PR, starts fresh work: a workspace on a branch named after the key
+    (``dev-6266``) off the default base, in the current repo.
+    """
+    found = find_pr_for_issue(key)
+    if found is not None:
+        repo_slug, number = found
+        if repo_slug:
+            owner, repo = repo_slug.split("/", 1)
+            target = find_local_repo(owner, repo)
+            os.chdir(target)
+            console.print(f"[dim]repo: {repo_slug} at {target}[/dim]")
+        console.print(f"[dim]{key} → PR #{number}[/dim]")
+        open_pr(number, repo_slug, no_attach, no_fetch)
+        return
+
+    # No PR yet — start the work. This needs a repo to branch in.
+    if not _in_git_repo():
+        die(
+            f"no PR found for {key}, and not inside a git repo to start a "
+            f"branch in\n  cd into the target repo and re-run"
+        )
+    branch = key.lower()
+    console.print(f"[dim]no PR found for {key}; starting branch {branch}[/dim]")
+    state = resolve_workspace(branch, DEFAULT_BASE, fetch=not no_fetch, strict_new=False)
+    _build_and_attach(state, no_attach)
+
+
 def _build_and_attach(state: WorkspaceState, no_attach: bool) -> None:
     """Build (or reuse) the tmux session for a resolved workspace, then attach.
 
@@ -1246,33 +1429,46 @@ def open_cmd(
 def pr(
     ref: str = typer.Argument(
         ...,
-        help="PR number (current repo) or a github PR URL (any repo under WK_PR_REPO_ROOT).",
+        help="PR number / github PR URL, or an issue-tracker link / key (e.g. DEV-6266).",
     ),
     no_attach: bool = typer.Option(False, "--no-attach", help="Don't attach."),
     no_fetch: bool = typer.Option(False, "--no-fetch", help="Skip `git fetch`."),
 ) -> None:
-    """Open a workspace for the head branch of a pull request.
+    """Open a workspace for a pull request — or the PR behind an issue.
 
     \b
-      wk pr 4670                                   → PR #4670 in the current repo
-      wk pr https://github.com/org/repo/pull/4670  → PR #4670 in org/repo
+      wk pr 4670                                    → PR #4670 in the current repo
+      wk pr https://github.com/org/repo/pull/4670   → PR #4670 in org/repo
+      wk pr https://acme.atlassian.net/browse/DEV-6 → the PR that references DEV-6
+      wk pr DEV-6266                                → same, bare issue key
 
-    Given a bare number, the PR is looked up in the current repo. Given a
-    full GitHub URL, the repo's local clone is located under
-    WK_PR_REPO_ROOT (default ~/_Work) by matching its `origin` remote, and
-    the workspace is created there.
+    [bold]PRs.[/bold] A bare number is looked up in the current repo. A full
+    GitHub URL's repo is located under WK_PR_REPO_ROOT (default ~/_Work) by
+    matching its `origin` remote, and the workspace is created there.
+    Same-repo PRs become a tracking branch (the PR's own head branch), like
+    `wk open <branch>`. Fork PRs — and PRs whose head branch no longer
+    exists on `origin` — are fetched via `refs/pull/<n>/head` into a local
+    `pr-<n>` branch.
 
-    Same-repo PRs are checked out as a tracking branch (the PR's own head
-    branch), exactly like `wk open <branch>`. Fork PRs — and PRs whose head
-    branch no longer exists on `origin` — are fetched via
-    `refs/pull/<n>/head` into a local `pr-<n>` branch.
+    [bold]Issues.[/bold] A Jira link or bare key is resolved to its PR:
+    searched in the current repo first, then across the repo's GitHub org
+    (override the org with WK_PR_SEARCH_OWNER). If a PR is found it's opened
+    like above. If none exists yet, a fresh workspace is started on a branch
+    named after the key (`dev-6266`) off the default base, in the current
+    repo.
     """
     require("git")
     require("tmux")
     require("gh")
 
-    owner, repo, number = parse_pr_ref(ref)
+    # An issue link/key resolves to a PR (or starts new work); everything
+    # else is a direct PR reference (number or github URL).
+    issue_key = parse_issue_ref(ref)
+    if issue_key:
+        open_issue(issue_key, no_attach=no_attach, no_fetch=no_fetch)
+        return
 
+    owner, repo, number = parse_pr_ref(ref)
     repo_slug: Optional[str] = None
     if owner and repo:
         repo_slug = f"{owner}/{repo}"
@@ -1282,27 +1478,7 @@ def pr(
         os.chdir(target)
         console.print(f"[dim]repo: {repo_slug} at {target}[/dim]")
 
-    info = gh_pr_info(number, repo_slug)
-    head_ref = info.get("headRefName") or ""
-    cross = bool(info.get("isCrossRepository"))
-    title = info.get("title", "")
-    state_label = info.get("state", "?")
-    console.print(f"PR [bold]#{number}[/bold] {title} [dim]({state_label})[/dim]")
-
-    main = repo_root()
-    if not no_fetch:
-        console.print("[dim]fetching…[/dim]")
-        run(["git", "-C", str(main), "fetch", "--prune"], check=False, capture=True)
-
-    # Same-repo PR whose head branch is still on origin → track it as a
-    # normal branch (resolve_workspace's "branch on remote" path). Fall
-    # through to the pull ref for fork PRs or deleted head branches.
-    if not cross and head_ref and branch_exists_on_remote(head_ref):
-        state = resolve_workspace(head_ref, DEFAULT_BASE, fetch=False, strict_new=False)
-        _build_and_attach(state, no_attach)
-        return
-
-    open_pr_pull_ref(number, no_attach)
+    open_pr(number, repo_slug, no_attach, no_fetch)
 
 
 @app.command()

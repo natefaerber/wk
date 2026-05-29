@@ -48,6 +48,24 @@ wk pr https://github.com/credo-ai/credo-backend/pull/4670
   fetched via `refs/pull/<n>/head` into a local `pr-<n>` branch.
 - Requires the GitHub CLI (`gh`) to be installed and authenticated.
 
+### Start (or jump to) work from an issue tracker
+
+Hand `wk pr` an issue-tracker link (or a bare key) and it resolves to the
+work for that ticket:
+
+```fish
+cd ~/_Work/credo-backend
+wk pr https://credo-ai.atlassian.net/browse/DEV-6266
+wk pr DEV-6266                 # same thing, bare key
+```
+
+- It searches for a PR referencing the key — the current repo first, then
+  across that repo's GitHub org (override the org with `WK_PR_SEARCH_OWNER`).
+- **PR found** → opens it, exactly like `wk pr <url>` (and `cd`s into the
+  matching clone under `~/_Work` if the PR lives in another repo).
+- **No PR yet** → starts fresh work: a new workspace on a branch named
+  after the key (`dev-6266`) off `origin/main`, in the current repo.
+
 ### Investigate a bug *on top of* a release branch
 
 You want a fresh branch based on `release/v35`:
@@ -263,6 +281,7 @@ wk open <branch>                 # create-or-attach (forgiving)
 wk open --pick                   # fzf over all branches, open the chosen one
 wk pr <number>                   # open a workspace for PR #N in the current repo
 wk pr <github-pr-url>            # open PR by URL (finds the repo under ~/_Work)
+wk pr <issue-url|KEY>            # resolve an issue (e.g. DEV-6266) to its PR, else start a branch
 wk close [branch]                # kill session, keep worktree (default: current)
 wk rm [branch]                   # destroy session + worktree + branch (default: current)
 wk task <prompt>                 # Claude names a branch, launches with prompt
@@ -294,6 +313,7 @@ wk dashboard                     # cross-workspace overview session
 | `WK_AGENT_CMD` | `claude -c \|\| claude` | command run in the agent pane |
 | `WK_WORKTREE_ROOT` | `<repo>.worktrees/` | where to put worktrees |
 | `WK_PR_REPO_ROOT` | `~/_Work` | where `wk pr <url>` looks for the PR's local clone |
+| `WK_PR_SEARCH_OWNER` | current repo's `origin` owner | GitHub org `wk pr <issue>` searches for the issue's PR |
 | `WK_SIDEBAR_REFRESH` | `3` | sidebar pane refresh interval in seconds |
 | `WK_DASHBOARD_REFRESH` | `30` | `wk dashboard` refresh interval in seconds (min 1) |
 
