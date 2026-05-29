@@ -61,6 +61,12 @@ DASHBOARD_SESSION = "wk-dashboard"
 # Default base branch for new worktrees.
 DEFAULT_BASE = "origin/main"
 
+# Where `wk pr <url>` looks for the local clone of a PR's repo when the
+# PR lives in a repo other than the current one. Override with
+# WK_PR_REPO_ROOT. A clone is matched by its `origin` remote slug.
+PR_REPO_ROOT_ENV = "WK_PR_REPO_ROOT"
+DEFAULT_PR_REPO_ROOT = "~/_Work"
+
 # Marker directory placed in each wk-managed worktree. Its presence
 # distinguishes wk workspaces from worktrees created directly with
 # `git worktree add`, so the sidebar can show only what wk owns.
@@ -325,6 +331,10 @@ Lifecycle (when the user asks you to do something with a workspace):
 - `wk open <branch>` — switch to an existing wk workspace for that branch,
   or create one if it doesn't exist yet. Forgiving: works for local
   branches, remote-only branches, or fresh branches off `main`.
+- `wk pr <number|url>` — open a workspace for a pull request's head branch.
+  A bare number is looked up in the current repo; a github PR URL is
+  looked up in whichever clone under `~/_Work` matches that repo. Handles
+  fork PRs by fetching `refs/pull/<n>/head` into a `pr-<n>` branch.
 - `wk close [branch]` — kill the workspace's tmux session but keep the
   worktree on disk. Default: current session.
 - `wk rm [branch]` — full destruction: kill session, remove worktree,
@@ -967,6 +977,190 @@ def resolve_workspace(
 
 
 # ---------------------------------------------------------------------------
+# pull-request resolution
+# ---------------------------------------------------------------------------
+
+
+# A github PR URL, e.g. https://github.com/owner/repo/pull/4670 (also
+# matches ssh-style and trailing .git). Captures owner, repo, number.
+_PR_URL_RE = re.compile(
+    r"github\.com[:/]+(?P<owner>[^/\s]+)/(?P<repo>[^/\s]+?)(?:\.git)?/pull/(?P<number>\d+)",
+    re.IGNORECASE,
+)
+# A git remote URL → owner/repo, for either https or ssh form.
+_REMOTE_SLUG_RE = re.compile(
+    r"github\.com[:/]+([^/\s]+)/([^/\s]+?)(?:\.git)?/?$",
+    re.IGNORECASE,
+)
+
+
+def parse_pr_ref(ref: str) -> tuple[Optional[str], Optional[str], str]:
+    """Parse a PR reference into (owner, repo, number).
+
+    A bare number (``4670`` or ``#4670``) returns (None, None, "4670") —
+    meaning "this PR in the current repo". A full GitHub PR URL returns
+    the owner/repo parsed from the URL so we can locate that repo's clone.
+    """
+    ref = ref.strip()
+    bare = ref.lstrip("#")
+    if bare.isdigit():
+        return None, None, bare
+    m = _PR_URL_RE.search(ref)
+    if m:
+        return m.group("owner"), m.group("repo"), m.group("number")
+    die(f"can't parse PR reference {ref!r}; want a number or a github PR URL")
+
+
+def _remote_slug(url: str) -> Optional[str]:
+    """Normalize a git remote URL to a lowercased ``owner/repo`` slug."""
+    m = _REMOTE_SLUG_RE.search(url.strip())
+    return f"{m.group(1)}/{m.group(2)}".lower() if m else None
+
+
+def find_local_repo(owner: str, repo: str) -> Path:
+    """Find the local clone of ``owner/repo`` under WK_PR_REPO_ROOT.
+
+    Matches by `origin` remote slug rather than directory name, so a repo
+    cloned into an oddly-named directory is still found. Dies with a
+    helpful message when nothing matches; on multiple matches, prefers the
+    clone closest to the search root and warns.
+    """
+    root = Path(os.environ.get(PR_REPO_ROOT_ENV, DEFAULT_PR_REPO_ROOT)).expanduser()
+    if not root.is_dir():
+        die(f"PR repo root not found: {root} (set {PR_REPO_ROOT_ENV})")
+
+    want = f"{owner}/{repo}".lower()
+    # `.git` is a directory in a normal clone but a file inside a worktree;
+    # `-type d` finds the main checkouts and skips worktrees. `-prune` stops
+    # find from descending into the (large) .git directory itself.
+    r = run(
+        ["find", str(root), "-maxdepth", "6", "-type", "d", "-name", ".git", "-prune"],
+        check=False,
+    )
+    matches: list[Path] = []
+    for git_dir in r.stdout.splitlines():
+        repo_dir = Path(git_dir).parent
+        u = run(
+            ["git", "-C", str(repo_dir), "remote", "get-url", "origin"],
+            check=False,
+        )
+        if u.returncode == 0 and _remote_slug(u.stdout) == want:
+            matches.append(repo_dir)
+
+    if not matches:
+        die(
+            f"no local clone of {want} found under {root}\n"
+            f"  clone it first, or point {PR_REPO_ROOT_ENV} at where it lives"
+        )
+
+    # ~/_Work routinely holds several clones of the same repo (an old copy,
+    # a scratch clone, a nested worktree). Disambiguate deterministically:
+    # prefer a directory actually named after the repo, then one not buried
+    # in a `.worktrees` dir, then the shallowest path.
+    def rank(p: Path) -> tuple[int, int, int]:
+        return (
+            0 if p.name.lower() == repo.lower() else 1,
+            1 if ".worktrees" in p.parts else 0,
+            len(p.parts),
+        )
+
+    matches.sort(key=rank)
+    # Only warn on a genuine tie — two clones both named exactly `repo`.
+    named = [p for p in matches if p.name.lower() == repo.lower()]
+    if len(named) > 1:
+        err.print(f"[yellow]note:[/yellow] multiple clones named {repo}; using {matches[0]}")
+    return matches[0]
+
+
+def gh_pr_info(number: str, repo_slug: Optional[str] = None) -> dict:
+    """Look up a PR with `gh` and return its JSON metadata as a dict.
+
+    Fields consumed downstream: headRefName, isCrossRepository, title,
+    state. `repo_slug` (owner/repo) targets a repo other than cwd's.
+    """
+    cmd = [
+        "gh", "pr", "view", number,
+        "--json", "headRefName,isCrossRepository,title,state",
+    ]
+    if repo_slug:
+        cmd += ["--repo", repo_slug]
+    r = run(cmd, check=False)
+    if r.returncode != 0:
+        msg = r.stderr.strip() or "gh pr view failed"
+        die(f"couldn't look up PR #{number}: {msg}")
+    try:
+        return json.loads(r.stdout)
+    except json.JSONDecodeError:
+        die(f"unexpected gh output looking up PR #{number}")
+
+
+def _build_and_attach(state: WorkspaceState, no_attach: bool) -> None:
+    """Build (or reuse) the tmux session for a resolved workspace, then attach.
+
+    Shared by `wk open` and `wk pr`: attach if the session is already
+    running, otherwise build the 5-pane layout first.
+    """
+    if state.session in tmux_sessions():
+        console.print("[dim]session running; attaching[/dim]")
+    else:
+        build_session(state.session, state.wt, agent_cmd(), branch=state.branch)
+        if state.created:
+            console.print(f"[green]✓[/green] workspace [bold]{state.branch}[/bold] ready at {state.wt}")
+        else:
+            console.print(f"[green]✓[/green] rebuilt session for [bold]{state.branch}[/bold]")
+    if not no_attach:
+        attach_or_switch(state.session)
+
+
+def open_pr_pull_ref(number: str, no_attach: bool) -> None:
+    """Check out a PR via its GitHub ``refs/pull/<n>/head`` ref.
+
+    Used for fork PRs (whose head branch isn't on `origin`) and for PRs
+    whose head branch has been deleted from `origin`. Creates or reuses a
+    local ``pr-<n>`` branch and a worktree for it. The pull ref is the one
+    thing GitHub guarantees exists for any PR regardless of fork.
+    """
+    main = repo_root()
+    branch = f"pr-{number}"
+
+    existing = find_existing_worktree(branch)
+    if existing is not None:
+        real_branch, wt = existing
+        _build_and_attach(
+            WorkspaceState(
+                branch=real_branch, wt=wt, session=session_name(real_branch),
+                created=False, branch_created=False,
+            ),
+            no_attach,
+        )
+        return
+
+    wt = worktree_path(branch)
+    if wt.exists():
+        die(
+            f"path exists but isn't a registered git worktree: {wt}\n"
+            f"  remove or rename it, then re-run"
+        )
+    wt.parent.mkdir(parents=True, exist_ok=True)
+
+    if branch_exists_locally(branch):
+        console.print(f"[dim]branch {branch} exists; checking out into worktree[/dim]")
+    else:
+        pull_ref = f"pull/{number}/head"
+        console.print(f"[dim]fetching {pull_ref} → {branch}[/dim]")
+        run(["git", "-C", str(main), "fetch", "origin", f"{pull_ref}:{branch}"])
+
+    run(["git", "-C", str(main), "worktree", "add", str(wt), branch])
+    _build_and_attach(
+        WorkspaceState(
+            branch=branch, wt=wt, session=session_name(branch),
+            created=True, branch_created=True,
+        ),
+        no_attach,
+    )
+
+
+# ---------------------------------------------------------------------------
 # commands
 # ---------------------------------------------------------------------------
 
@@ -1045,18 +1239,70 @@ def open_cmd(
         die("missing BRANCH (or pass --pick)")
 
     state = resolve_workspace(branch, base, fetch=not no_fetch, strict_new=False)
+    _build_and_attach(state, no_attach)
 
-    if state.session in tmux_sessions():
-        console.print(f"[dim]session running; attaching[/dim]")
-    else:
-        build_session(state.session, state.wt, agent_cmd(), branch=state.branch)
-        if state.created:
-            console.print(f"[green]✓[/green] workspace [bold]{state.branch}[/bold] ready at {state.wt}")
-        else:
-            console.print(f"[green]✓[/green] rebuilt session for [bold]{state.branch}[/bold]")
 
-    if not no_attach:
-        attach_or_switch(state.session)
+@app.command("pr")
+def pr(
+    ref: str = typer.Argument(
+        ...,
+        help="PR number (current repo) or a github PR URL (any repo under WK_PR_REPO_ROOT).",
+    ),
+    no_attach: bool = typer.Option(False, "--no-attach", help="Don't attach."),
+    no_fetch: bool = typer.Option(False, "--no-fetch", help="Skip `git fetch`."),
+) -> None:
+    """Open a workspace for the head branch of a pull request.
+
+    \b
+      wk pr 4670                                   → PR #4670 in the current repo
+      wk pr https://github.com/org/repo/pull/4670  → PR #4670 in org/repo
+
+    Given a bare number, the PR is looked up in the current repo. Given a
+    full GitHub URL, the repo's local clone is located under
+    WK_PR_REPO_ROOT (default ~/_Work) by matching its `origin` remote, and
+    the workspace is created there.
+
+    Same-repo PRs are checked out as a tracking branch (the PR's own head
+    branch), exactly like `wk open <branch>`. Fork PRs — and PRs whose head
+    branch no longer exists on `origin` — are fetched via
+    `refs/pull/<n>/head` into a local `pr-<n>` branch.
+    """
+    require("git")
+    require("tmux")
+    require("gh")
+
+    owner, repo, number = parse_pr_ref(ref)
+
+    repo_slug: Optional[str] = None
+    if owner and repo:
+        repo_slug = f"{owner}/{repo}"
+        target = find_local_repo(owner, repo)
+        # Every downstream git/worktree op resolves against cwd, so move
+        # into the target clone before touching anything.
+        os.chdir(target)
+        console.print(f"[dim]repo: {repo_slug} at {target}[/dim]")
+
+    info = gh_pr_info(number, repo_slug)
+    head_ref = info.get("headRefName") or ""
+    cross = bool(info.get("isCrossRepository"))
+    title = info.get("title", "")
+    state_label = info.get("state", "?")
+    console.print(f"PR [bold]#{number}[/bold] {title} [dim]({state_label})[/dim]")
+
+    main = repo_root()
+    if not no_fetch:
+        console.print("[dim]fetching…[/dim]")
+        run(["git", "-C", str(main), "fetch", "--prune"], check=False, capture=True)
+
+    # Same-repo PR whose head branch is still on origin → track it as a
+    # normal branch (resolve_workspace's "branch on remote" path). Fall
+    # through to the pull ref for fork PRs or deleted head branches.
+    if not cross and head_ref and branch_exists_on_remote(head_ref):
+        state = resolve_workspace(head_ref, DEFAULT_BASE, fetch=False, strict_new=False)
+        _build_and_attach(state, no_attach)
+        return
+
+    open_pr_pull_ref(number, no_attach)
 
 
 @app.command()

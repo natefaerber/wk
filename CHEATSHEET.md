@@ -24,6 +24,30 @@ wk open release/v35
   branch.
 - If neither exists, wk creates `release/v35` from `origin/main`.
 
+### Review a pull request
+
+Pull a PR's head branch into a workspace. Given just a number, wk looks it
+up in the current repo:
+
+```fish
+cd ~/_Work/credo-backend
+wk pr 4670
+```
+
+Given a full URL, wk finds the matching clone under `~/_Work` (matched by
+its `origin` remote — override the search root with `WK_PR_REPO_ROOT`) and
+opens the workspace there, no matter where you run it from:
+
+```fish
+wk pr https://github.com/credo-ai/credo-backend/pull/4670
+```
+
+- Same-repo PRs are checked out as a tracking branch (the PR's own head
+  branch), exactly like `wk open <branch>`.
+- Fork PRs — and PRs whose head branch has been deleted from `origin` — are
+  fetched via `refs/pull/<n>/head` into a local `pr-<n>` branch.
+- Requires the GitHub CLI (`gh`) to be installed and authenticated.
+
 ### Investigate a bug *on top of* a release branch
 
 You want a fresh branch based on `release/v35`:
@@ -237,6 +261,8 @@ or to the orchestrator instead.
 wk new <branch>                  # create + attach (errors if branch exists)
 wk open <branch>                 # create-or-attach (forgiving)
 wk open --pick                   # fzf over all branches, open the chosen one
+wk pr <number>                   # open a workspace for PR #N in the current repo
+wk pr <github-pr-url>            # open PR by URL (finds the repo under ~/_Work)
 wk close [branch]                # kill session, keep worktree (default: current)
 wk rm [branch]                   # destroy session + worktree + branch (default: current)
 wk task <prompt>                 # Claude names a branch, launches with prompt
@@ -267,6 +293,7 @@ wk dashboard                     # cross-workspace overview session
 |---|---|---|
 | `WK_AGENT_CMD` | `claude -c \|\| claude` | command run in the agent pane |
 | `WK_WORKTREE_ROOT` | `<repo>.worktrees/` | where to put worktrees |
+| `WK_PR_REPO_ROOT` | `~/_Work` | where `wk pr <url>` looks for the PR's local clone |
 | `WK_SIDEBAR_REFRESH` | `3` | sidebar pane refresh interval in seconds |
 | `WK_DASHBOARD_REFRESH` | `30` | `wk dashboard` refresh interval in seconds (min 1) |
 
