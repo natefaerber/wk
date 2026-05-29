@@ -333,17 +333,18 @@ wk lg-cd ../sibling-repo.worktrees/fix-thing
 
 Lifecycle (when the user asks you to do something with a workspace):
 
-- `wk open <branch>` — switch to an existing wk workspace for that branch,
-  or create one if it doesn't exist yet. Forgiving: works for local
-  branches, remote-only branches, or fresh branches off `main`.
-- `wk pr <number|url>` — open a workspace for a pull request's head branch.
-  A bare number is looked up in the current repo; a github PR URL is
-  looked up in whichever clone under `~/_Work` matches that repo. Handles
-  fork PRs by fetching `refs/pull/<n>/head` into a `pr-<n>` branch.
-- `wk pr <issue-url|KEY>` — same, but from an issue tracker. A Jira link
-  or bare key (e.g. `DEV-6266`) is resolved to its PR (searching the
-  current repo, then the repo's GitHub org); if no PR exists yet, a new
-  workspace is started on a branch named after the key.
+- `wk open <branch|pr|issue>` — the one "get into the work" command. It
+  accepts:
+  - a branch name — switch to (or create) a wk workspace for it. Forgiving:
+    works for local branches, remote-only branches, or fresh branches off
+    `main`.
+  - a pull request — a bare number (current repo) or a github PR URL (looked
+    up in whichever clone under `~/_Work` matches that repo). Fork PRs are
+    fetched via `refs/pull/<n>/head` into a `pr-<n>` branch.
+  - an issue — a Jira link or bare key (e.g. `DEV-6266`), resolved to its PR
+    (searching the current repo, then the repo's GitHub org); if no PR
+    exists yet, a new workspace is started on a branch named after the key.
+- `wk pr <number|url>` — the same PR path as an explicit, PR-only verb.
 - `wk close [branch]` — kill the workspace's tmux session but keep the
   worktree on disk. Default: current session.
 - `wk rm [branch]` — full destruction: kill session, remove worktree,
@@ -986,7 +987,7 @@ def resolve_workspace(
 
 
 # ---------------------------------------------------------------------------
-# pull-request resolution
+# ref resolution — branches, pull requests, and issue keys
 # ---------------------------------------------------------------------------
 
 
@@ -1003,12 +1004,14 @@ _REMOTE_SLUG_RE = re.compile(
 )
 
 
-def parse_pr_ref(ref: str) -> tuple[Optional[str], Optional[str], str]:
-    """Parse a PR reference into (owner, repo, number).
+def parse_pr_ref(ref: str) -> Optional[tuple[Optional[str], Optional[str], str]]:
+    """Parse a PR reference into (owner, repo, number), or None if it isn't one.
 
     A bare number (``4670`` or ``#4670``) returns (None, None, "4670") —
     meaning "this PR in the current repo". A full GitHub PR URL returns
     the owner/repo parsed from the URL so we can locate that repo's clone.
+    Anything else returns None, letting callers fall back to treating REF
+    as a branch name.
     """
     ref = ref.strip()
     bare = ref.lstrip("#")
@@ -1017,7 +1020,7 @@ def parse_pr_ref(ref: str) -> tuple[Optional[str], Optional[str], str]:
     m = _PR_URL_RE.search(ref)
     if m:
         return m.group("owner"), m.group("repo"), m.group("number")
-    die(f"can't parse PR reference {ref!r}; want a number or a github PR URL")
+    return None
 
 
 def _remote_slug(url: str) -> Optional[str]:
@@ -1246,12 +1249,12 @@ def open_pr(
     open_pr_pull_ref(number, no_attach)
 
 
-def open_issue(key: str, no_attach: bool, no_fetch: bool) -> None:
+def open_issue(key: str, base: str, no_attach: bool, no_fetch: bool) -> None:
     """Open a workspace for issue KEY: its PR if one exists, else a new branch.
 
     Resolves the issue to a PR (current repo, then org) and opens it. With
     no PR, starts fresh work: a workspace on a branch named after the key
-    (``dev-6266``) off the default base, in the current repo.
+    (``dev-6266``) off `base`, in the current repo.
     """
     found = find_pr_for_issue(key)
     if found is not None:
@@ -1273,7 +1276,52 @@ def open_issue(key: str, no_attach: bool, no_fetch: bool) -> None:
         )
     branch = key.lower()
     console.print(f"[dim]no PR found for {key}; starting branch {branch}[/dim]")
-    state = resolve_workspace(branch, DEFAULT_BASE, fetch=not no_fetch, strict_new=False)
+    state = resolve_workspace(branch, base, fetch=not no_fetch, strict_new=False)
+    _build_and_attach(state, no_attach)
+
+
+def open_pr_ref(
+    owner: Optional[str], repo: Optional[str], number: str,
+    no_attach: bool, no_fetch: bool,
+) -> None:
+    """Open a PR given its parsed (owner, repo, number).
+
+    When owner/repo are set (a URL), locate that repo's clone under
+    WK_PR_REPO_ROOT and `cd` into it first — every downstream git/worktree
+    op resolves against cwd. owner/repo None means the current repo.
+    """
+    repo_slug: Optional[str] = None
+    if owner and repo:
+        repo_slug = f"{owner}/{repo}"
+        target = find_local_repo(owner, repo)
+        os.chdir(target)
+        console.print(f"[dim]repo: {repo_slug} at {target}[/dim]")
+    open_pr(number, repo_slug, no_attach, no_fetch)
+
+
+def open_ref(ref: str, base: str, no_attach: bool, no_fetch: bool) -> None:
+    """Open whatever REF points at — an issue, a pull request, or a branch.
+
+    Classification, in order: an issue reference (Jira link or uppercase
+    ``KEY-123``) → resolve to its PR or start the work; a PR reference
+    (bare number or github PR URL) → open that PR; anything else → treat as
+    a branch name, exactly like the original `wk open`. Only the issue and
+    PR paths need `gh`, so it's required lazily.
+    """
+    issue_key = parse_issue_ref(ref)
+    if issue_key:
+        require("gh")
+        open_issue(issue_key, base=base, no_attach=no_attach, no_fetch=no_fetch)
+        return
+
+    pr_ref = parse_pr_ref(ref)
+    if pr_ref is not None:
+        require("gh")
+        owner, repo, number = pr_ref
+        open_pr_ref(owner, repo, number, no_attach, no_fetch)
+        return
+
+    state = resolve_workspace(ref, base, fetch=not no_fetch, strict_new=False)
     _build_and_attach(state, no_attach)
 
 
@@ -1394,9 +1442,10 @@ def open_cmd(
     no_attach: bool = typer.Option(False, "--no-attach", help="Don't attach."),
     no_fetch: bool = typer.Option(False, "--no-fetch", help="Skip `git fetch`."),
 ) -> None:
-    """Open BRANCH — attach if running, rebuild if not, create if missing.
+    """Open a workspace for BRANCH — a branch, a pull request, or an issue.
 
-    Forgiving counterpart to `wk new`. Handles every case:
+    Forgiving counterpart to `wk new`. For a branch name, handles every
+    case:
 
     \b
       branch + worktree + session all exist  →  attach
@@ -1407,6 +1456,17 @@ def open_cmd(
 
     Worktrees created outside `wk` (e.g. `git worktree add ...` directly)
     are recognized; their existing path is used, not wk's preferred path.
+
+    BRANCH is also accepted as:
+
+    \b
+      a pull request   — a number (`4670`) or github PR URL → open that PR
+      an issue         — a Jira link or uppercase key (`DEV-6266`) → open
+                         the PR that references it, or start the work on a
+                         new branch if there's no PR yet
+
+    `wk pr` is the same PR path if you want an explicit, PR-only verb.
+    Normal (lowercase) branch names never collide with the PR/issue forms.
     """
     require("git")
     require("tmux")
@@ -1421,64 +1481,48 @@ def open_cmd(
     if not branch:
         die("missing BRANCH (or pass --pick)")
 
-    state = resolve_workspace(branch, base, fetch=not no_fetch, strict_new=False)
-    _build_and_attach(state, no_attach)
+    open_ref(branch, base, no_attach, no_fetch)
 
 
 @app.command("pr")
 def pr(
     ref: str = typer.Argument(
         ...,
-        help="PR number / github PR URL, or an issue-tracker link / key (e.g. DEV-6266).",
+        help="PR number (current repo) or a github PR URL (any repo under WK_PR_REPO_ROOT).",
     ),
     no_attach: bool = typer.Option(False, "--no-attach", help="Don't attach."),
     no_fetch: bool = typer.Option(False, "--no-fetch", help="Skip `git fetch`."),
 ) -> None:
-    """Open a workspace for a pull request — or the PR behind an issue.
+    """Open a workspace for the head branch of a pull request.
 
     \b
-      wk pr 4670                                    → PR #4670 in the current repo
-      wk pr https://github.com/org/repo/pull/4670   → PR #4670 in org/repo
-      wk pr https://acme.atlassian.net/browse/DEV-6 → the PR that references DEV-6
-      wk pr DEV-6266                                → same, bare issue key
+      wk pr 4670                                   → PR #4670 in the current repo
+      wk pr https://github.com/org/repo/pull/4670  → PR #4670 in org/repo
 
-    [bold]PRs.[/bold] A bare number is looked up in the current repo. A full
-    GitHub URL's repo is located under WK_PR_REPO_ROOT (default ~/_Work) by
-    matching its `origin` remote, and the workspace is created there.
-    Same-repo PRs become a tracking branch (the PR's own head branch), like
+    A bare number is looked up in the current repo. A full GitHub URL's repo
+    is located under WK_PR_REPO_ROOT (default ~/_Work) by matching its
+    `origin` remote, and the workspace is created there. Same-repo PRs
+    become a tracking branch (the PR's own head branch), like
     `wk open <branch>`. Fork PRs — and PRs whose head branch no longer
     exists on `origin` — are fetched via `refs/pull/<n>/head` into a local
     `pr-<n>` branch.
 
-    [bold]Issues.[/bold] A Jira link or bare key is resolved to its PR:
-    searched in the current repo first, then across the repo's GitHub org
-    (override the org with WK_PR_SEARCH_OWNER). If a PR is found it's opened
-    like above. If none exists yet, a fresh workspace is started on a branch
-    named after the key (`dev-6266`) off the default base, in the current
-    repo.
+    This is the explicit, PR-only verb. `wk open` accepts the same PR
+    references (plus branches and issue keys) if you'd rather use one
+    command for everything.
     """
     require("git")
     require("tmux")
     require("gh")
 
-    # An issue link/key resolves to a PR (or starts new work); everything
-    # else is a direct PR reference (number or github URL).
-    issue_key = parse_issue_ref(ref)
-    if issue_key:
-        open_issue(issue_key, no_attach=no_attach, no_fetch=no_fetch)
-        return
-
-    owner, repo, number = parse_pr_ref(ref)
-    repo_slug: Optional[str] = None
-    if owner and repo:
-        repo_slug = f"{owner}/{repo}"
-        target = find_local_repo(owner, repo)
-        # Every downstream git/worktree op resolves against cwd, so move
-        # into the target clone before touching anything.
-        os.chdir(target)
-        console.print(f"[dim]repo: {repo_slug} at {target}[/dim]")
-
-    open_pr(number, repo_slug, no_attach, no_fetch)
+    pr_ref = parse_pr_ref(ref)
+    if pr_ref is None:
+        die(
+            f"not a PR reference: {ref!r}; want a number or a github PR URL\n"
+            f"  for an issue key or branch, use `wk open`"
+        )
+    owner, repo, number = pr_ref
+    open_pr_ref(owner, repo, number, no_attach, no_fetch)
 
 
 @app.command()
