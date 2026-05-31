@@ -287,6 +287,7 @@ wk open <number|pr-url>          # open a pull request (same as `wk pr`)
 wk open <issue-url|KEY>          # resolve an issue (e.g. DEV-6266) to its PR, else start a branch
 wk open --pick                   # fzf over all branches, open the chosen one
 wk pr <number|github-pr-url>     # open a pull request (explicit PR-only verb)
+wk adopt [dir]                   # wrap an existing checkout (default: cwd) in a session
 wk close [branch]                # kill session, keep worktree (default: current)
 wk rm [branch]                   # destroy session + worktree + branch (default: current)
 wk task <prompt>                 # Claude names a branch, launches with prompt
