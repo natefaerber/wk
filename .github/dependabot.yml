@@ -1,0 +1,10 @@
+# Keep GitHub Actions used by our workflows current. wk is a single-file
+# Python script with no lockfile, so there's no package ecosystem to track —
+# only the actions in .github/workflows. Dependabot opens a PR when a newer
+# major/minor is published; the release workflow's validate step gates merges.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
