@@ -1526,6 +1526,69 @@ def pr(
 
 
 @app.command()
+def adopt(
+    directory: Optional[str] = typer.Argument(
+        None, help="Directory to adopt. Defaults to the current directory."
+    ),
+    no_attach: bool = typer.Option(False, "--no-attach", help="Don't attach."),
+) -> None:
+    """Adopt an existing DIRECTORY as a wk workspace in place.
+
+    The branch-centric counterpart is `wk open`, which derives a worktree
+    path from a branch name and creates it if missing. `adopt` goes the
+    other way: you already have a checkout on disk — a plain clone, a
+    `git worktree add` you made by hand, or the main repo itself — and you
+    just want wk's 5-pane session, env vars, and `.wk/` marker wrapped
+    around it, without moving or recreating anything.
+
+    The directory must be inside a git work tree; the workspace is anchored
+    at that work tree's toplevel (so adopting a subdirectory adopts the
+    whole checkout). The branch is read from HEAD — a detached HEAD can't be
+    adopted, since the session name and `WK_BRANCH` need a branch. If a
+    session of that name is already running, we just attach to it.
+    """
+    require("git")
+    require("tmux")
+
+    start = Path(directory).expanduser().resolve() if directory else Path.cwd().resolve()
+    if not start.is_dir():
+        die(f"not a directory: {start}")
+
+    # Anchor at the work tree's toplevel, not the (possibly nested) dir the
+    # user pointed at — wk workspaces are whole checkouts, and the .wk/ marker
+    # and lazygit pane belong at the root.
+    r = run(
+        ["git", "-C", str(start), "rev-parse", "--show-toplevel"],
+        check=False,
+    )
+    if r.returncode != 0:
+        die(
+            f"not inside a git work tree: {start}\n"
+            f"  run `git init` there first, or use `wk open <branch>` to create one"
+        )
+    wt = Path(r.stdout.strip()).resolve()
+
+    branch = run(
+        ["git", "-C", str(wt), "rev-parse", "--abbrev-ref", "HEAD"]
+    ).stdout.strip()
+    if branch == "HEAD":
+        die(
+            f"{wt} is on a detached HEAD; check out a branch before adopting "
+            f"(wk needs a branch for the session name and WK_BRANCH)"
+        )
+
+    session = session_name(branch)
+    if session in tmux_sessions():
+        console.print(f"[dim]session running; attaching[/dim]")
+    else:
+        build_session(session, wt, agent_cmd(), branch=branch)
+        console.print(f"[green]✓[/green] adopted [bold]{branch}[/bold] at {wt}")
+
+    if not no_attach:
+        attach_or_switch(session)
+
+
+@app.command()
 def task(
     prompt: str = typer.Argument(..., help="The task description / prompt for Claude."),
     branch: Optional[str] = typer.Option(
