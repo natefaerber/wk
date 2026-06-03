@@ -53,8 +53,9 @@ The `wk` script uses `#!/usr/bin/env -S uv run --script` and inline
 
 ### Workspace = worktree + session + marker
 A wk workspace is the triple of:
-1. A git worktree on its own branch (at `<repo>.worktrees/<branch-slug>/`
-   by default — override via `WK_WORKTREE_ROOT`).
+1. A git worktree on its own branch (at `<repo>/.worktrees/<branch-slug>/`
+   by default — nested inside the repo, kept out of `git status` via
+   `.git/info/exclude`; override the location via `WK_WORKTREE_ROOT`).
 2. A tmux session named after the branch (with slashes → hyphens via
    `session_name()`).
 3. A `.wk/` marker directory inside the worktree (created by
