@@ -45,7 +45,10 @@ jobs:
           echo "tag=v$version" >> "$GITHUB_OUTPUT"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v8
+        # Pin to an exact release: astral-sh/setup-uv publishes no moving `v8`
+        # major tag (only `v7` and exact tags like `v8.1.0`), so `@v8` fails to
+        # resolve.
+        uses: astral-sh/setup-uv@v8.1.0
 
       - name: Validate wk script
         # Two checks: syntactic (cheap) and runtime (catches missing deps,
