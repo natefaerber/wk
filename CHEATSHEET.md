@@ -213,7 +213,7 @@ Every pane in a wk session has these env vars set:
 | var | example |
 |---|---|
 | `WK_IN_WORKSPACE` | `1` |
-| `WK_SESSION` | `release-v35` (slug, no slashes) |
+| `WK_SESSION` | `credo-backend-release-v35` (repo-prefixed slug, no slashes) |
 | `WK_BRANCH` | `release/v35` (canonical ref) |
 | `WK_PATH` | `/Users/nate/_Work/credo-backend/.worktrees/release-v35` |
 
@@ -232,8 +232,16 @@ auto-context:
 - wk accepts both slash form (`release/v35`) and slug form (`release-v35`)
   for `open`. It resolves slug → canonical (with slashes) before doing any
   git ops, so you won't accidentally create a duplicate hyphen-named branch.
-- Session names always use slug form (tmux doesn't love slashes).
-- Worktree paths use slug form too: `<repo>/.worktrees/release-v35`.
+- Session names are **project-scoped**: the repo name is prefixed onto the
+  branch slug, so `release/v35` in repo `credo-backend` becomes the session
+  `credo-backend-release-v35`. (tmux doesn't love slashes, hence the slug;
+  the prefix keeps two checkouts of *different* projects on the same branch
+  — classically both `main`, e.g. via `wk adopt` — from colliding on one
+  shared session.)
+- Commands that take a branch (`open`, `close`, `rm`, `switch`, `cd`, …) still
+  accept any of three forms: the real branch (`release/v35`), the bare slug
+  (`release-v35`), or the full prefixed session name (`credo-backend-release-v35`).
+- Worktree paths use the bare slug (no prefix): `<repo>/.worktrees/release-v35`.
 
 ---
 
