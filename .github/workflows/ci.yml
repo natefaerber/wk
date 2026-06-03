@@ -1,0 +1,36 @@
+name: ci
+
+# Runs on every push and PR. The release workflow only fires on tags, so
+# without this, branch pushes and PRs would get zero test coverage. Keep the
+# cheap parse/help guards here too — they catch the side-effect-free-import
+# property breaking, which the test harness relies on.
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up uv
+        # Same pinned version the release workflow uses.
+        uses: astral-sh/setup-uv@v8.1.0
+
+      - name: Validate wk script
+        run: |
+          python3 -c "import ast; ast.parse(open('wk').read())"
+          ./wk --help > /dev/null
+
+      - name: Run tests
+        # wk is a single uv-script file with inline PEP-723 deps; the suite
+        # imports it via SourceFileLoader (see conftest.py), so the runner
+        # needs typer + rich + pytest present.
+        run: uv run --with typer --with rich --with pytest pytest -q

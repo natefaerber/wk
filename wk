@@ -18,10 +18,13 @@ Each workspace is:
 from __future__ import annotations
 
 import functools
+import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import time as _time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -112,6 +115,28 @@ def die(msg: str, code: int = 1) -> None:
 def require(tool: str) -> None:
     if shutil.which(tool) is None:
         die(f"{tool!r} not found on PATH")
+
+
+def _log_detached_failure(logdir: Path, label: str) -> None:
+    """Append the current exception traceback to `<logdir>/wk-detached.log`.
+
+    The detached children (`_rm-detached`, `_relayout-detached`) run with
+    stdout/stderr pointed at /dev/null so the dying session's SIGHUP can't
+    reach them — which also means a crash there is otherwise invisible,
+    leaving e.g. a half-removed worktree with no signal anywhere. Logging to
+    a stable file (the main repo's `.git`, which outlives the worktree being
+    removed) makes those failures diagnosable after the fact.
+    """
+    import traceback
+
+    try:
+        logdir.mkdir(parents=True, exist_ok=True)
+        stamp = _time.strftime("%Y-%m-%d %H:%M:%S")
+        with (logdir / "wk-detached.log").open("a", encoding="utf-8") as f:
+            f.write(f"\n--- {label} failed at {stamp} ---\n")
+            f.write(traceback.format_exc())
+    except Exception:
+        pass  # logging must never mask the original failure
 
 
 def repo_root() -> Path:
@@ -600,10 +625,15 @@ def wk_tmux_sessions() -> set[str]:
 
 def workspace_status(branch: str, path: Path, sessions: set[str]) -> Workspace:
     name = session_name(branch)
-    # dirty?
-    dirty = bool(
-        run(["git", "-C", str(path), "status", "--porcelain"]).stdout.strip()
+    # dirty? A worktree dir can vanish out-of-band (a manual `rm -rf` of a
+    # stale `.worktrees/<x>`), which would make this git call exit nonzero.
+    # With check=True that CalledProcessError propagates out of
+    # all_workspaces() and crashes `wk ls`, `wk rm`, `wk switch`, and the
+    # dashboard render loop. Tolerate it: an unreadable worktree is "not dirty".
+    status = run(
+        ["git", "-C", str(path), "status", "--porcelain"], check=False
     )
+    dirty = bool(status.stdout.strip()) if status.returncode == 0 else False
     # ahead/behind vs base
     ahead = behind = 0
     base = os.environ.get("WK_BASE", DEFAULT_BASE)
@@ -818,11 +848,6 @@ def build_session(
     run(["tmux", "set-option", "-t", session, "@wk-path", str(wt)])
 
     _layout_splits_from_sidebar(session, wt, sidebar_id, agent, total_cols=total_cols)
-
-
-import json
-import re
-import time as _time
 
 
 # ---------------------------------------------------------------------------
@@ -2779,11 +2804,18 @@ def _rm_detached(
     require("git")
     require("tmux")
     main = repo_root()
-    workspaces = {w.branch: w for w in all_workspaces()}
-    w = workspaces.get(branch)
-    if w is None:
-        return
-    _do_rm(w, main, force, keep_branch)
+    try:
+        workspaces = {w.branch: w for w in all_workspaces()}
+        w = workspaces.get(branch)
+        if w is None:
+            return
+        _do_rm(w, main, force, keep_branch)
+    except Exception:
+        # We're detached with no terminal; surface the failure to a log so a
+        # half-removed worktree isn't a silent mystery. (main/.git outlives
+        # the worktree we're removing.)
+        _log_detached_failure(main / ".git", f"_rm-detached {branch}")
+        raise
 
 
 @app.command()
@@ -3094,8 +3126,6 @@ def sidebar() -> None:
     Reads $WK_CURRENT to mark the active workspace. Refreshes every 3s
     (tune with WK_SIDEBAR_REFRESH).
     """
-    import time as _time
-
     current = os.environ.get("WK_CURRENT", "")
     refresh = float(os.environ.get("WK_SIDEBAR_REFRESH", "3"))
 
@@ -3243,7 +3273,6 @@ def _dashboard_render(
     Calls `wk list` on a clock. Handles SIGUSR1 by waking sleep early so the
     next iteration redraws immediately — bound to `prefix M-r` via pkill.
     """
-    import time as _time
     import signal as _signal
 
     refresh = max(1.0, refresh)
