@@ -1,0 +1,18 @@
+{
+  "name": "wk-tools",
+  "owner": {
+    "name": "Nate Faerber",
+    "url": "https://github.com/natefaerber"
+  },
+  "description": "Nate's workspace tooling for Claude Code.",
+  "plugins": [
+    {
+      "name": "wk",
+      "source": ".",
+      "description": "Drive wk (tmux + git-worktree workspace manager) from Claude Code. The wk CLI installs separately; this plugin ships the /wk skill.",
+      "version": "0.4.0",
+      "homepage": "https://github.com/natefaerber/wk",
+      "keywords": ["tmux", "git-worktree", "workspace"]
+    }
+  ]
+}
