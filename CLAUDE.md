@@ -56,8 +56,14 @@ A wk workspace is the triple of:
 1. A git worktree on its own branch (at `<repo>/.worktrees/<branch-slug>/`
    by default — nested inside the repo, kept out of `git status` via
    `.git/info/exclude`; override the location via `WK_WORKTREE_ROOT`).
-2. A tmux session named after the branch (with slashes → hyphens via
-   `session_name()`).
+2. A tmux session named after the branch, project-scoped via
+   `session_name()`: the slugified repo name is prefixed (slashes/dots →
+   hyphens), so `<repo>-<branch-slug>`. The prefix is what keeps two
+   checkouts of different projects that sit on the same branch (classically
+   both on `main`, e.g. via `wk adopt`) from colliding on one session.
+   `_normalize_session()` is the bare slug (no prefix) used to match
+   session-form aliases; `_query_matches()` accepts the real branch, the
+   slug, or the full session name when resolving user input.
 3. A `.wk/` marker directory inside the worktree (created by
    `mark_wk_workspace()`).
 

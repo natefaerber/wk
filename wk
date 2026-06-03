@@ -17,6 +17,7 @@ Each workspace is:
 
 from __future__ import annotations
 
+import functools
 import os
 import shutil
 import subprocess
@@ -182,9 +183,47 @@ def ensure_worktrees_ignored() -> None:
         f.write(f"{prefix}{entry}\n")
 
 
+def _normalize_session(s: str) -> str:
+    # tmux session names can't contain `.` or `:`, and `/` would read as a
+    # window path. Normalize all three to `-`. This is the bare branch slug,
+    # also used to match session-form aliases (`feat/login` ↔ `feat-login`).
+    return s.replace("/", "-").replace(".", "-").replace(":", "-")
+
+
+@functools.lru_cache(maxsize=None)
+def _project_prefix(cwd: str) -> str:
+    """Slugified name of the *main* repo for the project at CWD, or "".
+
+    This is the project component of a session name (see `session_name`).
+    Keyed on CWD and cached because session_name is called in tight loops
+    over worktrees, and because cross-repo flows `os.chdir` into a
+    different repo mid-run — the key change picks up the new project.
+    Best-effort: outside a git repo we return "" and fall back to a bare
+    branch name, rather than dying just to compute a label.
+    """
+    try:
+        r = run(
+            ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return ""
+    # common_dir is .../<repo>/.git — its parent is the main checkout.
+    return _normalize_session(Path(r.stdout.strip()).parent.name)
+
+
 def session_name(branch: str) -> str:
-    # tmux session names can't contain `.` or `:`. Normalize.
-    return branch.replace("/", "-").replace(".", "-").replace(":", "-")
+    """tmux session name for BRANCH, scoped to the current project.
+
+    Prefixed with the repo name so two checkouts of *different* projects
+    that happen to sit on the same branch — classically both on `main`,
+    e.g. via `wk adopt` — don't resolve to one shared tmux session. Within
+    a single repo the prefix is constant, so every lookup stays consistent;
+    across repos the prefix differs, which is what breaks the collision.
+    """
+    base = _normalize_session(branch)
+    prefix = _project_prefix(os.getcwd())
+    return f"{prefix}-{base}" if prefix else base
 
 
 def agent_cmd() -> str:
@@ -200,6 +239,25 @@ class Workspace:
     dirty: bool
     ahead: int
     behind: int
+
+
+def _query_matches(query: str, branch_ref: str, session: Optional[str] = None) -> bool:
+    """True if QUERY identifies BRANCH_REF.
+
+    Accepts three forms so users can type whatever's handy: the exact
+    branch (`feat/login`), the session-form slug (`feat-login`), or the
+    full project-scoped session name (`wk-feat-login`). The slug form is
+    what kept working before session names were project-prefixed, so we
+    preserve it here.
+    """
+    if session is None:
+        session = session_name(branch_ref)
+    return query in (branch_ref, _normalize_session(branch_ref), session)
+
+
+def _matches_query(query: str, w: "Workspace") -> bool:
+    """`_query_matches` for a resolved Workspace (reuses its session name)."""
+    return _query_matches(query, w.branch, w.session)
 
 
 def list_worktrees() -> list[tuple[str, Path]]:
@@ -886,7 +944,7 @@ def find_existing_worktree(branch: str) -> Optional[tuple[str, Path]]:
             cur_path = Path(line[len("worktree ") :])
         elif line.startswith("branch "):
             ref = line[len("branch ") :].removeprefix("refs/heads/")
-            if cur_path is not None and (ref == branch or session_name(ref) == branch):
+            if cur_path is not None and _query_matches(branch, ref):
                 return ref, cur_path
         elif line == "":
             cur_path = None
@@ -909,10 +967,10 @@ def resolve_branch_alias(branch: str) -> str:
         return branch
     for ref in r.stdout.splitlines():
         ref = ref.strip()
-        if ref == branch:
-            return ref  # exact match wins
-        if session_name(ref) == branch:
-            return ref  # session-form alias
+        # Matches the real branch, its session-form slug, or the full
+        # project-scoped session name.
+        if _query_matches(branch, ref):
+            return ref
     return branch
 
 
@@ -1859,7 +1917,7 @@ def task_status(
     workspaces = all_workspaces()
     if branch:
         target = next(
-            (w for w in workspaces if w.branch == branch or w.session == branch),
+            (w for w in workspaces if _matches_query(branch, w)),
             None,
         )
         if target is None:
@@ -1922,7 +1980,7 @@ def task_output(
 ) -> None:
     """Dump a task workspace's `.wk/output.md` (the `--auto` claude's stdout)."""
     target = next(
-        (w for w in all_workspaces() if w.branch == branch or w.session == branch),
+        (w for w in all_workspaces() if _matches_query(branch, w)),
         None,
     )
     if target is None:
@@ -1973,7 +2031,7 @@ def task_merge(
     if orch is None:
         die("current tmux session isn't a wk workspace")
     task = next(
-        (w for w in workspaces if w.branch == branch or w.session == branch),
+        (w for w in workspaces if _matches_query(branch, w)),
         None,
     )
     if task is None:
@@ -2127,7 +2185,7 @@ def restore(
             targets = picked
     else:
         match = next(
-            ((b, p) for b, p in worktrees if b == branch or session_name(b) == branch),
+            ((b, p) for b, p in worktrees if _query_matches(branch, b)),
             None,
         )
         if match is None:
@@ -2317,7 +2375,7 @@ def refresh_agents(
     elif branch:
         targets = [
             w for w in workspaces
-            if w.branch == branch or w.session == branch
+            if _matches_query(branch, w)
         ]
         if not targets:
             die(f"no workspace matching {branch!r}")
@@ -2412,7 +2470,7 @@ def switch(
     target: Optional[Workspace] = None
     if branch:
         for w in workspaces:
-            if w.branch == branch or w.session == branch:
+            if _matches_query(branch, w):
                 target = w
                 break
         if target is None:
@@ -2587,7 +2645,7 @@ def close(
     if branch:
         target = next(
             (w for w in all_workspaces()
-             if w.branch == branch or w.session == branch),
+             if _matches_query(branch, w)),
             None,
         )
         if target is None:
@@ -2752,7 +2810,7 @@ def cd(
         die(f"no workspace for current session {session!r}")
     else:
         for w in all_workspaces():
-            if w.branch == branch or w.session == branch:
+            if _matches_query(branch, w):
                 print(w.path)
                 return
         die(f"no workspace for {branch!r}")
