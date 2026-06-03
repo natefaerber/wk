@@ -43,8 +43,11 @@ err = Console(stderr=True)
 # config
 # ---------------------------------------------------------------------------
 
-# Where worktrees live. Default: sibling dir next to the main repo,
-# named `<repo>.worktrees/<branch>`. Override with WK_WORKTREE_ROOT.
+# Where worktrees live. Default: a `.worktrees/` dir *inside* the main repo,
+# i.e. `<repo>/.worktrees/<branch>`. Override with WK_WORKTREE_ROOT.
+# Because this nests working copies inside the repo, we keep `.worktrees/`
+# out of the parent's `git status` via `.git/info/exclude` (see
+# `ensure_worktrees_ignored`).
 WORKTREE_ROOT_ENV = "WK_WORKTREE_ROOT"
 
 # Command to run in the main (chat) pane. Override with WK_AGENT_CMD.
@@ -126,18 +129,57 @@ def repo_name() -> str:
 
 
 def worktree_root() -> Path:
-    """Where all worktrees for this repo live."""
+    """Where all worktrees for this repo live.
+
+    Default is `<repo>/.worktrees/` — nested inside the main checkout so each
+    repo's worktrees stay co-located with it. `ensure_worktrees_ignored()`
+    keeps that dir out of the parent repo's `git status`. Override the whole
+    location (e.g. back to a sibling dir) with WK_WORKTREE_ROOT.
+    """
     override = os.environ.get(WORKTREE_ROOT_ENV)
     if override:
         return Path(override).expanduser()
-    main = repo_root()
-    return main.parent / f"{main.name}.worktrees"
+    return repo_root() / ".worktrees"
 
 
 def worktree_path(branch: str) -> Path:
     # branches like `feat/foo` become `feat-foo` on disk to avoid nested dirs
     safe = branch.replace("/", "-")
     return worktree_root() / safe
+
+
+def ensure_worktrees_ignored() -> None:
+    """Keep the in-repo `.worktrees/` dir out of the main repo's `git status`.
+
+    With the default layout, worktrees nest inside the main checkout, so git
+    would otherwise report `.worktrees/` as untracked. We add it to
+    `.git/info/exclude` rather than the tracked `.gitignore` so we don't dirty
+    the user's repo or force a commit. No-op when WK_WORKTREE_ROOT points the
+    worktrees somewhere outside the repo.
+
+    Idempotent: only the first call writes the line.
+    """
+    # Only relevant when worktrees actually live inside the repo.
+    main = repo_root()
+    try:
+        rel = worktree_root().resolve().relative_to(main.resolve())
+    except ValueError:
+        return  # worktree root is outside the repo — nothing to exclude
+
+    # `--git-common-dir` resolves to the *main* repo's .git even from a worktree.
+    common = run(
+        ["git", "-C", str(main), "rev-parse", "--path-format=absolute", "--git-common-dir"]
+    ).stdout.strip()
+    exclude = Path(common) / "info" / "exclude"
+    entry = f"/{rel.as_posix()}/"
+
+    existing = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
+    if entry in existing.split():
+        return
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    prefix = "" if existing == "" or existing.endswith("\n") else "\n"
+    with exclude.open("a", encoding="utf-8") as f:
+        f.write(f"{prefix}{entry}\n")
 
 
 def session_name(branch: str) -> str:
@@ -956,6 +998,8 @@ def resolve_workspace(
         )
 
     wt.parent.mkdir(parents=True, exist_ok=True)
+    # Nested `.worktrees/` would show as untracked in the main repo; exclude it.
+    ensure_worktrees_ignored()
 
     if branch_exists_locally(branch):
         if strict_new:
@@ -1373,6 +1417,8 @@ def open_pr_pull_ref(number: str, no_attach: bool) -> None:
             f"  remove or rename it, then re-run"
         )
     wt.parent.mkdir(parents=True, exist_ok=True)
+    # Nested `.worktrees/` would show as untracked in the main repo; exclude it.
+    ensure_worktrees_ignored()
 
     if branch_exists_locally(branch):
         console.print(f"[dim]branch {branch} exists; checking out into worktree[/dim]")

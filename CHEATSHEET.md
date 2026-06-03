@@ -23,7 +23,7 @@ wk open release/v35
 
 - If a worktree already exists for `release/v35` anywhere, wk reuses it.
 - If only the branch exists, wk adds a worktree at
-  `~/_Work/credo-backend.worktrees/release-v35` and checks it out.
+  `~/_Work/credo-backend/.worktrees/release-v35` and checks it out.
 - If the branch only exists on `origin`, wk fetches and creates a local tracking
   branch.
 - If neither exists, wk creates `release/v35` from `origin/main`.
@@ -215,7 +215,7 @@ Every pane in a wk session has these env vars set:
 | `WK_IN_WORKSPACE` | `1` |
 | `WK_SESSION` | `release-v35` (slug, no slashes) |
 | `WK_BRANCH` | `release/v35` (canonical ref) |
-| `WK_PATH` | `/Users/nate/_Work/credo-backend.worktrees/release-v35` |
+| `WK_PATH` | `/Users/nate/_Work/credo-backend/.worktrees/release-v35` |
 
 And `.wk/AGENTS.md` in the worktree root documents the layout + commands for
 the agent. Reference it from your project `CLAUDE.md` to give Claude
@@ -233,7 +233,7 @@ auto-context:
   for `open`. It resolves slug → canonical (with slashes) before doing any
   git ops, so you won't accidentally create a duplicate hyphen-named branch.
 - Session names always use slug form (tmux doesn't love slashes).
-- Worktree paths use slug form too: `<repo>.worktrees/release-v35`.
+- Worktree paths use slug form too: `<repo>/.worktrees/release-v35`.
 
 ---
 
@@ -259,7 +259,7 @@ wk task-status fix-tenant-500s       # detailed view of one
 wk task-output fix-tenant-500s -n 50 # last 50 lines of stdout
 
 # 3. Review and integrate
-git -C ~/_Work/credo-backend.worktrees/fix-tenant-500s diff main..
+git -C ~/_Work/credo-backend/.worktrees/fix-tenant-500s diff main..
 wk task-merge fix-tenant-500s         # --no-ff merge commit (default)
 wk task-merge fix-tenant-500s --squash # squash into one commit
 ```
@@ -317,7 +317,7 @@ wk dashboard                     # cross-workspace overview session
 | var | default | what |
 |---|---|---|
 | `WK_AGENT_CMD` | `claude -c \|\| claude` | command run in the agent pane |
-| `WK_WORKTREE_ROOT` | `<repo>.worktrees/` | where to put worktrees |
+| `WK_WORKTREE_ROOT` | `<repo>/.worktrees/` | where to put worktrees |
 | `WK_PR_REPO_ROOT` | `~/_Work` | where `wk open`/`wk pr` look for a PR-by-URL's local clone |
 | `WK_PR_SEARCH_OWNER` | current repo's `origin` owner | GitHub org `wk open <issue>` searches for the issue's PR |
 | `WK_SIDEBAR_REFRESH` | `3` | sidebar pane refresh interval in seconds |
