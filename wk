@@ -291,7 +291,14 @@ def list_worktrees() -> list[tuple[str, Path]]:
     Skips the main checkout and detached HEADs. Includes every worktree
     git knows about — use `list_wk_worktrees()` to filter to wk-owned ones.
     """
-    out = run(["git", "worktree", "list", "--porcelain"]).stdout
+    # check=False: this backs all_workspaces() → wk list/switch/rm/dashboard and
+    # the always-on sidebar/dashboard render loops. If git exits nonzero (CWD
+    # outside a repo, a corrupt .git), a raised CalledProcessError would crash
+    # every one of those, and permanently kill the render loops. Degrade to [].
+    r = run(["git", "worktree", "list", "--porcelain"], check=False)
+    if r.returncode != 0:
+        return []
+    out = r.stdout
     main = repo_root()
     results: list[tuple[str, Path]] = []
     cur_path: Optional[Path] = None
@@ -962,7 +969,10 @@ def find_existing_worktree(branch: str) -> Optional[tuple[str, Path]]:
 
     Returns (real_branch_name, path) on hit, or None.
     """
-    out = run(["git", "worktree", "list", "--porcelain"]).stdout
+    r = run(["git", "worktree", "list", "--porcelain"], check=False)
+    if r.returncode != 0:
+        return None
+    out = r.stdout
     cur_path: Optional[Path] = None
     for line in out.splitlines() + [""]:
         if line.startswith("worktree "):
@@ -2337,44 +2347,57 @@ def _relayout_detached(
     wt_path = Path(wt)
     wk = _wk_bin()
 
-    # Mark the worktree and tag the session so subsequent wk commands (sidebar,
-    # lg-cd, switch, etc.) recognize it.
-    mark_wk_workspace(wt_path, branch=branch)
-    run(["tmux", "set-option", "-t", session, "@wk", "1"])
-    run(["tmux", "set-option", "-t", session, "@wk-branch", branch])
-    run(["tmux", "set-option", "-t", session, "@wk-path", str(wt_path)])
+    # We run detached with stdout/stderr at /dev/null, and our FIRST act below is
+    # destructive (`kill-pane -a` nukes every other pane in the window). If a
+    # later step raises, the user is left with a mangled single-pane window and
+    # no diagnostic anywhere — so log any failure to a stable file, mirroring
+    # `_rm-detached`. (repo_root() resolves from the worktree we're relaying out.)
+    try:
+        # Mark the worktree and tag the session so subsequent wk commands
+        # (sidebar, lg-cd, switch, etc.) recognize it.
+        mark_wk_workspace(wt_path, branch=branch)
+        run(["tmux", "set-option", "-t", session, "@wk", "1"])
+        run(["tmux", "set-option", "-t", session, "@wk-branch", branch])
+        run(["tmux", "set-option", "-t", session, "@wk-path", str(wt_path)])
 
-    # Push WK_* into the session environment so newly-spawned panes inherit
-    # them. (build_session uses `-e` on new-session for the same effect at
-    # creation time; we can't do that retroactively, so set-environment is
-    # the equivalent for an existing session.)
-    for k, v in [
-        ("WK_IN_WORKSPACE", "1"),
-        ("WK_SESSION", session),
-        ("WK_BRANCH", branch),
-        ("WK_PATH", str(wt_path)),
-    ]:
-        run(["tmux", "set-environment", "-t", session, k, v])
+        # Push WK_* into the session environment so newly-spawned panes inherit
+        # them. (build_session uses `-e` on new-session for the same effect at
+        # creation time; we can't do that retroactively, so set-environment is
+        # the equivalent for an existing session.)
+        for k, v in [
+            ("WK_IN_WORKSPACE", "1"),
+            ("WK_SESSION", session),
+            ("WK_BRANCH", branch),
+            ("WK_PATH", str(wt_path)),
+        ]:
+            run(["tmux", "set-environment", "-t", session, k, v])
 
-    # Kill every pane in the target window except the one we're going to
-    # respawn as the sidebar.
-    run(["tmux", "kill-pane", "-a", "-t", pane], check=False)
+        # Kill every pane in the target window except the one we're going to
+        # respawn as the sidebar.
+        run(["tmux", "kill-pane", "-a", "-t", pane], check=False)
 
-    # Match build_session's window naming.
-    run(["tmux", "rename-window", "-t", window, "work"], check=False)
+        # Match build_session's window naming.
+        run(["tmux", "rename-window", "-t", window, "work"], check=False)
 
-    # Respawn the surviving pane as the sidebar. -k force-kills the existing
-    # process (our parent shell, plus its now-exited wk caller).
-    run(
-        [
-            "tmux", "respawn-pane", "-k",
-            "-t", pane,
-            "-c", str(wt_path),
-            *_shell_wrap(f"WK_CURRENT={session} {wk} sidebar"),
-        ]
-    )
+        # Respawn the surviving pane as the sidebar. -k force-kills the existing
+        # process (our parent shell, plus its now-exited wk caller).
+        run(
+            [
+                "tmux", "respawn-pane", "-k",
+                "-t", pane,
+                "-c", str(wt_path),
+                *_shell_wrap(f"WK_CURRENT={session} {wk} sidebar"),
+            ]
+        )
 
-    _layout_splits_from_sidebar(session, wt_path, pane, agent_cmd())
+        _layout_splits_from_sidebar(session, wt_path, pane, agent_cmd())
+    except Exception:
+        try:
+            logdir = repo_root() / ".git"
+        except Exception:
+            logdir = wt_path
+        _log_detached_failure(logdir, f"_relayout-detached {session}")
+        raise
 
 
 @app.command("refresh-agents")
@@ -2540,9 +2563,14 @@ def switch(
                 "--disabled",
                 "--bind=j:down,k:up,g:first,G:last",
                 "--bind=/:unbind(j,k,g,G)+enable-search+clear-query",
-                # ctrl-n / ctrl-d quick actions on the highlighted workspace
+                # ctrl-n / ctrl-d quick actions on the highlighted workspace.
+                # ctrl-d does NOT pass --force: a fat-fingered ctrl-d in the
+                # picker must not silently destroy a dirty worktree + unmerged
+                # branch. `wk rm` refuses on a dirty tree, and only force-deletes
+                # the branch ref under --force — so a clean-but-unmerged branch
+                # is preserved here too.
                 f"--bind=ctrl-n:execute(tmux command-prompt -p 'new branch:' 'run-shell \"{wk} new %%\"')+abort",
-                f"--bind=ctrl-d:execute({wk} rm {{1}} --force)+reload({wk} _list-once)",
+                f"--bind=ctrl-d:execute({wk} rm {{1}})+reload({wk} _list-once)",
             ],
             input="\n".join(lines),
             text=True,
@@ -2715,9 +2743,28 @@ def _do_rm(w: Workspace, main: Path, force: bool, keep_branch: bool) -> None:
     args = ["git", "-C", str(main), "worktree", "remove", str(w.path)]
     if force:
         args.append("--force")
-    run(args, check=False)
+    wt_result = run(args, check=False)
+    if wt_result.returncode != 0:
+        # Don't claim success we didn't achieve — and don't go on to delete the
+        # branch ref for a worktree that's still on disk.
+        console.print(
+            f"[red]✗[/red] could not remove worktree {w.path}: "
+            f"{wt_result.stderr.strip() or 'git worktree remove failed'}"
+        )
+        return
     if not keep_branch:
-        run(["git", "-C", str(main), "branch", "-D", w.branch], check=False)
+        # `-d` refuses to delete an unmerged branch; only escalate to the
+        # force-delete `-D` when the caller passed --force. A clean worktree can
+        # still hold committed-but-unmerged work, so default-rm must not discard
+        # the branch ref silently.
+        flag = "-D" if force else "-d"
+        br = run(["git", "-C", str(main), "branch", flag, w.branch], check=False)
+        if br.returncode != 0 and not force:
+            console.print(
+                f"[yellow]•[/yellow] kept branch [bold]{w.branch}[/bold] "
+                f"(has unmerged work; `git branch -D {w.branch}` or "
+                f"`wk rm --force` to delete)"
+            )
 
 
 @app.command()
@@ -3168,6 +3215,12 @@ def sidebar() -> None:
             _time.sleep(refresh)
         except KeyboardInterrupt:
             return
+        except Exception as e:
+            # An always-on pane must survive a transient error (e.g. a git hiccup
+            # mid-refresh) instead of dying for good. Show it and keep looping.
+            console.clear()
+            console.print(f"[red]sidebar error:[/red] {e}")
+            _time.sleep(refresh)
 
 
 @app.command("_list-once", hidden=True)
@@ -3308,6 +3361,12 @@ def _dashboard_render(
             _time.sleep(refresh)
         except KeyboardInterrupt:
             return
+        except Exception as e:
+            # Keep the dashboard pane alive through a transient error rather than
+            # letting the render loop die permanently.
+            console.clear()
+            console.print(f"[red]dashboard error:[/red] {e}")
+            _time.sleep(refresh)
 
 
 if __name__ == "__main__":
