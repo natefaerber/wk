@@ -29,9 +29,21 @@ install.sh          Installer. Copies or symlinks files to ~/.local/bin etc.
 lazygit.yml         Narrow-pane lazygit config, installed to ~/.config/wk/lazygit.yml.
 cdw.fish            Fish helper: `cd (wk cd <branch>)` shortcut.
 wk-resurrect-filter Helper for tmux-resurrect: only saves wk-tagged sessions.
-CHEATSHEET.md       User-facing reference.
+CHEATSHEET.md       User-facing reference (single source of truth for flags).
+README.md           Landing page; forks terminal-user vs Claude-Code-user install.
 CLAUDE.md           This file.
+conftest.py         Test harness — imports the single-file `wk` via SourceFileLoader.
+tests/              pytest suite for the pure + git-touching helpers.
+.claude-plugin/     Claude Code plugin packaging: plugin.json + marketplace.json
+                    (repo is its own `wk-tools` marketplace; ships the /wk skill).
+skills/wk/SKILL.md  The /wk skill the plugin ships (CC-wide "when to drive wk").
 ```
+
+The plugin (`.claude-plugin/` + `skills/`) is a thin distribution layer over the
+CLI — it ships the skill, NOT the binary. Users install the CLI separately
+(mise/install.sh) and the plugin via `/plugin marketplace add natefaerber/wk`.
+Plugin version (`plugin.json`) is kept in lockstep with the CLI tag by a guard
+in `release.yml`.
 
 ## Running locally
 
@@ -233,6 +245,14 @@ Then:
 2. Add a row to the commands-reference table in `CHEATSHEET.md`
 3. If it's something coding agents inside workspaces would use, add it
    to the `_AGENTS_MD` string in `wk`
+
+**Docs source-of-truth (avoid drift).** Command flags live in exactly one place:
+`CHEATSHEET.md`. The other command-describing surfaces — the `_AGENTS_MD` string
+(written to `.wk/AGENTS.md`) and `skills/wk/SKILL.md` (the plugin skill) — are
+*routing* references: they say which command fits a request and point to
+CHEATSHEET for flags. Don't re-list flags in them. `tests/test_docs_commands.py`
+fails CI if `_AGENTS_MD` or `SKILL.md` ever names a `wk <cmd>` that isn't a
+registered command, so renaming/removing a command surfaces the stale doc.
 
 ## Adding a new tmux binding
 

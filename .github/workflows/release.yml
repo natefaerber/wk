@@ -44,6 +44,23 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=v$version" >> "$GITHUB_OUTPUT"
 
+      - name: Check plugin manifests match the tag
+        # Version lockstep: the Claude Code plugin (.claude-plugin/) carries its
+        # own version, separate from the CLI's git tag. Keep them in sync by
+        # failing the release if the manifests weren't bumped to match the tag.
+        # Skipped on workflow_dispatch dry-runs (no tag).
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          pv=$(python3 -c "import json;print(json.load(open('.claude-plugin/plugin.json'))['version'])")
+          mv=$(python3 -c "import json;print(json.load(open('.claude-plugin/marketplace.json'))['plugins'][0]['version'])")
+          if [ "$pv" != "$VERSION" ] || [ "$mv" != "$VERSION" ]; then
+            echo "::error::version mismatch — tag=$VERSION plugin.json=$pv marketplace.json=$mv. Bump both manifests to match the tag before releasing."
+            exit 1
+          fi
+          echo "plugin manifests match tag v$VERSION"
+
       - name: Set up uv
         # Pin to an exact release: astral-sh/setup-uv publishes no moving `v8`
         # major tag (only `v7` and exact tags like `v8.1.0`), so `@v8` fails to
