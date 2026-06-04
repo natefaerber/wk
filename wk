@@ -21,13 +21,14 @@ import functools
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import time as _time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import NoReturn, Optional
 
 import typer
 from rich.console import Console
@@ -107,7 +108,7 @@ def run(
     )
 
 
-def die(msg: str, code: int = 1) -> None:
+def die(msg: str, code: int = 1) -> NoReturn:
     err.print(f"[red]error:[/red] {msg}")
     raise typer.Exit(code)
 
@@ -291,7 +292,14 @@ def list_worktrees() -> list[tuple[str, Path]]:
     Skips the main checkout and detached HEADs. Includes every worktree
     git knows about — use `list_wk_worktrees()` to filter to wk-owned ones.
     """
-    out = run(["git", "worktree", "list", "--porcelain"]).stdout
+    # check=False: this backs all_workspaces() → wk list/switch/rm/dashboard and
+    # the always-on sidebar/dashboard render loops. If git exits nonzero (CWD
+    # outside a repo, a corrupt .git), a raised CalledProcessError would crash
+    # every one of those, and permanently kill the render loops. Degrade to [].
+    r = run(["git", "worktree", "list", "--porcelain"], check=False)
+    if r.returncode != 0:
+        return []
+    out = r.stdout
     main = repo_root()
     results: list[tuple[str, Path]] = []
     cur_path: Optional[Path] = None
@@ -488,6 +496,10 @@ Parallel work (only from an orchestrator workspace — see ORCHESTRATOR.md):
   `.wk/output.md` (the `--auto` Claude's stdout).
 - `wk task-merge <branch> [--squash]` — merge a finished task branch
   back into the current workspace's branch.
+- `wk task-cancel <branch>` — stop a running task's agent (kill its
+  session), keeping the worktree and partial output.
+- `wk task-retry <branch>` — re-run a task's agent against its existing
+  `.wk/task.md`, in place (clears the prior output/done markers).
 
 Inspection / housekeeping:
 
@@ -663,6 +675,28 @@ def all_workspaces() -> list[Workspace]:
     return [workspace_status(b, p, sessions) for b, p in list_wk_worktrees()]
 
 
+def find_workspace(
+    query: str, workspaces: Optional[list[Workspace]] = None
+) -> Optional[Workspace]:
+    """First workspace matching QUERY (branch / slug / full session name), or None.
+
+    Pass an existing WORKSPACES list to avoid re-running all_workspaces() (which
+    shells out per worktree); otherwise it's fetched.
+    """
+    ws = all_workspaces() if workspaces is None else workspaces
+    return next((w for w in ws if _matches_query(query, w)), None)
+
+
+def require_workspace(
+    query: str, workspaces: Optional[list[Workspace]] = None
+) -> Workspace:
+    """find_workspace() or die — the shared "no workspace matching X" guard."""
+    w = find_workspace(query, workspaces)
+    if w is None:
+        die(f"no workspace matching {query!r}")
+    return w
+
+
 def in_tmux() -> bool:
     return "TMUX" in os.environ
 
@@ -695,6 +729,7 @@ def _shell_wrap(cmd: str) -> list[str]:
 # Target widths (cols) and height percentages for the 5-pane layout.
 # Tuned for ~290-col widescreen tmux windows (UWQHD 3440px); tmux scales
 # proportionally when attached to a smaller terminal.
+WINDOW_COLS = 290       # detached-session width; reshaped to fit on attach
 LEFT_COL_COLS = 42      # sidebar + shell column
 RIGHT_COL_COLS = 75     # lazygit + terminal column
 SIDEBAR_PCT = 20        # sidebar gets this percent of left col height
@@ -720,7 +755,7 @@ def _layout_splits_from_sidebar(
     wt: Path,
     sidebar_id: str,
     agent: str,
-    total_cols: int = 290,
+    total_cols: int = WINDOW_COLS,
 ) -> None:
     """Given an already-existing sidebar pane (running `wk sidebar`), perform
     the four splits that finish the 5-pane layout. Shared by `build_session`
@@ -784,6 +819,22 @@ def _layout_splits_from_sidebar(
     run(["tmux", "select-pane", "-t", agent_id])
 
 
+def wk_env_pairs(session: str, branch: str, wt: Path) -> list[tuple[str, str]]:
+    """The WK_* environment contract exposed to every pane of a workspace.
+
+    Single source of truth so `build_session` (which sets these via
+    `new-session -e` at creation) and `_relayout-detached` (which sets them via
+    `set-environment` retroactively) can't drift apart. The contract is
+    documented for agents in the embedded `.wk/AGENTS.md`.
+    """
+    return [
+        ("WK_IN_WORKSPACE", "1"),
+        ("WK_SESSION", session),
+        ("WK_BRANCH", branch),
+        ("WK_PATH", str(wt)),
+    ]
+
+
 def build_session(
     session: str,
     wt: Path,
@@ -804,7 +855,7 @@ def build_session(
         └──────────┴──────────────────────────┴──────────────────┘
     """
     wk = _wk_bin()
-    total_cols = 290
+    total_cols = WINDOW_COLS
     real_branch = branch or session
 
     # Mark this worktree as a wk workspace before we touch tmux — the sidebar
@@ -815,12 +866,7 @@ def build_session(
     # etc.) detect they're inside wk and find the workspace context. tmux's
     # -e flag on new-session applies to all panes split off this session.
     env_flags: list[str] = []
-    for k, v in [
-        ("WK_IN_WORKSPACE", "1"),
-        ("WK_SESSION", session),
-        ("WK_BRANCH", real_branch),
-        ("WK_PATH", str(wt)),
-    ]:
+    for k, v in wk_env_pairs(session, real_branch, wt):
         env_flags.extend(["-e", f"{k}={v}"])
 
     # Sidebar (initial pane). Starts with `wk sidebar` running.
@@ -840,14 +886,30 @@ def build_session(
         ]
     ).stdout.strip()
 
-    # Tag the session as wk-managed so tmux-resurrect filters and other tools
-    # can identify it. Stored as tmux user options, readable via
-    # `tmux show-options -v -t <session> @wk`.
-    run(["tmux", "set-option", "-t", session, "@wk", "1"])
-    run(["tmux", "set-option", "-t", session, "@wk-branch", real_branch])
-    run(["tmux", "set-option", "-t", session, "@wk-path", str(wt)])
+    # A successful new-session prints the new pane's %NN id. An empty/garbled
+    # capture means every subsequent `-t <id>` split would target the wrong
+    # pane — bail before building a broken layout (and kill whatever was made).
+    if not sidebar_id.startswith("%"):
+        run(["tmux", "kill-session", "-t", session], check=False)
+        die(f"failed to create session {session!r} (tmux returned no pane id)")
 
-    _layout_splits_from_sidebar(session, wt, sidebar_id, agent, total_cols=total_cols)
+    # If any split/option fails partway, don't leave a half-built session
+    # running — callers and is_wk_workspace() would treat the zombie as a real
+    # workspace. Tear it down and report.
+    try:
+        # Tag the session as wk-managed so tmux-resurrect filters and other
+        # tools can identify it. Stored as tmux user options, readable via
+        # `tmux show-options -v -t <session> @wk`.
+        run(["tmux", "set-option", "-t", session, "@wk", "1"])
+        run(["tmux", "set-option", "-t", session, "@wk-branch", real_branch])
+        run(["tmux", "set-option", "-t", session, "@wk-path", str(wt)])
+
+        _layout_splits_from_sidebar(
+            session, wt, sidebar_id, agent, total_cols=total_cols
+        )
+    except Exception:
+        run(["tmux", "kill-session", "-t", session], check=False)
+        die(f"failed to build session {session!r}; cleaned up the partial session")
 
 
 # ---------------------------------------------------------------------------
@@ -962,7 +1024,10 @@ def find_existing_worktree(branch: str) -> Optional[tuple[str, Path]]:
 
     Returns (real_branch_name, path) on hit, or None.
     """
-    out = run(["git", "worktree", "list", "--porcelain"]).stdout
+    r = run(["git", "worktree", "list", "--porcelain"], check=False)
+    if r.returncode != 0:
+        return None
+    out = r.stdout
     cur_path: Optional[Path] = None
     for line in out.splitlines() + [""]:
         if line.startswith("worktree "):
@@ -1106,6 +1171,18 @@ def resolve_workspace(
         return WorkspaceState(branch=branch, wt=wt, session=session, created=True, branch_created=True)
 
     # Case 5.
+    # Verify the base ref resolves before branching from it — otherwise
+    # `git worktree add` raises a bare CalledProcessError. Common on a repo with
+    # no `origin` remote, or whose default branch isn't `main` (set WK_BASE or
+    # pass --base).
+    if run(
+        ["git", "-C", str(main), "rev-parse", "--verify", "--quiet", base],
+        check=False,
+    ).returncode != 0:
+        die(
+            f"base ref {base!r} doesn't exist — fetch origin, or set WK_BASE "
+            f"(or pass --base) to a ref that exists."
+        )
     console.print(f"[dim]creating branch {branch} from {base}[/dim]")
     run(
         ["git", "-C", str(main), "worktree", "add", "-b", branch, str(wt), base]
@@ -1521,10 +1598,12 @@ def open_pr_pull_ref(number: str, no_attach: bool) -> None:
 
 
 # ---------------------------------------------------------------------------
-# commands
+# commands — grouped below: workspace lifecycle · orchestrator · session
+# management · inspection & navigation · teardown · paths & panes · passive views
 # ---------------------------------------------------------------------------
 
 
+# --- workspace lifecycle: new / open / pr / adopt ---
 @app.command()
 def new(
     branch: str = typer.Argument(..., help="Branch name for the new workspace."),
@@ -1596,6 +1675,9 @@ def open_cmd(
 
     `wk pr` is the same PR path if you want an explicit, PR-only verb.
     Normal (lowercase) branch names never collide with the PR/issue forms.
+
+    Already standing in a checkout you don't want recreated (a plain clone or
+    a hand-made worktree)? Use `wk adopt` to wrap it in place instead.
     """
     require("git")
     require("tmux")
@@ -1717,6 +1799,21 @@ def adopt(
         attach_or_switch(session)
 
 
+# The headless (`--auto`) task command, shared by `wk task --auto` and
+# `wk task-retry`. Runs from the worktree cwd, so the `.wk/...` paths resolve.
+# Writes a `.wk/done` sentinel FILE when claude exits (not a log marker) —
+# task-status keys "done" off the file's existence, which can't be spoofed by
+# the task's own output echoing a magic string. `read -n 1` keeps the pane open
+# for review.
+_AUTO_TASK_CMD = (
+    "claude -p \"$(cat .wk/task.md)\" 2>&1 | tee .wk/output.md; "
+    "touch .wk/done; "
+    "echo; echo '── task complete ── press any key to close ──'; "
+    "read -n 1"
+)
+
+
+# --- orchestrator: task / task-status / -output / -merge / -cancel / -retry ---
 @app.command()
 def task(
     prompt: str = typer.Argument(..., help="The task description / prompt for Claude."),
@@ -1788,21 +1885,12 @@ def task(
 
     # Build the session. Agent command depends on --auto.
     if auto:
-        # Non-interactive: pane 2 runs claude -p, output piped to .wk/output.md.
-        # `tee` streams to both the pane and the file so the user can watch.
-        # `read -n 1` keeps the pane open after exit for review.
-        auto_cmd = (
-            "claude -p \"$(cat .wk/task.md)\" 2>&1 | tee .wk/output.md; "
-            "echo; echo '── task complete ── press any key to close ──'; "
-            "read -n 1"
-        )
-        build_session(session, wt, " ".join(_shell_wrap(auto_cmd)), branch=branch)
+        build_session(session, wt, " ".join(_shell_wrap(_AUTO_TASK_CMD)), branch=branch)
     else:
         # Interactive: launch claude with the prompt as a positional arg so
         # it's pre-filled in the input buffer. Claude handles the launch
         # timing itself — no send-keys race condition.
         # We use shell-quoting via shlex for safety against unusual chars.
-        import shlex
         agent = f"claude {shlex.quote(prompt.strip())}"
         build_session(session, wt, agent, branch=branch)
 
@@ -1824,9 +1912,9 @@ def task(
 # ---------------------------------------------------------------------------
 
 
-# Sentinel string that `wk task --auto` writes when claude -p exits cleanly.
-# Used by task-status to distinguish "done" from "running / crashed mid-run".
-_TASK_COMPLETE_MARKER = "── task complete ──"
+# Name of the sentinel file `_AUTO_TASK_CMD` touches when claude exits.
+# task-status keys "done" off its existence (robust to the task's own output).
+_TASK_DONE_MARKER = "done"
 
 
 def _is_task_workspace_session(session: str) -> bool:
@@ -1872,6 +1960,7 @@ def _task_status(w: Workspace) -> TaskStatus:
     is_task = w.has_session and _is_task_workspace_session(w.session)
     output_path = w.path / WK_MARKER_DIR / "output.md"
     output_size = output_path.stat().st_size if output_path.exists() else 0
+    done = (w.path / WK_MARKER_DIR / _TASK_DONE_MARKER).exists()
     last_line: Optional[str] = None
     state = "idle"
 
@@ -1880,12 +1969,13 @@ def _task_status(w: Workspace) -> TaskStatus:
         # Last non-empty line, stripped of ANSI/control chars best-effort.
         lines = [ln.rstrip() for ln in tail.splitlines() if ln.strip()]
         last_line = lines[-1] if lines else None
-        if _TASK_COMPLETE_MARKER in tail:
-            state = "done"
-        elif w.has_session:
-            state = "running"
-        else:
-            state = "failed"  # session gone but no completion marker
+
+    # The `.wk/done` sentinel is the source of truth for completion; it can't be
+    # faked by the task's own output (unlike grepping for a marker string).
+    if done:
+        state = "done"
+    elif output_size > 0:
+        state = "running" if w.has_session else "failed"  # session gone mid-run
     elif is_task and w.has_session:
         # Auto task with no output yet, or interactive task — call it running.
         state = "running"
@@ -1939,15 +2029,11 @@ def task_status(
     Designed for orchestrator polling: tells you which tasks are still
     running, which finished, which crashed, and what each one last said.
     """
+    require("git")
+    require("tmux")
     workspaces = all_workspaces()
     if branch:
-        target = next(
-            (w for w in workspaces if _matches_query(branch, w)),
-            None,
-        )
-        if target is None:
-            die(f"no workspace matching {branch!r}")
-        targets = [target]
+        targets = [require_workspace(branch, workspaces)]
     else:
         targets = workspaces
 
@@ -2004,12 +2090,8 @@ def task_output(
     ),
 ) -> None:
     """Dump a task workspace's `.wk/output.md` (the `--auto` claude's stdout)."""
-    target = next(
-        (w for w in all_workspaces() if _matches_query(branch, w)),
-        None,
-    )
-    if target is None:
-        die(f"no workspace matching {branch!r}")
+    require("git")
+    target = require_workspace(branch)
     output_path = target.path / WK_MARKER_DIR / "output.md"
     if not output_path.exists():
         die(f"no output yet at {output_path}")
@@ -2055,12 +2137,7 @@ def task_merge(
     orch = next((w for w in workspaces if w.session == orch_session), None)
     if orch is None:
         die("current tmux session isn't a wk workspace")
-    task = next(
-        (w for w in workspaces if _matches_query(branch, w)),
-        None,
-    )
-    if task is None:
-        die(f"no workspace matching {branch!r}")
+    task = require_workspace(branch, workspaces)
     if task.session == orch.session:
         die("can't merge a workspace into itself")
     if task.dirty:
@@ -2099,6 +2176,82 @@ def task_merge(
         console.print(
             f"[dim]squashed — commit manually in {orch.path}[/dim]"
         )
+
+
+@app.command("task-cancel")
+def task_cancel(
+    branch: str = typer.Argument(..., help="Task workspace to cancel."),
+) -> None:
+    """Stop a running task's agent without destroying anything.
+
+    Kills the task's tmux session (which terminates the `claude` process) but
+    keeps the worktree, `.wk/task.md`, and any partial output on disk. Use this
+    when a task is wedged or going the wrong way: unlike `wk rm` it loses no
+    work, and you can inspect the result or re-run it with `wk task-retry`.
+    """
+    require("git")
+    require("tmux")
+    target = require_workspace(branch)
+    if target.has_session:
+        run(["tmux", "kill-session", "-t", target.session], check=False)
+        console.print(
+            f"[green]✓[/green] cancelled [bold]{target.branch}[/bold] "
+            f"[dim](worktree kept; `wk task-retry {target.branch}` to re-run, "
+            f"`wk rm {target.branch}` to discard)[/dim]"
+        )
+    else:
+        console.print(
+            f"[dim]no running session for {target.branch}; nothing to cancel[/dim]"
+        )
+
+
+@app.command("task-retry")
+def task_retry(
+    branch: str = typer.Argument(..., help="Task workspace to re-run."),
+    no_attach: bool = typer.Option(
+        False, "--no-attach", help="Don't attach the rebuilt session."
+    ),
+) -> None:
+    """Re-run a task's agent against its existing `.wk/task.md`, in place.
+
+    For a task that crashed or finished unsatisfactorily: reuses the same
+    worktree and prompt, rebuilds the headless (`--auto`) session, and clears
+    the previous run's `output.md` / `done` markers so status reflects the fresh
+    run. The branch and its commits are left untouched — retry re-runs the
+    agent, it does not reset your code.
+    """
+    require("git")
+    require("tmux")
+    require("claude")
+    target = require_workspace(branch)
+    task_file = target.path / WK_MARKER_DIR / "task.md"
+    if not task_file.exists():
+        die(
+            f"no task file at {task_file} — is {target.branch!r} a "
+            f"`wk task` workspace?"
+        )
+    prompt = task_file.read_text(encoding="utf-8").strip()
+
+    # Kill any running session and clear the prior run's markers so task-status
+    # reflects the fresh run rather than the stale "done"/output.
+    if target.has_session:
+        run(["tmux", "kill-session", "-t", target.session], check=False)
+    for marker in ("output.md", _TASK_DONE_MARKER):
+        p = target.path / WK_MARKER_DIR / marker
+        if p.exists():
+            p.unlink()
+
+    session = session_name(target.branch)
+    build_session(
+        session, target.path, " ".join(_shell_wrap(_AUTO_TASK_CMD)),
+        branch=target.branch,
+    )
+    run(["tmux", "set-option", "-t", session, "@wk-task", "1"])
+    run(["tmux", "set-option", "-t", session, "@wk-task-prompt", prompt[:200]])
+    console.print(f"[green]✓[/green] re-running [bold]{target.branch}[/bold]")
+    console.print(f"  [dim]output: {target.path}/.wk/output.md[/dim]")
+    if not no_attach:
+        attach_or_switch(session)
 
 
 def _pick_restore_targets(
@@ -2149,6 +2302,7 @@ def _pick_restore_targets(
     return [(b, p) for b, p in candidates if b in pick_set]
 
 
+# --- session management: restore / relayout / refresh-agents ---
 @app.command()
 def restore(
     branch: Optional[str] = typer.Argument(
@@ -2248,10 +2402,13 @@ def relayout(
 ) -> None:
     """Rebuild the 5-pane wk layout in the current tmux session's active window.
 
-    Useful when a layout has been mangled by hand, or to convert an arbitrary
-    tmux session into a wk workspace. Kills every other pane in the active
-    window and respawns the active pane as the sidebar, then re-runs the same
-    split sequence `wk open` uses. The session keeps its name.
+    Useful when a layout has been mangled by hand, or to convert the current
+    tmux session into a wk workspace. (Sibling "make this wk" verbs: `wk adopt`
+    wraps a *directory* in place; `wk open` builds one from a *branch* name —
+    reach for relayout only to fix/convert the session you're already in.)
+    Kills every other pane in the active window and respawns the active pane as
+    the sidebar, then re-runs the same split sequence `wk open` uses. The
+    session keeps its name.
 
     The destructive work runs in a detached process — same trick `wk rm` uses
     for self-removal — because respawning the pane that's running this command
@@ -2337,44 +2494,52 @@ def _relayout_detached(
     wt_path = Path(wt)
     wk = _wk_bin()
 
-    # Mark the worktree and tag the session so subsequent wk commands (sidebar,
-    # lg-cd, switch, etc.) recognize it.
-    mark_wk_workspace(wt_path, branch=branch)
-    run(["tmux", "set-option", "-t", session, "@wk", "1"])
-    run(["tmux", "set-option", "-t", session, "@wk-branch", branch])
-    run(["tmux", "set-option", "-t", session, "@wk-path", str(wt_path)])
+    # We run detached with stdout/stderr at /dev/null, and our FIRST act below is
+    # destructive (`kill-pane -a` nukes every other pane in the window). If a
+    # later step raises, the user is left with a mangled single-pane window and
+    # no diagnostic anywhere — so log any failure to a stable file, mirroring
+    # `_rm-detached`. (repo_root() resolves from the worktree we're relaying out.)
+    try:
+        # Mark the worktree and tag the session so subsequent wk commands
+        # (sidebar, lg-cd, switch, etc.) recognize it.
+        mark_wk_workspace(wt_path, branch=branch)
+        run(["tmux", "set-option", "-t", session, "@wk", "1"])
+        run(["tmux", "set-option", "-t", session, "@wk-branch", branch])
+        run(["tmux", "set-option", "-t", session, "@wk-path", str(wt_path)])
 
-    # Push WK_* into the session environment so newly-spawned panes inherit
-    # them. (build_session uses `-e` on new-session for the same effect at
-    # creation time; we can't do that retroactively, so set-environment is
-    # the equivalent for an existing session.)
-    for k, v in [
-        ("WK_IN_WORKSPACE", "1"),
-        ("WK_SESSION", session),
-        ("WK_BRANCH", branch),
-        ("WK_PATH", str(wt_path)),
-    ]:
-        run(["tmux", "set-environment", "-t", session, k, v])
+        # Push WK_* into the session environment so newly-spawned panes inherit
+        # them. (build_session uses `-e` on new-session for the same effect at
+        # creation time; we can't do that retroactively, so set-environment is
+        # the equivalent for an existing session.)
+        for k, v in wk_env_pairs(session, branch, wt_path):
+            run(["tmux", "set-environment", "-t", session, k, v])
 
-    # Kill every pane in the target window except the one we're going to
-    # respawn as the sidebar.
-    run(["tmux", "kill-pane", "-a", "-t", pane], check=False)
+        # Kill every pane in the target window except the one we're going to
+        # respawn as the sidebar.
+        run(["tmux", "kill-pane", "-a", "-t", pane], check=False)
 
-    # Match build_session's window naming.
-    run(["tmux", "rename-window", "-t", window, "work"], check=False)
+        # Match build_session's window naming.
+        run(["tmux", "rename-window", "-t", window, "work"], check=False)
 
-    # Respawn the surviving pane as the sidebar. -k force-kills the existing
-    # process (our parent shell, plus its now-exited wk caller).
-    run(
-        [
-            "tmux", "respawn-pane", "-k",
-            "-t", pane,
-            "-c", str(wt_path),
-            *_shell_wrap(f"WK_CURRENT={session} {wk} sidebar"),
-        ]
-    )
+        # Respawn the surviving pane as the sidebar. -k force-kills the existing
+        # process (our parent shell, plus its now-exited wk caller).
+        run(
+            [
+                "tmux", "respawn-pane", "-k",
+                "-t", pane,
+                "-c", str(wt_path),
+                *_shell_wrap(f"WK_CURRENT={session} {wk} sidebar"),
+            ]
+        )
 
-    _layout_splits_from_sidebar(session, wt_path, pane, agent_cmd())
+        _layout_splits_from_sidebar(session, wt_path, pane, agent_cmd())
+    except Exception:
+        try:
+            logdir = repo_root() / ".git"
+        except Exception:
+            logdir = wt_path
+        _log_detached_failure(logdir, f"_relayout-detached {session}")
+        raise
 
 
 @app.command("refresh-agents")
@@ -2394,6 +2559,8 @@ def refresh_agents(
     Pass a branch name to target a specific one, or `--all` for every wk
     workspace this repo knows about.
     """
+    require("git")
+    require("tmux")
     workspaces = all_workspaces()
     if all_workspaces_flag:
         targets = workspaces
@@ -2435,6 +2602,7 @@ def refresh_agents(
         )
 
 
+# --- inspection & navigation: is-wk-session / list / switch / cycle ---
 @app.command()
 def is_wk_session(
     session: str = typer.Argument(..., help="Session name to check.")
@@ -2540,9 +2708,14 @@ def switch(
                 "--disabled",
                 "--bind=j:down,k:up,g:first,G:last",
                 "--bind=/:unbind(j,k,g,G)+enable-search+clear-query",
-                # ctrl-n / ctrl-d quick actions on the highlighted workspace
+                # ctrl-n / ctrl-d quick actions on the highlighted workspace.
+                # ctrl-d does NOT pass --force: a fat-fingered ctrl-d in the
+                # picker must not silently destroy a dirty worktree + unmerged
+                # branch. `wk rm` refuses on a dirty tree, and only force-deletes
+                # the branch ref under --force — so a clean-but-unmerged branch
+                # is preserved here too.
                 f"--bind=ctrl-n:execute(tmux command-prompt -p 'new branch:' 'run-shell \"{wk} new %%\"')+abort",
-                f"--bind=ctrl-d:execute({wk} rm {{1}} --force)+reload({wk} _list-once)",
+                f"--bind=ctrl-d:execute({wk} rm {{1}})+reload({wk} _list-once)",
             ],
             input="\n".join(lines),
             text=True,
@@ -2650,6 +2823,7 @@ def cycle(
     run(["tmux", "switch-client", "-t", target], check=False)
 
 
+# --- teardown: close (keep worktree) / rm (destroy) ---
 @app.command()
 def close(
     branch: Optional[str] = typer.Argument(
@@ -2668,13 +2842,7 @@ def close(
     require("tmux")
 
     if branch:
-        target = next(
-            (w for w in all_workspaces()
-             if _matches_query(branch, w)),
-            None,
-        )
-        if target is None:
-            die(f"no workspace matching {branch!r}")
+        target = require_workspace(branch)
         session = target.session
         label = target.branch
     else:
@@ -2715,9 +2883,28 @@ def _do_rm(w: Workspace, main: Path, force: bool, keep_branch: bool) -> None:
     args = ["git", "-C", str(main), "worktree", "remove", str(w.path)]
     if force:
         args.append("--force")
-    run(args, check=False)
+    wt_result = run(args, check=False)
+    if wt_result.returncode != 0:
+        # Don't claim success we didn't achieve — and don't go on to delete the
+        # branch ref for a worktree that's still on disk.
+        console.print(
+            f"[red]✗[/red] could not remove worktree {w.path}: "
+            f"{wt_result.stderr.strip() or 'git worktree remove failed'}"
+        )
+        return
     if not keep_branch:
-        run(["git", "-C", str(main), "branch", "-D", w.branch], check=False)
+        # `-d` refuses to delete an unmerged branch; only escalate to the
+        # force-delete `-D` when the caller passed --force. A clean worktree can
+        # still hold committed-but-unmerged work, so default-rm must not discard
+        # the branch ref silently.
+        flag = "-D" if force else "-d"
+        br = run(["git", "-C", str(main), "branch", flag, w.branch], check=False)
+        if br.returncode != 0 and not force:
+            console.print(
+                f"[yellow]•[/yellow] kept branch [bold]{w.branch}[/bold] "
+                f"(has unmerged work; `git branch -D {w.branch}` or "
+                f"`wk rm --force` to delete)"
+            )
 
 
 @app.command()
@@ -2818,6 +3005,7 @@ def _rm_detached(
         raise
 
 
+# --- paths & panes: cd / lg-cd ---
 @app.command()
 def cd(
     branch: Optional[str] = typer.Argument(
@@ -2828,13 +3016,18 @@ def cd(
 
     Usage in fish:  cd (wk cd feature-x)
     """
+    require("git")
+    require("tmux")
     if branch is None:
-        # Infer from current tmux session
-        sess = os.environ.get("TMUX_PANE")
-        if not sess:
+        # Infer from the current tmux session. Use in_tmux() like every other
+        # command (checks $TMUX) — the old $TMUX_PANE check was an inconsistent
+        # proxy and the value was discarded anyway.
+        if not in_tmux():
             die("not inside tmux; pass a branch name")
-        r = run(["tmux", "display-message", "-p", "#S"])
+        r = run(["tmux", "display-message", "-p", "#S"], check=False)
         session = r.stdout.strip()
+        if not session:
+            die("could not determine current tmux session; pass a branch name")
         for w in all_workspaces():
             if w.session == session:
                 print(w.path)
@@ -3101,8 +3294,26 @@ def lg_cd(
     )
     pane_id = r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
     if not pane_id:
-        # Pre-marker sessions (or non-wk sessions) fall back to visual index.
-        pane_id = f"{sess}:work.4"
+        # Pre-marker sessions don't have @wk-lazygit-pane stored. Find the pane
+        # actually running lazygit instead of guessing a visual index like
+        # `work.4` — tmux renumbers indices on every split, so a stale guess can
+        # land on the shell/terminal pane, and `respawn-pane -k` would then
+        # force-kill it (destroying that pane's process).
+        lp = run(
+            ["tmux", "list-panes", "-t", sess, "-F",
+             "#{pane_id} #{pane_current_command}"],
+            check=False,
+        )
+        for line in lp.stdout.splitlines():
+            pid, _, cmd = line.partition(" ")
+            if cmd.strip() == "lazygit":
+                pane_id = pid
+                break
+    if not pane_id:
+        die(
+            f"no lazygit pane found in session {sess!r} — reopen the workspace "
+            f"with `wk open` so wk can track its lazygit pane."
+        )
 
     run(
         [
@@ -3115,6 +3326,7 @@ def lg_cd(
     console.print(f"[green]✓[/green] lazygit → [dim]{target}[/dim]")
 
 
+# --- passive views: sidebar / dashboard (+ internal renderers) ---
 @app.command()
 def sidebar() -> None:
     """Passive workspace dashboard (runs inside the leftmost tmux pane).
@@ -3131,6 +3343,10 @@ def sidebar() -> None:
 
     while True:
         try:
+            # Long-lived loop: drop the cwd-keyed _project_prefix cache each
+            # iteration so a repo rename/move doesn't pin a stale session prefix
+            # (which would make every workspace render as "no session").
+            _project_prefix.cache_clear()
             workspaces = all_workspaces()
             console.clear()
             if not workspaces:
@@ -3168,6 +3384,12 @@ def sidebar() -> None:
             _time.sleep(refresh)
         except KeyboardInterrupt:
             return
+        except Exception as e:
+            # An always-on pane must survive a transient error (e.g. a git hiccup
+            # mid-refresh) instead of dying for good. Show it and keep looping.
+            console.clear()
+            console.print(f"[red]sidebar error:[/red] {e}")
+            _time.sleep(refresh)
 
 
 @app.command("_list-once", hidden=True)
@@ -3280,6 +3502,9 @@ def _dashboard_render(
 
     while True:
         try:
+            # See sidebar(): drop the cwd-keyed prefix cache each iteration so a
+            # repo move can't pin a stale session prefix in this long-lived loop.
+            _project_prefix.cache_clear()
             console.clear()
             # Reuse the `list` command's output by invoking it directly.
             workspaces = all_workspaces()
@@ -3308,6 +3533,12 @@ def _dashboard_render(
             _time.sleep(refresh)
         except KeyboardInterrupt:
             return
+        except Exception as e:
+            # Keep the dashboard pane alive through a transient error rather than
+            # letting the render loop die permanently.
+            console.clear()
+            console.print(f"[red]dashboard error:[/red] {e}")
+            _time.sleep(refresh)
 
 
 if __name__ == "__main__":

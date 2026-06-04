@@ -266,7 +266,11 @@ wk task-status                       # table of all task workspaces
 wk task-status fix-tenant-500s       # detailed view of one
 wk task-output fix-tenant-500s -n 50 # last 50 lines of stdout
 
-# 3. Review and integrate
+# 3a. Intervene on a wedged or wrong-direction task
+wk task-cancel fix-tenant-500s       # kill the agent, keep the worktree
+wk task-retry  fix-tenant-500s       # re-run the agent on the same task.md
+
+# 3b. Review and integrate
 git -C ~/_Work/credo-backend/.worktrees/fix-tenant-500s diff main..
 wk task-merge fix-tenant-500s         # --no-ff merge commit (default)
 wk task-merge fix-tenant-500s --squash # squash into one commit
