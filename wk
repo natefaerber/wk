@@ -21,13 +21,14 @@ import functools
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import time as _time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import NoReturn, Optional
 
 import typer
 from rich.console import Console
@@ -107,7 +108,7 @@ def run(
     )
 
 
-def die(msg: str, code: int = 1) -> None:
+def die(msg: str, code: int = 1) -> NoReturn:
     err.print(f"[red]error:[/red] {msg}")
     raise typer.Exit(code)
 
@@ -674,6 +675,28 @@ def all_workspaces() -> list[Workspace]:
     return [workspace_status(b, p, sessions) for b, p in list_wk_worktrees()]
 
 
+def find_workspace(
+    query: str, workspaces: Optional[list[Workspace]] = None
+) -> Optional[Workspace]:
+    """First workspace matching QUERY (branch / slug / full session name), or None.
+
+    Pass an existing WORKSPACES list to avoid re-running all_workspaces() (which
+    shells out per worktree); otherwise it's fetched.
+    """
+    ws = all_workspaces() if workspaces is None else workspaces
+    return next((w for w in ws if _matches_query(query, w)), None)
+
+
+def require_workspace(
+    query: str, workspaces: Optional[list[Workspace]] = None
+) -> Workspace:
+    """find_workspace() or die — the shared "no workspace matching X" guard."""
+    w = find_workspace(query, workspaces)
+    if w is None:
+        die(f"no workspace matching {query!r}")
+    return w
+
+
 def in_tmux() -> bool:
     return "TMUX" in os.environ
 
@@ -706,6 +729,7 @@ def _shell_wrap(cmd: str) -> list[str]:
 # Target widths (cols) and height percentages for the 5-pane layout.
 # Tuned for ~290-col widescreen tmux windows (UWQHD 3440px); tmux scales
 # proportionally when attached to a smaller terminal.
+WINDOW_COLS = 290       # detached-session width; reshaped to fit on attach
 LEFT_COL_COLS = 42      # sidebar + shell column
 RIGHT_COL_COLS = 75     # lazygit + terminal column
 SIDEBAR_PCT = 20        # sidebar gets this percent of left col height
@@ -731,7 +755,7 @@ def _layout_splits_from_sidebar(
     wt: Path,
     sidebar_id: str,
     agent: str,
-    total_cols: int = 290,
+    total_cols: int = WINDOW_COLS,
 ) -> None:
     """Given an already-existing sidebar pane (running `wk sidebar`), perform
     the four splits that finish the 5-pane layout. Shared by `build_session`
@@ -795,6 +819,22 @@ def _layout_splits_from_sidebar(
     run(["tmux", "select-pane", "-t", agent_id])
 
 
+def wk_env_pairs(session: str, branch: str, wt: Path) -> list[tuple[str, str]]:
+    """The WK_* environment contract exposed to every pane of a workspace.
+
+    Single source of truth so `build_session` (which sets these via
+    `new-session -e` at creation) and `_relayout-detached` (which sets them via
+    `set-environment` retroactively) can't drift apart. The contract is
+    documented for agents in the embedded `.wk/AGENTS.md`.
+    """
+    return [
+        ("WK_IN_WORKSPACE", "1"),
+        ("WK_SESSION", session),
+        ("WK_BRANCH", branch),
+        ("WK_PATH", str(wt)),
+    ]
+
+
 def build_session(
     session: str,
     wt: Path,
@@ -815,7 +855,7 @@ def build_session(
         └──────────┴──────────────────────────┴──────────────────┘
     """
     wk = _wk_bin()
-    total_cols = 290
+    total_cols = WINDOW_COLS
     real_branch = branch or session
 
     # Mark this worktree as a wk workspace before we touch tmux — the sidebar
@@ -826,12 +866,7 @@ def build_session(
     # etc.) detect they're inside wk and find the workspace context. tmux's
     # -e flag on new-session applies to all panes split off this session.
     env_flags: list[str] = []
-    for k, v in [
-        ("WK_IN_WORKSPACE", "1"),
-        ("WK_SESSION", session),
-        ("WK_BRANCH", real_branch),
-        ("WK_PATH", str(wt)),
-    ]:
+    for k, v in wk_env_pairs(session, real_branch, wt):
         env_flags.extend(["-e", f"{k}={v}"])
 
     # Sidebar (initial pane). Starts with `wk sidebar` running.
@@ -1563,10 +1598,12 @@ def open_pr_pull_ref(number: str, no_attach: bool) -> None:
 
 
 # ---------------------------------------------------------------------------
-# commands
+# commands — grouped below: workspace lifecycle · orchestrator · session
+# management · inspection & navigation · teardown · paths & panes · passive views
 # ---------------------------------------------------------------------------
 
 
+# --- workspace lifecycle: new / open / pr / adopt ---
 @app.command()
 def new(
     branch: str = typer.Argument(..., help="Branch name for the new workspace."),
@@ -1776,6 +1813,7 @@ _AUTO_TASK_CMD = (
 )
 
 
+# --- orchestrator: task / task-status / -output / -merge / -cancel / -retry ---
 @app.command()
 def task(
     prompt: str = typer.Argument(..., help="The task description / prompt for Claude."),
@@ -1853,7 +1891,6 @@ def task(
         # it's pre-filled in the input buffer. Claude handles the launch
         # timing itself — no send-keys race condition.
         # We use shell-quoting via shlex for safety against unusual chars.
-        import shlex
         agent = f"claude {shlex.quote(prompt.strip())}"
         build_session(session, wt, agent, branch=branch)
 
@@ -1996,13 +2033,7 @@ def task_status(
     require("tmux")
     workspaces = all_workspaces()
     if branch:
-        target = next(
-            (w for w in workspaces if _matches_query(branch, w)),
-            None,
-        )
-        if target is None:
-            die(f"no workspace matching {branch!r}")
-        targets = [target]
+        targets = [require_workspace(branch, workspaces)]
     else:
         targets = workspaces
 
@@ -2060,12 +2091,7 @@ def task_output(
 ) -> None:
     """Dump a task workspace's `.wk/output.md` (the `--auto` claude's stdout)."""
     require("git")
-    target = next(
-        (w for w in all_workspaces() if _matches_query(branch, w)),
-        None,
-    )
-    if target is None:
-        die(f"no workspace matching {branch!r}")
+    target = require_workspace(branch)
     output_path = target.path / WK_MARKER_DIR / "output.md"
     if not output_path.exists():
         die(f"no output yet at {output_path}")
@@ -2111,12 +2137,7 @@ def task_merge(
     orch = next((w for w in workspaces if w.session == orch_session), None)
     if orch is None:
         die("current tmux session isn't a wk workspace")
-    task = next(
-        (w for w in workspaces if _matches_query(branch, w)),
-        None,
-    )
-    if task is None:
-        die(f"no workspace matching {branch!r}")
+    task = require_workspace(branch, workspaces)
     if task.session == orch.session:
         die("can't merge a workspace into itself")
     if task.dirty:
@@ -2170,11 +2191,7 @@ def task_cancel(
     """
     require("git")
     require("tmux")
-    target = next(
-        (w for w in all_workspaces() if _matches_query(branch, w)), None
-    )
-    if target is None:
-        die(f"no workspace matching {branch!r}")
+    target = require_workspace(branch)
     if target.has_session:
         run(["tmux", "kill-session", "-t", target.session], check=False)
         console.print(
@@ -2206,11 +2223,7 @@ def task_retry(
     require("git")
     require("tmux")
     require("claude")
-    target = next(
-        (w for w in all_workspaces() if _matches_query(branch, w)), None
-    )
-    if target is None:
-        die(f"no workspace matching {branch!r}")
+    target = require_workspace(branch)
     task_file = target.path / WK_MARKER_DIR / "task.md"
     if not task_file.exists():
         die(
@@ -2289,6 +2302,7 @@ def _pick_restore_targets(
     return [(b, p) for b, p in candidates if b in pick_set]
 
 
+# --- session management: restore / relayout / refresh-agents ---
 @app.command()
 def restore(
     branch: Optional[str] = typer.Argument(
@@ -2497,12 +2511,7 @@ def _relayout_detached(
         # them. (build_session uses `-e` on new-session for the same effect at
         # creation time; we can't do that retroactively, so set-environment is
         # the equivalent for an existing session.)
-        for k, v in [
-            ("WK_IN_WORKSPACE", "1"),
-            ("WK_SESSION", session),
-            ("WK_BRANCH", branch),
-            ("WK_PATH", str(wt_path)),
-        ]:
+        for k, v in wk_env_pairs(session, branch, wt_path):
             run(["tmux", "set-environment", "-t", session, k, v])
 
         # Kill every pane in the target window except the one we're going to
@@ -2593,6 +2602,7 @@ def refresh_agents(
         )
 
 
+# --- inspection & navigation: is-wk-session / list / switch / cycle ---
 @app.command()
 def is_wk_session(
     session: str = typer.Argument(..., help="Session name to check.")
@@ -2813,6 +2823,7 @@ def cycle(
     run(["tmux", "switch-client", "-t", target], check=False)
 
 
+# --- teardown: close (keep worktree) / rm (destroy) ---
 @app.command()
 def close(
     branch: Optional[str] = typer.Argument(
@@ -2831,13 +2842,7 @@ def close(
     require("tmux")
 
     if branch:
-        target = next(
-            (w for w in all_workspaces()
-             if _matches_query(branch, w)),
-            None,
-        )
-        if target is None:
-            die(f"no workspace matching {branch!r}")
+        target = require_workspace(branch)
         session = target.session
         label = target.branch
     else:
@@ -3000,6 +3005,7 @@ def _rm_detached(
         raise
 
 
+# --- paths & panes: cd / lg-cd ---
 @app.command()
 def cd(
     branch: Optional[str] = typer.Argument(
@@ -3320,6 +3326,7 @@ def lg_cd(
     console.print(f"[green]✓[/green] lazygit → [dim]{target}[/dim]")
 
 
+# --- passive views: sidebar / dashboard (+ internal renderers) ---
 @app.command()
 def sidebar() -> None:
     """Passive workspace dashboard (runs inside the leftmost tmux pane).

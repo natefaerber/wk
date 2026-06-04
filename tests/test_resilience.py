@@ -124,3 +124,22 @@ def test_task_status_failed_when_session_gone_without_sentinel(wk, tmp_path, mon
     (wkdir / "output.md").write_text("partial output\n", encoding="utf-8")
     w = _ws(wk, path=tmp_path, has_session=False)
     assert wk._task_status(w).state == "failed"
+
+
+# --------------------------------------------------------------------------- #
+# find_workspace / require_workspace — the shared lookup helpers.
+# --------------------------------------------------------------------------- #
+
+def test_find_and_require_workspace(wk):
+    import typer
+
+    a = _ws(wk, branch="feat/login", session="r-feat-login")
+    b = _ws(wk, branch="main", session="r-main")
+    ws = [a, b]
+    assert wk.find_workspace("feat-login", ws) is a   # session-form slug
+    assert wk.find_workspace("feat/login", ws) is a   # real branch
+    assert wk.find_workspace("main", ws) is b
+    assert wk.find_workspace("nope", ws) is None
+    assert wk.require_workspace("feat/login", ws) is a
+    with pytest.raises(typer.Exit):
+        wk.require_workspace("nope", ws)
