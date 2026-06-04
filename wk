@@ -847,14 +847,30 @@ def build_session(
         ]
     ).stdout.strip()
 
-    # Tag the session as wk-managed so tmux-resurrect filters and other tools
-    # can identify it. Stored as tmux user options, readable via
-    # `tmux show-options -v -t <session> @wk`.
-    run(["tmux", "set-option", "-t", session, "@wk", "1"])
-    run(["tmux", "set-option", "-t", session, "@wk-branch", real_branch])
-    run(["tmux", "set-option", "-t", session, "@wk-path", str(wt)])
+    # A successful new-session prints the new pane's %NN id. An empty/garbled
+    # capture means every subsequent `-t <id>` split would target the wrong
+    # pane — bail before building a broken layout (and kill whatever was made).
+    if not sidebar_id.startswith("%"):
+        run(["tmux", "kill-session", "-t", session], check=False)
+        die(f"failed to create session {session!r} (tmux returned no pane id)")
 
-    _layout_splits_from_sidebar(session, wt, sidebar_id, agent, total_cols=total_cols)
+    # If any split/option fails partway, don't leave a half-built session
+    # running — callers and is_wk_workspace() would treat the zombie as a real
+    # workspace. Tear it down and report.
+    try:
+        # Tag the session as wk-managed so tmux-resurrect filters and other
+        # tools can identify it. Stored as tmux user options, readable via
+        # `tmux show-options -v -t <session> @wk`.
+        run(["tmux", "set-option", "-t", session, "@wk", "1"])
+        run(["tmux", "set-option", "-t", session, "@wk-branch", real_branch])
+        run(["tmux", "set-option", "-t", session, "@wk-path", str(wt)])
+
+        _layout_splits_from_sidebar(
+            session, wt, sidebar_id, agent, total_cols=total_cols
+        )
+    except Exception:
+        run(["tmux", "kill-session", "-t", session], check=False)
+        die(f"failed to build session {session!r}; cleaned up the partial session")
 
 
 # ---------------------------------------------------------------------------
@@ -1116,6 +1132,18 @@ def resolve_workspace(
         return WorkspaceState(branch=branch, wt=wt, session=session, created=True, branch_created=True)
 
     # Case 5.
+    # Verify the base ref resolves before branching from it — otherwise
+    # `git worktree add` raises a bare CalledProcessError. Common on a repo with
+    # no `origin` remote, or whose default branch isn't `main` (set WK_BASE or
+    # pass --base).
+    if run(
+        ["git", "-C", str(main), "rev-parse", "--verify", "--quiet", base],
+        check=False,
+    ).returncode != 0:
+        die(
+            f"base ref {base!r} doesn't exist — fetch origin, or set WK_BASE "
+            f"(or pass --base) to a ref that exists."
+        )
     console.print(f"[dim]creating branch {branch} from {base}[/dim]")
     run(
         ["git", "-C", str(main), "worktree", "add", "-b", branch, str(wt), base]
@@ -1949,6 +1977,8 @@ def task_status(
     Designed for orchestrator polling: tells you which tasks are still
     running, which finished, which crashed, and what each one last said.
     """
+    require("git")
+    require("tmux")
     workspaces = all_workspaces()
     if branch:
         target = next(
@@ -2014,6 +2044,7 @@ def task_output(
     ),
 ) -> None:
     """Dump a task workspace's `.wk/output.md` (the `--auto` claude's stdout)."""
+    require("git")
     target = next(
         (w for w in all_workspaces() if _matches_query(branch, w)),
         None,
@@ -2417,6 +2448,8 @@ def refresh_agents(
     Pass a branch name to target a specific one, or `--all` for every wk
     workspace this repo knows about.
     """
+    require("git")
+    require("tmux")
     workspaces = all_workspaces()
     if all_workspaces_flag:
         targets = workspaces
@@ -3148,8 +3181,26 @@ def lg_cd(
     )
     pane_id = r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
     if not pane_id:
-        # Pre-marker sessions (or non-wk sessions) fall back to visual index.
-        pane_id = f"{sess}:work.4"
+        # Pre-marker sessions don't have @wk-lazygit-pane stored. Find the pane
+        # actually running lazygit instead of guessing a visual index like
+        # `work.4` — tmux renumbers indices on every split, so a stale guess can
+        # land on the shell/terminal pane, and `respawn-pane -k` would then
+        # force-kill it (destroying that pane's process).
+        lp = run(
+            ["tmux", "list-panes", "-t", sess, "-F",
+             "#{pane_id} #{pane_current_command}"],
+            check=False,
+        )
+        for line in lp.stdout.splitlines():
+            pid, _, cmd = line.partition(" ")
+            if cmd.strip() == "lazygit":
+                pane_id = pid
+                break
+    if not pane_id:
+        die(
+            f"no lazygit pane found in session {sess!r} — reopen the workspace "
+            f"with `wk open` so wk can track its lazygit pane."
+        )
 
     run(
         [
@@ -3178,6 +3229,10 @@ def sidebar() -> None:
 
     while True:
         try:
+            # Long-lived loop: drop the cwd-keyed _project_prefix cache each
+            # iteration so a repo rename/move doesn't pin a stale session prefix
+            # (which would make every workspace render as "no session").
+            _project_prefix.cache_clear()
             workspaces = all_workspaces()
             console.clear()
             if not workspaces:
@@ -3333,6 +3388,9 @@ def _dashboard_render(
 
     while True:
         try:
+            # See sidebar(): drop the cwd-keyed prefix cache each iteration so a
+            # repo move can't pin a stale session prefix in this long-lived loop.
+            _project_prefix.cache_clear()
             console.clear()
             # Reuse the `list` command's output by invoking it directly.
             workspaces = all_workspaces()
