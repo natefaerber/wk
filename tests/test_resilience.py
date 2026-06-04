@@ -94,3 +94,33 @@ def test_list_worktrees_returns_empty_on_git_failure(wk, monkeypatch):
 def test_find_existing_worktree_returns_none_on_git_failure(wk, monkeypatch):
     monkeypatch.setattr(wk, "run", RunRecorder(fail_match="worktree list", fail_rc=128))
     assert wk.find_existing_worktree("anything") is None
+
+
+# --------------------------------------------------------------------------- #
+# _task_status — "done" keys off the .wk/done sentinel FILE, not a string in
+# the task's own output (which could be spoofed by the task echoing it).
+# --------------------------------------------------------------------------- #
+
+def test_task_status_done_requires_sentinel_file(wk, tmp_path, monkeypatch):
+    # rc=1 for every run() so the tmux show-options probes are inert.
+    monkeypatch.setattr(wk, "run", RunRecorder(fail_match="", fail_rc=1))
+    wkdir = tmp_path / wk.WK_MARKER_DIR
+    wkdir.mkdir()
+    # Output literally contains the old completion marker string but there's no
+    # sentinel file → must NOT be reported done.
+    (wkdir / "output.md").write_text("working...\n── task complete ──\n", encoding="utf-8")
+    w = _ws(wk, path=tmp_path, has_session=True)
+    assert wk._task_status(w).state == "running"
+
+    # Drop the sentinel → done.
+    (wkdir / wk._TASK_DONE_MARKER).touch()
+    assert wk._task_status(w).state == "done"
+
+
+def test_task_status_failed_when_session_gone_without_sentinel(wk, tmp_path, monkeypatch):
+    monkeypatch.setattr(wk, "run", RunRecorder(fail_match="", fail_rc=1))
+    wkdir = tmp_path / wk.WK_MARKER_DIR
+    wkdir.mkdir()
+    (wkdir / "output.md").write_text("partial output\n", encoding="utf-8")
+    w = _ws(wk, path=tmp_path, has_session=False)
+    assert wk._task_status(w).state == "failed"
