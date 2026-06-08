@@ -350,6 +350,7 @@ wk task-output <branch> [-n N]   # dump a task's .wk/output.md (--follow streams
 wk task-merge <branch>           # merge task branch into orchestrator's branch
 wk sidebar                       # the dashboard renderer (runs in pane.1)
 wk dashboard                     # cross-workspace overview session
+wk version                       # print the wk version (also `wk --version` / `-V`)
 ```
 
 ---

@@ -44,22 +44,23 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=v$version" >> "$GITHUB_OUTPUT"
 
-      - name: Check plugin manifests match the tag
-        # Version lockstep: the Claude Code plugin (.claude-plugin/) carries its
-        # own version, separate from the CLI's git tag. Keep them in sync by
-        # failing the release if the manifests weren't bumped to match the tag.
-        # Skipped on workflow_dispatch dry-runs (no tag).
+      - name: Check version lockstep with the tag
+        # The version lives in three places that ship independently: the CLI
+        # (`__version__` in `wk`), and the Claude Code plugin's two manifests
+        # (.claude-plugin/). Fail the release if any wasn't bumped to match the
+        # tag. Skipped on workflow_dispatch dry-runs (no tag).
         if: startsWith(github.ref, 'refs/tags/v')
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           pv=$(python3 -c "import json;print(json.load(open('.claude-plugin/plugin.json'))['version'])")
           mv=$(python3 -c "import json;print(json.load(open('.claude-plugin/marketplace.json'))['plugins'][0]['version'])")
-          if [ "$pv" != "$VERSION" ] || [ "$mv" != "$VERSION" ]; then
-            echo "::error::version mismatch — tag=$VERSION plugin.json=$pv marketplace.json=$mv. Bump both manifests to match the tag before releasing."
+          cv=$(python3 -c "import re;print(re.search(r'^__version__ = \"([^\"]+)\"', open('wk').read(), re.M).group(1))")
+          if [ "$pv" != "$VERSION" ] || [ "$mv" != "$VERSION" ] || [ "$cv" != "$VERSION" ]; then
+            echo "::error::version mismatch — tag=$VERSION wk=$cv plugin.json=$pv marketplace.json=$mv. Bump all three to match the tag before releasing."
             exit 1
           fi
-          echo "plugin manifests match tag v$VERSION"
+          echo "versions match tag v$VERSION (wk + both plugin manifests)"
 
       - name: Set up uv
         # Pin to an exact release: astral-sh/setup-uv publishes no moving `v8`
@@ -80,8 +81,25 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           mkdir -p dist
+          # The canonical asset. `mise … [asset_pattern=wk]` and install.sh users
+          # rely on this exact name; keep it.
           install -m 0755 wk dist/wk
-          ( cd dist && sha256sum wk > wk.sha256 )
+          # wk is one portable script for every platform, but mise's `github:`
+          # backend, with no asset_pattern, autodetects by scoring OS/arch tokens
+          # in the asset NAME — a lone `wk` has none, so a bare
+          # `mise use github:natefaerber/wk` looks for an arch-specific asset and
+          # errors ("no matching asset"). Publish identical copies under the
+          # common target-triple names so autodetection finds a match on each
+          # platform; mise strips the OS/arch suffix, so the installed bin is
+          # still `wk`. (Old, stricter mise versions need this; newer ones accept
+          # the lone `wk`. Either way the bare command now just works.)
+          for triple in \
+            aarch64-apple-darwin x86_64-apple-darwin \
+            x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            install -m 0755 wk "dist/wk-$triple"
+          done
+          ( cd dist && sha256sum wk wk-* > wk.sha256 )
+          ls -l dist
 
       - name: Publish release
         if: startsWith(github.ref, 'refs/tags/v')
@@ -93,4 +111,5 @@ jobs:
             --title "wk $TAG" \
             --generate-notes \
             dist/wk \
+            dist/wk-* \
             dist/wk.sha256

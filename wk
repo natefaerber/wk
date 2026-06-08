@@ -34,6 +34,12 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+# Single source of truth for the CLI version. Kept in lockstep with the git
+# release tag and the plugin manifests (`.claude-plugin/*.json`) — the release
+# workflow fails if they don't all match. Surfaced via `wk --version` and the
+# `wk version` command.
+__version__ = "0.7.0"
+
 app = typer.Typer(
     add_completion=False,
     no_args_is_help=True,
@@ -42,6 +48,30 @@ app = typer.Typer(
 )
 console = Console()
 err = Console(stderr=True)
+
+
+def _version_callback(value: bool) -> None:
+    """Eager `--version` handler: print and exit before any command runs."""
+    if value:
+        console.print(f"wk {__version__}")
+        raise typer.Exit()
+
+
+@app.callback()
+def _main(
+    version: bool = typer.Option(
+        False, "--version", "-V",
+        callback=_version_callback, is_eager=True,
+        help="Show the wk version and exit.",
+    ),
+) -> None:
+    """Workspace manager: git worktree + tmux session per branch."""
+
+
+@app.command()
+def version() -> None:
+    """Print the wk version (same as `wk --version`)."""
+    console.print(f"wk {__version__}")
 
 
 # ---------------------------------------------------------------------------

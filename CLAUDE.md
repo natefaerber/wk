@@ -42,8 +42,12 @@ skills/wk/SKILL.md  The /wk skill the plugin ships (CC-wide "when to drive wk").
 The plugin (`.claude-plugin/` + `skills/`) is a thin distribution layer over the
 CLI — it ships the skill, NOT the binary. Users install the CLI separately
 (mise/install.sh) and the plugin via `/plugin marketplace add natefaerber/wk`.
-Plugin version (`plugin.json`) is kept in lockstep with the CLI tag by a guard
-in `release.yml`.
+The version lives in **three** places that must match the release tag:
+`__version__` in `wk` (surfaced by `wk --version` / `wk version`) and the
+`version` field in each of `.claude-plugin/plugin.json` and
+`marketplace.json`. Bump all three together when releasing — `release.yml`
+fails the build otherwise, and `tests/test_version_lockstep.py` catches drift
+on every PR.
 
 ## Running locally
 

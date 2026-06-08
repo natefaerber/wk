@@ -32,6 +32,15 @@ mise use -g "github:natefaerber/wk[asset_pattern=wk,bin=wk]"
 That drops the single portable `wk` script on your PATH. Requires `tmux`, `git`,
 `uv`, and `fzf` (and optionally `fish`, `eza`, `lazygit`).
 
+> **Hitting `no matching asset` / a missing-arch error?** `wk` is one portable
+> script for every platform, so the `asset_pattern=wk` above tells mise to grab
+> it by name instead of hunting for a `<arch>` build. If you (or a teammate) ran
+> the bare `mise use github:natefaerber/wk` on an older mise, its autodetection
+> looks for an arch-specific asset and fails. Fixes, any one of: re-run the
+> command above with `[asset_pattern=wk,bin=wk]`; `mise self-update`; or
+> `mise rm github:natefaerber/wk` and re-add. (Releases also ship arch-named
+> copies now, so the bare form auto-detects on current mise.)
+
 **Full keystroke experience (clone + install):** to also get the tmux bindings,
 the narrow-pane lazygit config, and the fish `cd` helper:
 ```sh
