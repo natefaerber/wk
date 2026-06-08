@@ -2124,7 +2124,17 @@ def task(
         help="Don't attach the tmux session (still creates it).",
     ),
 ) -> None:
-    """Create a workspace and kick off Claude Code with [bold]PROMPT[/bold]."""
+    """Create a workspace and kick off Claude Code with [bold]PROMPT[/bold].
+
+    The spawn half of the orchestrator pattern: names a branch (Claude picks
+    one from the prompt unless you pass --branch), builds the workspace, and
+    launches the agent already primed with PROMPT. Interactive by default —
+    you attach and watch. With --auto it runs headless (`claude -p`), streams
+    to `.wk/output.md`, and exits when done, so you can fan out several at
+    once and check back with `wk task-status` / `wk task-output`, then fold
+    the result in with `wk task-merge`. Run it from an orchestrator branch
+    (main/master/…), never from inside a task workspace — that's recursion.
+    """
     require("git")
     require("tmux")
     require("claude")
@@ -2376,12 +2386,20 @@ def task_output(
         False, "--follow", "-f", help="Stream new output (tail -f style)."
     ),
 ) -> None:
-    """Dump a task workspace's `.wk/output.md` (the `--auto` claude's stdout)."""
+    """Dump a `--auto` task workspace's `.wk/output.md` (the headless agent's log).
+
+    The way to read what a headless task did without attaching its session:
+    `--auto` tasks stream the agent's stdout to `.wk/output.md`, and this
+    prints it. `--tail N` shows only the last N lines; `--follow` streams new
+    output (`tail -f`) so you can watch a run in progress. Use `wk task-status`
+    first to see which tasks are running, done, or failed.
+    """
     require("git")
     target = require_workspace(branch)
     output_path = target.path / WK_MARKER_DIR / "output.md"
     if not output_path.exists():
-        die(f"no output yet at {output_path}")
+        die(f"no output yet at {output_path}",
+            hint="`wk task-status` shows which tasks have produced output")
 
     if follow:
         # Hand off to `tail -f` so we don't reimplement the inotify dance.
@@ -2949,7 +2967,14 @@ def is_wk_session(
 @app.command("list")
 @app.command("ls", hidden=True)
 def list_cmd() -> None:
-    """Show all workspaces with branch, status, and session state."""
+    """Show all workspaces with branch, status, and session state.
+
+    One row per worktree wk knows about: the session-state glyph (▶ current
+    / ● running / · no session), branch, project-scoped session name,
+    ahead/behind vs upstream, a ✱ when the worktree is dirty, and the path.
+    A read-only snapshot — use `wk switch` to move between them, or
+    `wk dashboard` for the same table on an auto-refreshing clock.
+    """
     require("git")
     workspaces = all_workspaces()
     if not workspaces:
@@ -2962,7 +2987,15 @@ def list_cmd() -> None:
 def switch(
     branch: Optional[str] = typer.Argument(None, help="Branch; omit for fzf picker."),
 ) -> None:
-    """Switch to an existing workspace."""
+    """Switch to an existing workspace's tmux session.
+
+    With BRANCH, jumps straight to that workspace (accepts the branch, its
+    session-form slug, or the full session name). With no argument, opens an
+    fzf picker over all workspaces with a live preview (task, recent commits,
+    git status). Attaches when run outside tmux, switches the client when
+    inside. Only moves between *existing* workspaces — use `wk open` to create
+    or rebuild one, or `wk cycle` to alt-tab between running sessions.
+    """
     require("tmux")
     workspaces = all_workspaces()
     if not workspaces:
