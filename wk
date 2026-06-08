@@ -118,6 +118,13 @@ def die(msg: str, code: int = 1, *, hint: Optional[str] = None) -> NoReturn:
     raise typer.Exit(code)
 
 
+def warn(msg: str) -> None:
+    """Print `warning: <msg>` to stderr — a non-fatal advisory. Pairs with
+    `die()` (fatal `error:`) so the CLI speaks one prefix vocabulary: red
+    `error:` for things that stop, yellow `warning:` for things that don't."""
+    err.print(f"[yellow]warning:[/yellow] {msg}")
+
+
 def require(tool: str) -> None:
     if shutil.which(tool) is None:
         die(f"{tool!r} not found on PATH")
@@ -1550,7 +1557,7 @@ def find_local_repo(owner: str, repo: str) -> Path:
     # Only warn on a genuine tie — two clones both named exactly `repo`.
     named = [p for p in matches if p.name.lower() == repo.lower()]
     if len(named) > 1:
-        err.print(f"[yellow]note:[/yellow] multiple clones named {repo}; using {matches[0]}")
+        warn(f"multiple clones named {repo}; using {matches[0]}")
     return matches[0]
 
 
@@ -2741,7 +2748,7 @@ def relayout(
 
     if not is_wk and not force:
         console.print(
-            f"[yellow]![/yellow] session [bold]{session}[/bold] is not a wk session"
+            f"[yellow]warning:[/yellow] session [bold]{session}[/bold] is not a wk session"
         )
         console.print(
             f"  will convert: branch=[bold]{branch}[/bold]  path=[dim]{wt}[/dim]"
@@ -3191,7 +3198,7 @@ def _do_rm(w: Workspace, main: Path, force: bool, keep_branch: bool) -> None:
         br = run(["git", "-C", str(main), "branch", flag, w.branch], check=False)
         if br.returncode != 0 and not force:
             console.print(
-                f"[yellow]•[/yellow] kept branch [bold]{w.branch}[/bold] "
+                f"[yellow]warning:[/yellow] kept branch [bold]{w.branch}[/bold] "
                 f"(has unmerged work; `git branch -D {w.branch}` or "
                 f"`wk rm --force` to delete)"
             )
@@ -3686,7 +3693,7 @@ def sidebar() -> None:
             # An always-on pane must survive a transient error (e.g. a git hiccup
             # mid-refresh) instead of dying for good. Show it and keep looping.
             console.clear()
-            console.print(f"[red]sidebar error:[/red] {e}")
+            console.print(f"[yellow]warning:[/yellow] sidebar render failed: {e}")
             _time.sleep(refresh)
 
 
@@ -3818,7 +3825,7 @@ def _dashboard_render(
             # Keep the dashboard pane alive through a transient error rather than
             # letting the render loop die permanently.
             console.clear()
-            console.print(f"[red]dashboard error:[/red] {e}")
+            console.print(f"[yellow]warning:[/yellow] dashboard render failed: {e}")
             _time.sleep(refresh)
 
 
