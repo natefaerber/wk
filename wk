@@ -28,7 +28,7 @@ import sys
 import time as _time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import NoReturn, Optional
+from typing import Callable, NoReturn, Optional
 
 import typer
 from rich.console import Console
@@ -108,8 +108,13 @@ def run(
     )
 
 
-def die(msg: str, code: int = 1) -> NoReturn:
+def die(msg: str, code: int = 1, *, hint: Optional[str] = None) -> NoReturn:
+    """Print `error: <msg>` and exit. An optional HINT prints on the next
+    line as a dimmed `→ …` next step, so failures point at the fix instead
+    of leaving the user to guess the recovery command."""
     err.print(f"[red]error:[/red] {msg}")
+    if hint:
+        err.print(f"[dim]→ {hint}[/dim]")
     raise typer.Exit(code)
 
 
@@ -145,7 +150,8 @@ def repo_root() -> Path:
     try:
         r = run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"])
     except subprocess.CalledProcessError:
-        die("not inside a git repository")
+        die("not inside a git repository",
+            hint="cd into a git repo, or run `git init` here first")
     common_dir = Path(r.stdout.strip())
     # common_dir is .../<repo>/.git — parent is the main checkout
     return common_dir.parent
@@ -265,6 +271,105 @@ class Workspace:
     dirty: bool
     ahead: int
     behind: int
+
+
+# ── workspace-state rendering ──────────────────────────────────────
+# Every surface that lists workspaces — `wk list`, the `switch` fzf
+# picker, the passive sidebar, the dashboard, and the fzf `_list-once`
+# reload — speaks ONE visual vocabulary for session state and worktree
+# cleanliness. Defined once here so the surfaces a user flips between
+# never drift into different symbol languages. (They used to: `list`
+# showed ●/○ while everything else showed ▶/●/·, and the dashboard
+# dropped the current-session marker entirely.)
+#   ▶  current session — the one you're attached to
+#   ●  a running wk session (not the current one)
+#   ·  no session — worktree exists, nothing attached
+#   ✱  dirty worktree (uncommitted changes)
+GLYPH_CURRENT = "▶"
+GLYPH_RUNNING = "●"
+GLYPH_IDLE = "·"
+GLYPH_DIRTY = "✱"
+
+
+def current_session() -> str:
+    """The tmux session we're rendering "from", used to mark it with ▶.
+
+    Prefers $WK_CURRENT (exported into picker popups so a reload sees the
+    same value); falls back to asking tmux directly when we're attached
+    but it wasn't exported. Empty string when not in tmux at all.
+    """
+    current = os.environ.get("WK_CURRENT", "")
+    if not current and in_tmux():
+        r = run(["tmux", "display-message", "-p", "#S"], check=False)
+        current = r.stdout.strip()
+    return current
+
+
+def session_marker(w: "Workspace", current: str = "", *, rich: bool = True) -> str:
+    """Session-state glyph for W (▶ current / ● running / · idle).
+
+    rich=True wraps it in Rich color tags (for console surfaces);
+    rich=False returns the bare glyph (for fzf/ANSI surfaces).
+    """
+    if w.session == current:
+        return f"[green]{GLYPH_CURRENT}[/green]" if rich else GLYPH_CURRENT
+    if w.has_session:
+        return f"[cyan]{GLYPH_RUNNING}[/cyan]" if rich else GLYPH_RUNNING
+    return f"[dim]{GLYPH_IDLE}[/dim]" if rich else GLYPH_IDLE
+
+
+def dirty_marker(w: "Workspace", *, rich: bool = True) -> str:
+    """Dirty-worktree glyph (✱) for W, or a single space when clean so
+    columns stay aligned across rows."""
+    if not w.dirty:
+        return " "
+    return f"[red]{GLYPH_DIRTY}[/red]" if rich else GLYPH_DIRTY
+
+
+def ahead_behind(w: "Workspace") -> str:
+    """`+A/-B` ahead/behind summary, or "" when the branch is in sync."""
+    return f"+{w.ahead}/-{w.behind}" if (w.ahead or w.behind) else ""
+
+
+def _picker_line(w: "Workspace", current: str) -> str:
+    """One `session\\tdisplay` row for the fzf workspace picker.
+
+    Shared by the `switch` picker and its `_list-once` reload: the two
+    MUST emit identical rows, or the list visually jumps when fzf
+    reloads after a destructive action.
+    """
+    marker = session_marker(w, current, rich=False)
+    ab = ahead_behind(w) or " "
+    status = dirty_marker(w, rich=False)
+    display = f"{marker} {w.branch[:30]:<30} {ab:>8} {status}"
+    return f"{w.session}\t{display}"
+
+
+def workspace_table(workspaces: list["Workspace"], current: str = "") -> Table:
+    """The workspace table shared by `wk list` and the dashboard, so the
+    one-shot listing and the auto-refreshing monitor never drift into
+    different columns or glyphs."""
+    table = Table(box=None, pad_edge=False, show_header=True, header_style="bold")
+    table.add_column("", justify="center")          # session-state glyph
+    table.add_column("branch", style="bold")
+    table.add_column("session", style="dim")
+    table.add_column("ahead/behind", justify="right")
+    table.add_column("dirty", justify="center")
+    table.add_column("path", style="dim")
+    for w in workspaces:
+        try:
+            shown = "~/" + str(w.path.relative_to(Path.home()))
+        except ValueError:
+            shown = str(w.path)
+        table.add_row(
+            session_marker(w, current),
+            w.branch,
+            w.session,
+            ahead_behind(w) or "[dim]·[/dim]",
+            dirty_marker(w),
+            shown,
+        )
+    return table
 
 
 def _query_matches(query: str, branch_ref: str, session: Optional[str] = None) -> bool:
@@ -693,7 +798,7 @@ def require_workspace(
     """find_workspace() or die — the shared "no workspace matching X" guard."""
     w = find_workspace(query, workspaces)
     if w is None:
-        die(f"no workspace matching {query!r}")
+        die(f"no workspace matching {query!r}", hint="`wk list` shows every workspace")
     return w
 
 
@@ -726,14 +831,55 @@ def _shell_wrap(cmd: str) -> list[str]:
     return ["sh", "-c", cmd]
 
 
-# Target widths (cols) and height percentages for the 5-pane layout.
-# Tuned for ~290-col widescreen tmux windows (UWQHD 3440px); tmux scales
-# proportionally when attached to a smaller terminal.
-WINDOW_COLS = 290       # detached-session width; reshaped to fit on attach
-LEFT_COL_COLS = 42      # sidebar + shell column
-RIGHT_COL_COLS = 75     # lazygit + terminal column
-SIDEBAR_PCT = 20        # sidebar gets this percent of left col height
-LAZYGIT_PCT = 60        # lazygit gets this percent of right col height
+# ── layout geometry ────────────────────────────────────────────────
+# Sessions are built *detached* at a fixed virtual size, then tmux reshapes
+# them proportionally when a client attaches. So these are the ratios that
+# look right, expressed in the cols / height-percent that tmux splits take.
+#
+# WIDE — the 5-pane widescreen layout (sidebar|agent|lazygit + shell/term).
+# Tuned for ~290-col windows (UWQHD 3440px). Each number earns its value:
+WIDE_WINDOW_COLS = 290    # virtual width the detached session is built at
+WIDE_WINDOW_ROWS = 75     # virtual height (reshaped on attach)
+WIDE_LEFT_COL_COLS = 42   # sidebar+shell column — ~40 cols fits branch names
+                          # and `git status -sb` lines without wrapping
+WIDE_RIGHT_COL_COLS = 75  # lazygit+terminal column — lazygit's files+diff
+                          # panes need ~70 cols to be readable
+WIDE_SIDEBAR_PCT = 20     # sidebar's share of the left column height; the
+                          # workspace list is short, so the shell gets the rest
+WIDE_LAZYGIT_PCT = 60     # lazygit's share of the right column; its log/diff
+                          # view wants the larger share over the terminal
+
+# LAPTOP — 2-column layout for narrow displays: left column is the sidebar
+# stacked over a terminal, right column is a full-height agent. No lazygit or
+# separate shell pane — on a laptop they cost more width than they're worth.
+LAPTOP_WINDOW_COLS = 200  # virtual width; narrower so ratios suit a laptop
+LAPTOP_WINDOW_ROWS = 50
+LAPTOP_LEFT_COL_COLS = 40  # sidebar/terminal column — agent takes the rest
+LAPTOP_SIDEBAR_PCT = 38    # sidebar's share of the left column; the terminal
+                           # beneath it gets the larger remainder
+
+# Auto-selection threshold: a client at least this wide gets WIDE, narrower
+# gets LAPTOP. Overridable via $WK_WIDE_COLS; both overridden by $WK_LAYOUT
+# / --layout. 220 sits between a typical laptop (~180-210 cols) and a docked
+# widescreen (260+).
+WK_DEFAULT_WIDE_COLS = 220
+
+
+@dataclass(frozen=True)
+class LayoutProfile:
+    """A named pane layout: how to build it and how to rebalance it.
+
+    `name` is stored on the session as @wk-layout so `wk rebalance` and
+    `wk lg-cd` can tell which layout a running session was built with.
+    `build` finishes the layout from the initial sidebar pane; `rebalance`
+    resets the geometry of an already-attached window in place.
+    """
+    name: str
+    window_cols: int
+    window_rows: int
+    has_lazygit: bool
+    build: Callable[[str, Path, str, str], None]
+    rebalance: Callable[[str], None]
 
 
 # sh command that launches lazygit with wk's narrow-pane config if it exists,
@@ -750,24 +896,21 @@ LAZYGIT_CMD = (
 )
 
 
-def _layout_splits_from_sidebar(
-    session: str,
-    wt: Path,
-    sidebar_id: str,
-    agent: str,
-    total_cols: int = WINDOW_COLS,
-) -> None:
-    """Given an already-existing sidebar pane (running `wk sidebar`), perform
-    the four splits that finish the 5-pane layout. Shared by `build_session`
-    (which creates the session first) and `wk relayout` (which converts an
-    existing session's active window in-place).
+def _build_wide(session: str, wt: Path, sidebar_id: str, agent: str) -> None:
+    """Finish the 5-pane widescreen layout from an existing sidebar pane.
 
-    Sets @wk-lazygit-pane on the session so `wk lg-cd` can find the lazygit
-    pane later, and selects the agent pane so the user lands there on attach.
+    Sets @wk-lazygit-pane so `wk lg-cd` can find the lazygit pane later, and
+    selects the agent pane so the user lands there on attach.
+
+        ┌────────┬──────────────────┬──────────┐
+        │ sidebar│                  │ lazygit  │
+        ├────────┤      agent       ├──────────┤
+        │ shell  │                  │ terminal │
+        └────────┴──────────────────┴──────────┘
     """
     # Agent. Split right of sidebar; new pane takes everything except the
     # left column.
-    agent_width = total_cols - LEFT_COL_COLS
+    agent_width = WIDE_WINDOW_COLS - WIDE_LEFT_COL_COLS
     agent_id = run(
         [
             "tmux", "split-window", "-h",
@@ -785,7 +928,7 @@ def _layout_splits_from_sidebar(
             "tmux", "split-window", "-h",
             "-t", agent_id,
             "-c", str(wt),
-            "-l", str(RIGHT_COL_COLS),
+            "-l", str(WIDE_RIGHT_COL_COLS),
             "-P", "-F", "#{pane_id}",
             *_shell_wrap(LAZYGIT_CMD),
         ]
@@ -801,7 +944,7 @@ def _layout_splits_from_sidebar(
             "tmux", "split-window", "-v",
             "-t", sidebar_id,
             "-c", str(wt),
-            "-l", f"{100 - SIDEBAR_PCT}%",
+            "-l", f"{100 - WIDE_SIDEBAR_PCT}%",
         ]
     )
 
@@ -811,12 +954,131 @@ def _layout_splits_from_sidebar(
             "tmux", "split-window", "-v",
             "-t", lazygit_id,
             "-c", str(wt),
-            "-l", f"{100 - LAZYGIT_PCT}%",
+            "-l", f"{100 - WIDE_LAZYGIT_PCT}%",
         ]
     )
 
     # Land in the agent pane on attach.
     run(["tmux", "select-pane", "-t", agent_id])
+
+
+def _build_laptop(session: str, wt: Path, sidebar_id: str, agent: str) -> None:
+    """Finish the 2-column laptop layout from an existing sidebar pane:
+    left column = sidebar over terminal, right column = full-height agent.
+
+        ┌────────┬──────────────────────────────┐
+        │ sidebar│                              │
+        ├────────┤            agent             │
+        │ terminal│                             │
+        └────────┴──────────────────────────────┘
+
+    No lazygit pane (so @wk-lazygit-pane is intentionally left unset) and no
+    separate shell pane — the left-bottom terminal covers both.
+    """
+    # Agent — the entire right column. Split right of sidebar; it takes
+    # everything except the left column.
+    agent_width = LAPTOP_WINDOW_COLS - LAPTOP_LEFT_COL_COLS
+    agent_id = run(
+        [
+            "tmux", "split-window", "-h",
+            "-t", sidebar_id,
+            "-c", str(wt),
+            "-l", str(agent_width),
+            "-P", "-F", "#{pane_id}",
+            agent,
+        ]
+    ).stdout.strip()
+
+    # Terminal — left column, bottom. Split below the sidebar (default shell).
+    run(
+        [
+            "tmux", "split-window", "-v",
+            "-t", sidebar_id,
+            "-c", str(wt),
+            "-l", f"{100 - LAPTOP_SIDEBAR_PCT}%",
+        ]
+    )
+
+    # Land in the agent pane on attach.
+    run(["tmux", "select-pane", "-t", agent_id])
+
+
+def _rebalance_wide(session: str) -> None:
+    """Reset the widescreen geometry on SESSION's active window.
+
+    Targets panes by visual index, which is safe here: rebalance only runs
+    on a fully-built, stable wk layout (tmux only renumbers indices while
+    splits are happening). Visual order: 1=sidebar, 2=shell, 3=agent,
+    4=lazygit, 5=terminal. The `session:.N` form pins the target to SESSION
+    rather than the attached client's current session.
+    """
+    run(["tmux", "resize-pane", "-t", f"{session}:.1", "-x", str(WIDE_LEFT_COL_COLS)], check=False)
+    run(["tmux", "resize-pane", "-t", f"{session}:.4", "-x", str(WIDE_RIGHT_COL_COLS)], check=False)
+    run(["tmux", "resize-pane", "-t", f"{session}:.1", "-y", f"{WIDE_SIDEBAR_PCT}%"], check=False)
+    run(["tmux", "resize-pane", "-t", f"{session}:.4", "-y", f"{WIDE_LAZYGIT_PCT}%"], check=False)
+
+
+def _rebalance_laptop(session: str) -> None:
+    """Reset the laptop geometry on SESSION's active window. Visual order:
+    1=sidebar, 2=terminal, 3=agent — so resizing pane 1 sets both the left
+    column width and the sidebar's share of its height."""
+    run(["tmux", "resize-pane", "-t", f"{session}:.1", "-x", str(LAPTOP_LEFT_COL_COLS)], check=False)
+    run(["tmux", "resize-pane", "-t", f"{session}:.1", "-y", f"{LAPTOP_SIDEBAR_PCT}%"], check=False)
+
+
+LAYOUTS: dict[str, LayoutProfile] = {
+    "wide": LayoutProfile(
+        name="wide", window_cols=WIDE_WINDOW_COLS, window_rows=WIDE_WINDOW_ROWS,
+        has_lazygit=True, build=_build_wide, rebalance=_rebalance_wide,
+    ),
+    "laptop": LayoutProfile(
+        name="laptop", window_cols=LAPTOP_WINDOW_COLS, window_rows=LAPTOP_WINDOW_ROWS,
+        has_lazygit=False, build=_build_laptop, rebalance=_rebalance_laptop,
+    ),
+}
+# Accepted aliases for the user-facing layout name (env / flag / @wk-layout).
+_LAYOUT_ALIASES = {"wide": "wide", "widescreen": "wide", "laptop": "laptop", "narrow": "laptop"}
+
+
+def _client_cols() -> Optional[int]:
+    """Best guess at the column width of the display we'll attach with.
+
+    Prefers the attached tmux client's width (when run from inside tmux),
+    else the controlling terminal's size. None when neither is knowable
+    (e.g. a headless/cron invocation with no tty).
+    """
+    if in_tmux():
+        r = run(["tmux", "display-message", "-p", "#{client_width}"], check=False)
+        w = r.stdout.strip()
+        if r.returncode == 0 and w.isdigit() and int(w) > 0:
+            return int(w)
+    try:
+        return os.get_terminal_size().columns
+    except OSError:
+        return None
+
+
+def resolve_profile(explicit: Optional[str] = None) -> LayoutProfile:
+    """Pick a layout: explicit name (--layout) > $WK_LAYOUT > auto by width.
+
+    Auto compares the attach display's width against $WK_WIDE_COLS (default
+    220): wider → `wide`, narrower → `laptop`. When the width is unknowable
+    (headless), defaults to `wide` to preserve the historical layout.
+    """
+    name = (explicit or os.environ.get("WK_LAYOUT", "")).strip().lower()
+    if name:
+        if name not in _LAYOUT_ALIASES:
+            die(f"unknown layout {name!r}", hint="expected 'wide' or 'laptop'")
+        return LAYOUTS[_LAYOUT_ALIASES[name]]
+
+    try:
+        threshold = int(os.environ.get("WK_WIDE_COLS") or WK_DEFAULT_WIDE_COLS)
+    except ValueError:
+        threshold = WK_DEFAULT_WIDE_COLS
+    cols = _client_cols()
+    if cols is None:
+        return LAYOUTS["wide"]
+    return LAYOUTS["wide"] if cols >= threshold else LAYOUTS["laptop"]
 
 
 def wk_env_pairs(session: str, branch: str, wt: Path) -> list[tuple[str, str]]:
@@ -840,22 +1102,25 @@ def build_session(
     wt: Path,
     agent: str,
     branch: Optional[str] = None,
+    layout: Optional[str] = None,
 ) -> None:
-    """Create a detached session with the 5-pane layout.
+    """Create a detached session with the wk pane layout.
 
-    Panes are 1-indexed (matches user's `pane-base-index 1` tmux setting):
+    LAYOUT picks the profile ("wide" / "laptop"); None auto-selects by the
+    attach display's width (see `resolve_profile`). The widescreen layout is
+    5 panes, the laptop layout is 2 columns — both build the sidebar first,
+    then `profile.build` finishes the rest:
 
-        ┌──────────┬──────────────────────────┬──────────────────┐
-        │ sidebar  │                          │   lazygit        │
-        │ pane.1   │                          │   pane.3         │
-        ├──────────┤   agent (Claude Code)    ├──────────────────┤
-        │          │   pane.2                 │                  │
-        │ shell    │                          │   terminal       │
-        │ pane.4   │                          │   pane.5         │
-        └──────────┴──────────────────────────┴──────────────────┘
+        wide (1-indexed panes)            laptop
+        ┌────────┬──────────┬─────────┐   ┌────────┬─────────────────┐
+        │ sidebar│          │ lazygit │   │ sidebar│                 │
+        │ pane.1 │  agent   │ pane.4  │   ├────────┤      agent      │
+        │ shell  │  pane.3  │ terminal│   │terminal│                 │
+        │ pane.2 │          │ pane.5  │   │        │                 │
+        └────────┴──────────┴─────────┘   └────────┴─────────────────┘
     """
     wk = _wk_bin()
-    total_cols = WINDOW_COLS
+    profile = resolve_profile(layout)
     real_branch = branch or session
 
     # Mark this worktree as a wk workspace before we touch tmux — the sidebar
@@ -878,7 +1143,7 @@ def build_session(
             "tmux", "new-session", "-d",
             "-s", session,
             "-c", str(wt),
-            "-x", str(total_cols), "-y", "75",  # reshaped on attach
+            "-x", str(profile.window_cols), "-y", str(profile.window_rows),  # reshaped on attach
             "-n", "work",
             *env_flags,
             "-P", "-F", "#{pane_id}",
@@ -903,10 +1168,11 @@ def build_session(
         run(["tmux", "set-option", "-t", session, "@wk", "1"])
         run(["tmux", "set-option", "-t", session, "@wk-branch", real_branch])
         run(["tmux", "set-option", "-t", session, "@wk-path", str(wt)])
+        # Record which layout this session was built with, so `wk rebalance`
+        # and `wk lg-cd` can behave correctly (e.g. laptop has no lazygit).
+        run(["tmux", "set-option", "-t", session, "@wk-layout", profile.name])
 
-        _layout_splits_from_sidebar(
-            session, wt, sidebar_id, agent, total_cols=total_cols
-        )
+        profile.build(session, wt, sidebar_id, agent)
     except Exception:
         run(["tmux", "kill-session", "-t", session], check=False)
         die(f"failed to build session {session!r}; cleaned up the partial session")
@@ -1503,7 +1769,8 @@ def open_pr_ref(
     open_pr(number, repo_slug, no_attach, no_fetch)
 
 
-def open_ref(ref: str, base: str, no_attach: bool, no_fetch: bool) -> None:
+def open_ref(ref: str, base: str, no_attach: bool, no_fetch: bool,
+             layout: Optional[str] = None) -> None:
     """Open whatever REF points at — an issue, a pull request, or a branch.
 
     Classification, in order: an issue reference (Jira link or uppercase
@@ -1526,19 +1793,21 @@ def open_ref(ref: str, base: str, no_attach: bool, no_fetch: bool) -> None:
         return
 
     state = resolve_workspace(ref, base, fetch=not no_fetch, strict_new=False)
-    _build_and_attach(state, no_attach)
+    _build_and_attach(state, no_attach, layout=layout)
 
 
-def _build_and_attach(state: WorkspaceState, no_attach: bool) -> None:
+def _build_and_attach(state: WorkspaceState, no_attach: bool,
+                      layout: Optional[str] = None) -> None:
     """Build (or reuse) the tmux session for a resolved workspace, then attach.
 
     Shared by `wk open` and `wk pr`: attach if the session is already
-    running, otherwise build the 5-pane layout first.
+    running, otherwise build the layout first (LAYOUT picks the profile;
+    None auto-detects).
     """
     if state.session in tmux_sessions():
         console.print("[dim]session running; attaching[/dim]")
     else:
-        build_session(state.session, state.wt, agent_cmd(), branch=state.branch)
+        build_session(state.session, state.wt, agent_cmd(), branch=state.branch, layout=layout)
         if state.created:
             console.print(f"[green]✓[/green] workspace [bold]{state.branch}[/bold] ready at {state.wt}")
         else:
@@ -1612,6 +1881,10 @@ def new(
     ),
     no_attach: bool = typer.Option(False, "--no-attach", help="Don't attach."),
     no_fetch: bool = typer.Option(False, "--no-fetch", help="Skip `git fetch`."),
+    layout: Optional[str] = typer.Option(
+        None, "--layout", "-l",
+        help="Layout: 'wide' or 'laptop'. Default auto-detects from display width.",
+    ),
 ) -> None:
     """Create a [bold]new[/bold] worktree + tmux session for BRANCH and attach.
 
@@ -1623,11 +1896,12 @@ def new(
 
     session = session_name(branch)
     if session in tmux_sessions():
-        die(f"tmux session already exists: {session}")
+        die(f"tmux session already exists: {session}",
+            hint=f"`wk switch {branch}` to attach to it")
 
     state = resolve_workspace(branch, base, fetch=not no_fetch, strict_new=True)
 
-    build_session(state.session, state.wt, agent_cmd(), branch=state.branch)
+    build_session(state.session, state.wt, agent_cmd(), branch=state.branch, layout=layout)
     console.print(f"[green]✓[/green] workspace [bold]{state.branch}[/bold] ready at {state.wt}")
 
     if not no_attach:
@@ -1649,6 +1923,11 @@ def open_cmd(
     ),
     no_attach: bool = typer.Option(False, "--no-attach", help="Don't attach."),
     no_fetch: bool = typer.Option(False, "--no-fetch", help="Skip `git fetch`."),
+    layout: Optional[str] = typer.Option(
+        None, "--layout", "-l",
+        help="Layout: 'wide' or 'laptop'. Default auto-detects from display width. "
+             "Applies only when building a session (ignored if one's already running).",
+    ),
 ) -> None:
     """Open a workspace for BRANCH — a branch, a pull request, or an issue.
 
@@ -1692,7 +1971,7 @@ def open_cmd(
     if not branch:
         die("missing BRANCH (or pass --pick)")
 
-    open_ref(branch, base, no_attach, no_fetch)
+    open_ref(branch, base, no_attach, no_fetch, layout=layout)
 
 
 @app.command("pr")
@@ -1870,7 +2149,8 @@ def task(
 
     session = session_name(branch)
     if session in tmux_sessions():
-        die(f"tmux session already exists: {session}")
+        die(f"tmux session already exists: {session}",
+            hint=f"`wk switch {branch}` to attach to it")
 
     # Create the worktree (strict: error if branch already exists).
     state = resolve_workspace(branch, base, fetch=not no_fetch, strict_new=True)
@@ -2136,7 +2416,8 @@ def task_merge(
     workspaces = all_workspaces()
     orch = next((w for w in workspaces if w.session == orch_session), None)
     if orch is None:
-        die("current tmux session isn't a wk workspace")
+        die("current tmux session isn't a wk workspace",
+            hint="`wk relayout` converts the current session into one")
     task = require_workspace(branch, workspaces)
     if task.session == orch.session:
         die("can't merge a workspace into itself")
@@ -2399,13 +2680,19 @@ def relayout(
         False, "--force", "-f",
         help="Skip confirmation when the current session isn't tagged as wk.",
     ),
+    layout: Optional[str] = typer.Option(
+        None, "--layout", "-l",
+        help="Layout profile: 'wide' or 'laptop'. Default auto-detects from "
+             "the display width (see CHEATSHEET).",
+    ),
 ) -> None:
-    """Rebuild the 5-pane wk layout in the current tmux session's active window.
+    """Rebuild the wk pane layout in the current tmux session's active window.
 
-    Useful when a layout has been mangled by hand, or to convert the current
-    tmux session into a wk workspace. (Sibling "make this wk" verbs: `wk adopt`
-    wraps a *directory* in place; `wk open` builds one from a *branch* name —
-    reach for relayout only to fix/convert the session you're already in.)
+    Useful when a layout has been mangled by hand, when you've docked/undocked
+    and want the other layout, or to convert the current tmux session into a
+    wk workspace. (Sibling "make this wk" verbs: `wk adopt` wraps a *directory*
+    in place; `wk open` builds one from a *branch* name — reach for relayout
+    only to fix/convert/reshape the session you're already in.)
     Kills every other pane in the active window and respawns the active pane as
     the sidebar, then re-runs the same split sequence `wk open` uses. The
     session keeps its name.
@@ -2462,6 +2749,11 @@ def relayout(
         if not typer.confirm("Proceed?", default=True):
             raise typer.Exit(0)
 
+    # Resolve the profile HERE, while a client is attached and its width is
+    # knowable — the detached worker has no client to auto-detect from, so we
+    # hand it the concrete name.
+    profile = resolve_profile(layout)
+
     wk_bin = _wk_bin()
     subprocess.Popen(
         [
@@ -2471,6 +2763,7 @@ def relayout(
             "--window", win_id,
             "--wt", str(wt),
             "--branch", branch,
+            "--layout", profile.name,
         ],
         start_new_session=True,  # survive the pane respawn that kills our shell
         stdin=subprocess.DEVNULL,
@@ -2487,12 +2780,14 @@ def _relayout_detached(
     window: str = typer.Option(..., help="Window id (@NN) to relayout."),
     wt: str = typer.Option(..., help="Worktree path."),
     branch: str = typer.Option(..., help="Branch name."),
+    layout: str = typer.Option("wide", help="Resolved layout name ('wide'/'laptop')."),
 ) -> None:
     """Internal: do the destructive layout rebuild for `wk relayout` from a
     process detached from the pane being respawned."""
     require("tmux")
     wt_path = Path(wt)
     wk = _wk_bin()
+    profile = resolve_profile(layout)
 
     # We run detached with stdout/stderr at /dev/null, and our FIRST act below is
     # destructive (`kill-pane -a` nukes every other pane in the window). If a
@@ -2506,6 +2801,7 @@ def _relayout_detached(
         run(["tmux", "set-option", "-t", session, "@wk", "1"])
         run(["tmux", "set-option", "-t", session, "@wk-branch", branch])
         run(["tmux", "set-option", "-t", session, "@wk-path", str(wt_path)])
+        run(["tmux", "set-option", "-t", session, "@wk-layout", profile.name])
 
         # Push WK_* into the session environment so newly-spawned panes inherit
         # them. (build_session uses `-e` on new-session for the same effect at
@@ -2532,7 +2828,7 @@ def _relayout_detached(
             ]
         )
 
-        _layout_splits_from_sidebar(session, wt_path, pane, agent_cmd())
+        profile.build(session, wt_path, pane, agent_cmd())
     except Exception:
         try:
             logdir = repo_root() / ".git"
@@ -2540,6 +2836,28 @@ def _relayout_detached(
             logdir = wt_path
         _log_detached_failure(logdir, f"_relayout-detached {session}")
         raise
+
+
+@app.command()
+def rebalance() -> None:
+    """Reset the current window's pane sizes to the wk layout's defaults.
+
+    Run from inside a wk session after dragging pane borders around. Reads
+    the session's @wk-layout tag to apply the right geometry (the widescreen
+    and laptop layouts have different target sizes). Bound to `prefix M-w`.
+    """
+    require("tmux")
+    if not in_tmux():
+        die("not inside tmux; run `wk rebalance` from within a wk session")
+    r = run(["tmux", "display-message", "-p", "#S"], check=False)
+    session = r.stdout.strip()
+    name = run(
+        ["tmux", "show-options", "-v", "-t", session, "@wk-layout"], check=False
+    ).stdout.strip()
+    # Sessions built before @wk-layout existed (or non-wk windows) default to
+    # the widescreen geometry, matching the historical M-w behavior.
+    profile = LAYOUTS.get(name, LAYOUTS["wide"])
+    profile.rebalance(session)
 
 
 @app.command("refresh-agents")
@@ -2570,7 +2888,7 @@ def refresh_agents(
             if _matches_query(branch, w)
         ]
         if not targets:
-            die(f"no workspace matching {branch!r}")
+            die(f"no workspace matching {branch!r}", hint="`wk list` shows every workspace")
     else:
         if not in_tmux():
             die("not inside tmux; pass a branch name or --all")
@@ -2630,24 +2948,7 @@ def list_cmd() -> None:
     if not workspaces:
         console.print("[dim]no workspaces[/dim]")
         return
-
-    table = Table(box=None, pad_edge=False)
-    table.add_column("branch", style="bold")
-    table.add_column("session")
-    table.add_column("ahead/behind", justify="right")
-    table.add_column("status")
-    table.add_column("path", style="dim")
-
-    for w in workspaces:
-        sess = "[green]●[/green] " + w.session if w.has_session else f"[dim]○ {w.session}[/dim]"
-        ab = f"+{w.ahead}/-{w.behind}" if (w.ahead or w.behind) else "[dim]·[/dim]"
-        status = "[yellow]dirty[/yellow]" if w.dirty else "[green]clean[/green]"
-        try:
-            shown = "~/" + str(w.path.relative_to(Path.home()))
-        except ValueError:
-            shown = str(w.path)
-        table.add_row(w.branch, sess, ab, status, shown)
-    console.print(table)
+    console.print(workspace_table(workspaces, current_session()))
 
 
 @app.command()
@@ -2658,7 +2959,7 @@ def switch(
     require("tmux")
     workspaces = all_workspaces()
     if not workspaces:
-        die("no workspaces to switch to")
+        die("no workspaces to switch to", hint="`wk new <branch>` creates one")
 
     target: Optional[Workspace] = None
     if branch:
@@ -2667,23 +2968,12 @@ def switch(
                 target = w
                 break
         if target is None:
-            die(f"no workspace matching {branch!r}")
+            die(f"no workspace matching {branch!r}", hint="`wk list` shows every workspace")
     else:
         require("fzf")
         wk = _wk_bin()
-        current = os.environ.get("WK_CURRENT", "")
-        # Compute it ourselves if not exported (e.g. when run from a popup).
-        if not current and in_tmux():
-            r = run(["tmux", "display-message", "-p", "#S"], check=False)
-            current = r.stdout.strip()
-
-        lines: list[str] = []
-        for w in workspaces:
-            marker = "▶" if w.session == current else ("●" if w.has_session else "·")
-            ab = f"+{w.ahead}/-{w.behind}" if (w.ahead or w.behind) else " "
-            status = "✱" if w.dirty else " "
-            display = f"{marker} {w.branch[:30]:<30} {ab:>8} {status}"
-            lines.append(f"{w.session}\t{display}")
+        current = current_session()
+        lines = [_picker_line(w, current) for w in workspaces]
 
         proc = subprocess.run(
             [
@@ -2945,7 +3235,7 @@ def rm(
 
     w = workspaces.get(branch)
     if w is None:
-        die(f"no workspace for {branch!r}")
+        die(f"no workspace for {branch!r}", hint="`wk list` shows every workspace")
     if w.dirty and not force:
         die("worktree is dirty; use --force or commit first")
 
@@ -3038,7 +3328,7 @@ def cd(
             if _matches_query(branch, w):
                 print(w.path)
                 return
-        die(f"no workspace for {branch!r}")
+        die(f"no workspace for {branch!r}", hint="`wk list` shows every workspace")
 
 
 def _active_pane_cwd() -> Optional[str]:
@@ -3310,9 +3600,19 @@ def lg_cd(
                 pane_id = pid
                 break
     if not pane_id:
+        # The laptop layout has no lazygit pane by design — say so rather than
+        # suggesting a reopen that wouldn't add one.
+        layout_name = run(
+            ["tmux", "show-options", "-v", "-t", sess, "@wk-layout"], check=False
+        ).stdout.strip()
+        if layout_name == "laptop":
+            die(
+                f"session {sess!r} uses the laptop layout, which has no lazygit pane",
+                hint="`wk relayout --layout wide` to switch to the 5-pane layout",
+            )
         die(
-            f"no lazygit pane found in session {sess!r} — reopen the workspace "
-            f"with `wk open` so wk can track its lazygit pane."
+            f"no lazygit pane found in session {sess!r}",
+            hint="reopen the workspace with `wk open` so wk can track its lazygit pane",
         )
 
     run(
@@ -3350,7 +3650,7 @@ def sidebar() -> None:
             workspaces = all_workspaces()
             console.clear()
             if not workspaces:
-                console.print("[dim](no workspaces)[/dim]")
+                console.print("[dim]no workspaces[/dim]")
                 console.print()
                 console.print("[dim]wk new <branch>[/dim]")
             else:
@@ -3359,20 +3659,18 @@ def sidebar() -> None:
                 )
                 console.print()
                 for w in workspaces:
+                    marker = session_marker(w, current)
                     if w.session == current:
-                        marker = "[green]▶[/green]"
                         name_style = "bold"
                     elif w.has_session:
-                        marker = "[cyan]●[/cyan]"
                         name_style = ""
                     else:
-                        marker = "[dim]·[/dim]"
                         name_style = "dim"
                     ab = (
-                        f"[yellow]+{w.ahead}/-{w.behind}[/yellow]"
+                        f"[yellow]{ahead_behind(w)}[/yellow]"
                         if (w.ahead or w.behind) else " " * 8
                     )
-                    status = "[red]✱[/red]" if w.dirty else " "
+                    status = dirty_marker(w)
                     name = w.branch[:36]
                     if name_style:
                         name = f"[{name_style}]{name:<36}[/{name_style}]"
@@ -3396,13 +3694,9 @@ def sidebar() -> None:
 def list_once() -> None:
     """Internal: dump one workspace list line per workspace, tab-delimited
     `session\\tdisplay`. Used by fzf --reload after destructive actions."""
-    current = os.environ.get("WK_CURRENT", "")
+    current = current_session()
     for w in all_workspaces():
-        marker = "▶" if w.session == current else ("●" if w.has_session else "·")
-        ab = f"+{w.ahead}/-{w.behind}" if (w.ahead or w.behind) else " "
-        status = "✱" if w.dirty else " "
-        display = f"{marker} {w.branch[:30]:<30} {ab:>8} {status}"
-        print(f"{w.session}\t{display}")
+        print(_picker_line(w, current))
 
 
 @app.command("_preview", hidden=True)
@@ -3506,26 +3800,13 @@ def _dashboard_render(
             # repo move can't pin a stale session prefix in this long-lived loop.
             _project_prefix.cache_clear()
             console.clear()
-            # Reuse the `list` command's output by invoking it directly.
+            # Share the exact table `wk list` renders, so the dashboard and
+            # the one-shot listing never drift in columns or glyphs.
             workspaces = all_workspaces()
             if not workspaces:
-                console.print("[dim](no workspaces)[/dim]")
+                console.print("[dim]no workspaces[/dim]")
             else:
-                table = Table(show_header=True, header_style="bold")
-                table.add_column("branch")
-                table.add_column("session", justify="center")
-                table.add_column("±", justify="right")
-                table.add_column("dirty", justify="center")
-                table.add_column("path")
-                for w in workspaces:
-                    table.add_row(
-                        w.branch,
-                        "[cyan]●[/cyan]" if w.has_session else "[dim]·[/dim]",
-                        f"+{w.ahead}/-{w.behind}" if (w.ahead or w.behind) else " ",
-                        "[red]✱[/red]" if w.dirty else " ",
-                        f"[dim]{w.path}[/dim]",
-                    )
-                console.print(table)
+                console.print(workspace_table(workspaces, current_session()))
             console.print()
             console.print(
                 f"[dim]auto-refresh every {refresh:g}s · M-r to refresh now[/dim]"

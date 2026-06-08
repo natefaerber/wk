@@ -131,6 +131,11 @@ wk rm release/v35 --keep-branch   # remove worktree but keep the branch ref
 
 ## Pane layout
 
+wk has two layout profiles. The **widescreen** layout (5 panes) is the default
+on wide displays; the **laptop** layout (2 columns) kicks in on narrow ones.
+
+### Widescreen (`wide`)
+
 ```
 ┌──────────┬──────────────────────────┬──────────────────┐
 │ sidebar  │                          │   lazygit        │
@@ -149,7 +154,30 @@ wk rm release/v35 --keep-branch   # remove worktree but keep the branch ref
 - **lazygit** — `lazygit -ucf ~/.config/wk/lazygit.yml` (narrow-pane config)
 - **terminal** — another login shell
 
-`prefix M-w` rebalances widths/heights back to defaults.
+### Laptop (`laptop`)
+
+```
+┌──────────┬──────────────────────────────────────┐
+│ sidebar  │                                      │
+├──────────┤        agent (Claude Code)           │
+│ terminal │                                      │
+└──────────┴──────────────────────────────────────┘
+```
+
+Two columns: the left stacks the **sidebar** over a **terminal**; the right is
+a full-height **agent**. No lazygit or separate shell pane — on a narrow display
+they cost more width than they're worth.
+
+### Choosing a layout
+
+By default wk **auto-detects** from the display width when it builds a session:
+a client at least `WK_WIDE_COLS` (default 220) columns wide gets `wide`, narrower
+gets `laptop`. Override per-invocation with `--layout wide|laptop` on `wk new` /
+`wk open` / `wk relayout`, or globally with `WK_LAYOUT=wide|laptop` (e.g. set it
+in your laptop's shell profile). Docked and undocked the same machine? Just
+`wk relayout` after switching displays — it re-detects.
+
+`prefix M-w` (`wk rebalance`) resets pane sizes to the current layout's defaults.
 
 ---
 
@@ -294,6 +322,7 @@ or to the orchestrator instead.
 
 ```
 wk new <branch>                  # create + attach (errors if branch exists)
+wk new <branch> --layout laptop  # force a layout (wide|laptop); default auto-detects
 wk open <branch>                 # create-or-attach a branch workspace (forgiving)
 wk open <number|pr-url>          # open a pull request (same as `wk pr`)
 wk open <issue-url|KEY>          # resolve an issue (e.g. DEV-6266) to its PR, else start a branch
@@ -311,7 +340,8 @@ wk restore [branch]              # rebuild tmux session(s) for existing worktree
 wk restore --list                # show which worktrees would be restored (dry-run)
 wk restore                       # on a TTY: fzf multi-select picker (tab to mark)
 wk restore --all                 # rebuild every missing session, skip the picker
-wk relayout                      # rebuild 5-pane layout in the current tmux session
+wk relayout [--layout wide|laptop] # rebuild the layout in the current session (re-detects)
+wk rebalance                     # reset pane sizes to the current layout's defaults (prefix M-w)
 wk refresh-agents [branch|--all] # regenerate .wk/AGENTS.md and ORCHESTRATOR.md
 wk cd [branch]                   # print worktree path (for shell cd integration)
 wk lg-cd [path] [--pick=...]     # retarget lazygit pane
@@ -329,6 +359,8 @@ wk dashboard                     # cross-workspace overview session
 | var | default | what |
 |---|---|---|
 | `WK_AGENT_CMD` | `claude -c \|\| claude` | command run in the agent pane |
+| `WK_LAYOUT` | _(auto)_ | force a layout profile: `wide` or `laptop` (overrides auto-detect) |
+| `WK_WIDE_COLS` | `220` | auto-detect threshold: clients ≥ this many cols get `wide`, else `laptop` |
 | `WK_WORKTREE_ROOT` | `<repo>/.worktrees/` | where to put worktrees |
 | `WK_PR_REPO_ROOT` | `~/_Work` | where `wk open`/`wk pr` look for a PR-by-URL's local clone |
 | `WK_PR_SEARCH_OWNER` | current repo's `origin` owner | GitHub org `wk open <issue>` searches for the issue's PR |
