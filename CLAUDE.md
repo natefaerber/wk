@@ -79,9 +79,26 @@ A wk workspace is the triple of:
 3. A `.wk/` marker directory inside the worktree (created by
    `mark_wk_workspace()`).
 
-The 5-pane layout is built by `build_session()`. Visual pane indices
-(after tmux's tree-traversal renumbering) are: 1=sidebar, 2=shell,
-3=agent, 4=lazygit, 5=terminal.
+The layout is built by `build_session()`, which picks a `LayoutProfile`
+(via `resolve_profile()`) and delegates the splits to `profile.build`.
+Two profiles live in the `LAYOUTS` registry:
+- **wide** (`_build_wide`) — the 5-pane widescreen layout. Visual pane
+  indices (after tmux's tree-traversal renumbering): 1=sidebar, 2=shell,
+  3=agent, 4=lazygit, 5=terminal.
+- **laptop** (`_build_laptop`) — 2 columns: left = sidebar over terminal,
+  right = full-height agent. No lazygit/shell panes. Visual indices:
+  1=sidebar, 2=terminal, 3=agent.
+
+`resolve_profile()` precedence: explicit `--layout` > `$WK_LAYOUT` > auto
+by attach-display width (`_client_cols()` vs `$WK_WIDE_COLS`, default 220;
+headless → wide). The chosen profile's name is stored on the session as
+`@wk-layout` so `wk rebalance` and `wk lg-cd` can behave per-layout.
+Per-profile geometry constants (`WIDE_*` / `LAPTOP_*`) and the rebalance
+sequences live next to the builders — change sizes there, not in `wk.conf`
+(the `M-w` binding just calls `wk rebalance`, which reads `@wk-layout`).
+`resolve_profile` is resolved in the *attached* parent for `wk relayout`
+and the concrete name handed to the detached worker (which has no client
+to detect width from).
 
 ### Identification: `@wk` tmux user options
 A session is "a wk session" iff it has `@wk = 1` set as a tmux user
@@ -93,7 +110,10 @@ marker dir OR a tagged session.
 Other `@wk-*` options set on sessions:
 - `@wk-branch`: canonical branch name (with slashes preserved)
 - `@wk-path`: absolute path to the worktree
+- `@wk-layout`: layout profile name (`wide`/`laptop`) the session was built
+  with; read by `wk rebalance` and `wk lg-cd`
 - `@wk-lazygit-pane`: the `%NN` id of the lazygit pane, used by `wk lg-cd`
+  (unset in the laptop layout, which has no lazygit pane)
 - `@wk-task`, `@wk-task-prompt`: set by `wk task` for tracking
 - `@wk-last-session` (server-scoped): for `wk cycle last` (alt-tab style)
 - `@wk-dashboard`: set on the `wk-dashboard` session
