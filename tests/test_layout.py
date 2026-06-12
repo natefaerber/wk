@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import subprocess
 
+import pytest
+
 
 class SplitRec:
     """run() mock that hands back a fresh %pane-id for every `-P` split and
@@ -67,6 +69,42 @@ def test_build_laptop_is_two_columns(wk, monkeypatch):
     assert any("-v" in s for s in splits), "terminal is stacked below the sidebar"
     selects = [c for c in rec.calls if "select-pane" in c]
     assert selects and "%2" in selects[-1]
+
+
+def test_rebalance_refuses_non_wk_session(wk, monkeypatch):
+    # prefix M-w fires globally; rebalancing a plain session would mangle it.
+    import typer
+
+    def fake_run(cmd, *a, **k):
+        if "display-message" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, "plain-sess", "")
+        return subprocess.CompletedProcess(cmd, 0, "", "")  # @wk unset
+
+    monkeypatch.setattr(wk, "require", lambda *a, **k: None)
+    monkeypatch.setattr(wk, "in_tmux", lambda: True)
+    monkeypatch.setattr(wk, "run", fake_run)
+    with pytest.raises(typer.Exit):
+        wk.rebalance()
+
+
+def test_rebalance_runs_on_wk_session(wk, monkeypatch):
+    calls = []
+
+    def fake_run(cmd, *a, **k):
+        calls.append(list(cmd))
+        if "display-message" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, "wk-sess", "")
+        if cmd[-1] == "@wk":
+            return subprocess.CompletedProcess(cmd, 0, "1", "")
+        if cmd[-1] == "@wk-layout":
+            return subprocess.CompletedProcess(cmd, 0, "wide", "")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(wk, "require", lambda *a, **k: None)
+    monkeypatch.setattr(wk, "in_tmux", lambda: True)
+    monkeypatch.setattr(wk, "run", fake_run)
+    wk.rebalance()
+    assert any("resize-pane" in c for c in calls)
 
 
 def test_rebalance_wide_targets_match_build_order(wk, monkeypatch):

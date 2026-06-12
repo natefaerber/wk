@@ -2971,13 +2971,18 @@ def rebalance() -> None:
     require("tmux")
     if not in_tmux():
         die("not inside tmux; run `wk rebalance` from within a wk session")
-    r = run(["tmux", "display-message", "-p", "#S"], check=False)
-    session = r.stdout.strip()
+    session = run(["tmux", "display-message", "-p", "#S"]).stdout.strip()
+    # Refuse on a non-wk session: M-w fires globally, and resizing a plain
+    # tmux session's panes to wk's column widths would mangle it.
+    is_wk = run(
+        ["tmux", "show-options", "-v", "-t", session, "@wk"], check=False
+    ).stdout.strip()
+    if is_wk != "1":
+        die(f"{session!r} isn't a wk session; nothing to rebalance",
+            hint="run `wk rebalance` from inside a wk workspace")
     name = run(
         ["tmux", "show-options", "-v", "-t", session, "@wk-layout"], check=False
     ).stdout.strip()
-    # Sessions built before @wk-layout existed (or non-wk windows) default to
-    # the widescreen geometry, matching the historical M-w behavior.
     profile = LAYOUTS.get(name, LAYOUTS["wide"])
     profile.rebalance(session)
 
