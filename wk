@@ -3113,9 +3113,16 @@ def switch(
         # inline instead of just erroring. Headless callers (piped, or
         # `wk switch <branch>`) keep the non-zero die so scripts see the failure.
         if branch is None and sys.stdin.isatty():
-            console.print("[dim]No wk workspaces yet — let's make your first one.[/dim]")
+            # We got here, so all_workspaces() succeeded — we're in a repo.
+            # Name it (and the base) so it's clear WHERE the branch will land.
+            repo = repo_root()
+            console.print(
+                f"No wk workspaces in [bold]{repo.name}[/bold] "
+                f"[dim]({repo})[/dim] yet — let's make your first one."
+            )
             name = typer.prompt(
-                "new branch (or empty to cancel)", default="", show_default=False
+                f"new branch in {repo.name} off {DEFAULT_BASE} (empty to cancel)",
+                default="", show_default=False,
             ).strip()
             if not name:
                 console.print("[dim](cancelled)[/dim]")
