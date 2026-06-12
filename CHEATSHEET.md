@@ -302,6 +302,8 @@ wk task-retry  fix-tenant-500s       # re-run the agent on the same task.md
 git -C ~/_Work/credo-backend/.worktrees/fix-tenant-500s diff main..
 wk task-merge fix-tenant-500s         # --no-ff merge commit (default)
 wk task-merge fix-tenant-500s --squash # squash into one commit
+wk task-merge fix-tenant-500s --rm     # merge, then tear down the task workspace
+wk task-merge fix-tenant-500s --into main  # target an orchestrator explicitly
 ```
 
 | binding | what |

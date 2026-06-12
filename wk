@@ -326,6 +326,14 @@ GLYPH_CURRENT = "▶"
 GLYPH_RUNNING = "●"
 GLYPH_IDLE = "·"
 GLYPH_DIRTY = "✱"
+GLYPH_DONE = "✓"
+
+
+def task_done(w: "Workspace") -> bool:
+    """True if W is a finished `--auto` task — the `.wk/done` sentinel exists.
+    Only `--auto` task workspaces ever write it, so the file's presence alone
+    identifies a done task (no tmux call needed)."""
+    return (w.path / WK_MARKER_DIR / _TASK_DONE_MARKER).exists()
 
 
 def current_session() -> str:
@@ -347,7 +355,12 @@ def session_marker(w: "Workspace", current: str = "", *, rich: bool = True) -> s
 
     rich=True wraps it in Rich color tags (for console surfaces);
     rich=False returns the bare glyph (for fzf/ANSI surfaces).
+
+    A finished `--auto` task shows ✓ regardless of session state — "this task
+    is done, ready to merge" is the signal that matters most for it.
     """
+    if task_done(w):
+        return f"[green]{GLYPH_DONE}[/green]" if rich else GLYPH_DONE
     if w.session == current:
         return f"[green]{GLYPH_CURRENT}[/green]" if rich else GLYPH_CURRENT
     if w.has_session:
@@ -636,8 +649,11 @@ Parallel work (only from an orchestrator workspace — see ORCHESTRATOR.md):
 - `wk task-status [branch]` — running / done / failed for task workspaces.
 - `wk task-output <branch> [--tail N] [--follow]` — read a task's
   `.wk/output.md` (the `--auto` Claude's stdout).
-- `wk task-merge <branch> [--squash]` — merge a finished task branch
-  back into the current workspace's branch.
+- `wk task-merge <branch> [--squash] [--rm] [--into <orch>]` — merge a
+  finished task branch back into the orchestrator's branch. `--rm` tears
+  the task workspace down after a clean merge; `--into` targets an
+  orchestrator other than the current session. A finished `--auto` task
+  shows ✓ in the sidebar and messages the orchestrator when it's done.
 - `wk task-cancel <branch>` — stop a running task's agent (kill its
   session), keeping the worktree and partial output.
 - `wk task-retry <branch>` — re-run a task's agent against its existing
@@ -702,8 +718,11 @@ directions), you should:
    ```
    wk task-merge <task-branch>          # --no-ff merge commit
    wk task-merge <task-branch> --squash # squash into one commit
+   wk task-merge <task-branch> --rm     # merge, then tear the task down
    ```
    The merge happens in *this* worktree, against the current branch.
+   `--rm` folds the clean-up step (6) into the merge: it removes the
+   task's worktree and, when the branch is ancestor-merged, deletes it.
 6. **Clean up** — after a task is merged, the child workspace is no
    longer needed. Either `wk close <task-branch>` (kill the session but
    keep the worktree on disk, in case you want to revisit) or
@@ -2124,6 +2143,14 @@ def adopt(
 _AUTO_TASK_CMD = (
     "claude -p \"$(cat .wk/task.md)\" 2>&1 | tee .wk/output.md; "
     "touch .wk/done; "
+    # Report back to the orchestrator that spawned us, if any. @wk-task-orch is
+    # set on this session by `wk task`; reading it at completion (not spawn)
+    # avoids the set-option race. display-message surfaces in the orchestrator's
+    # status line; the sidebar's ✓ glyph is the persistent signal. No daemon.
+    'orch=$(tmux show-options -qv @wk-task-orch 2>/dev/null); '
+    '[ -n "$orch" ] && tmux display-message -t "$orch" '
+    '"wk: task ${WK_BRANCH:-?} done — wk task-merge ${WK_BRANCH:-} --rm" '
+    '2>/dev/null; '
     "echo; echo '── task complete ── press any key to close ──'; "
     "read -n 1"
 )
@@ -2224,6 +2251,12 @@ def task(
     # Tag the session as a task workspace so the sidebar can mark it.
     run(["tmux", "set-option", "-t", session, "@wk-task", "1"])
     run(["tmux", "set-option", "-t", session, "@wk-task-prompt", prompt.strip()[:200]])
+    # Record who spawned us so the auto-task command can report completion back.
+    # Captured from the current session (the orchestrator); empty when `wk task`
+    # is run outside a wk session, in which case the child stays silent.
+    orch_session = current_session()
+    if orch_session:
+        run(["tmux", "set-option", "-t", session, "@wk-task-orch", orch_session])
 
     console.print(f"[green]✓[/green] task workspace [bold]{branch}[/bold] ready")
     console.print(f"  [dim]task file: {task_file}[/dim]")
@@ -2456,23 +2489,48 @@ def task_merge(
         False, "--no-commit",
         help="Merge but don't commit (lets you inspect before finalizing).",
     ),
+    into: Optional[str] = typer.Option(
+        None, "--into",
+        help="Orchestrator workspace to merge into (branch / session / slug). "
+             "Default: the current tmux session. Pass this to merge from "
+             "outside the orchestrator session (e.g. headless).",
+    ),
+    rm: bool = typer.Option(
+        False, "--rm",
+        help="After a successful merge, tear down the task workspace "
+             "(worktree + session). The branch is deleted only if it's "
+             "ancestor-merged into the orchestrator branch.",
+    ),
 ) -> None:
-    """Merge a task branch into the *current* wk workspace's branch.
+    """Merge a task branch into an orchestrator workspace's branch.
 
-    Run from inside the orchestrator's tmux session. The merge happens in
-    that worktree, against its current branch. Errors if either side has
-    uncommitted changes or the task workspace has unsaved work.
+    Defaults to the *current* wk session as the orchestrator; pass `--into`
+    to target another (which also lets you run this from outside any session).
+    The merge happens in the orchestrator's worktree, against its branch.
+    Errors if either side has uncommitted changes. With `--rm`, the merged
+    task workspace is torn down in one step.
     """
     require("git")
-    if not in_tmux():
-        die("run from inside a wk session (the orchestrator workspace)")
-    r = run(["tmux", "display-message", "-p", "#S"], check=False)
-    orch_session = r.stdout.strip()
     workspaces = all_workspaces()
-    orch = next((w for w in workspaces if w.session == orch_session), None)
-    if orch is None:
-        die("current tmux session isn't a wk workspace",
-            hint="`wk relayout` converts the current session into one")
+    # Resolve the orchestrator: an explicit --into target, else the current
+    # session. Resolving by query (not bare #S) is what lets `--into` be fired
+    # from anywhere — the deferred merge-when-done latch and agent callers need
+    # this, and it sidesteps the "#S is the child, not the orchestrator" bug.
+    if into:
+        orch = require_workspace(into, workspaces)
+    else:
+        if not in_tmux():
+            die("run from inside a wk session (the orchestrator workspace)",
+                hint="or pass `--into <orchestrator>` to target one explicitly")
+        orch_session = run(["tmux", "display-message", "-p", "#S"]).stdout.strip()
+        orch = next((w for w in workspaces if w.session == orch_session), None)
+        if orch is None:
+            die("current tmux session isn't a wk workspace",
+                hint="`wk relayout` converts the current session into one, "
+                     "or pass `--into <orchestrator>`")
+    if rm and (squash or no_commit):
+        die("--rm needs a finalized merge; it can't combine with "
+            "--squash or --no-commit")
     task = require_workspace(branch, workspaces)
     if task.session == orch.session:
         die("can't merge a workspace into itself")
@@ -2512,6 +2570,32 @@ def task_merge(
         console.print(
             f"[dim]squashed — commit manually in {orch.path}[/dim]"
         )
+
+    if rm:
+        # Tear down the merged task. Delete the branch only if it's genuinely
+        # ancestor-merged into the orchestrator branch — checking against the
+        # orchestrator branch specifically, not the main checkout's HEAD (which
+        # `wk rm`'s plain `-d` would, and wrongly refuse). When confirmed merged,
+        # the force delete is safe; otherwise keep the branch and only drop the
+        # worktree, so no committed-but-unmerged work is ever silently lost.
+        main = repo_root()
+        merged = run(
+            ["git", "-C", str(main), "branch", "--merged", orch.branch,
+             "--format=%(refname:short)"],
+            check=False,
+        )
+        is_merged = task.branch in merged.stdout.split()
+        _do_rm(task, main, force=is_merged, keep_branch=not is_merged)
+        if is_merged:
+            console.print(
+                f"[green]✓[/green] removed task workspace [bold]{task.branch}[/bold]"
+            )
+        else:
+            console.print(
+                f"[yellow]warning:[/yellow] removed worktree but kept branch "
+                f"[bold]{task.branch}[/bold] (not ancestor-merged into "
+                f"{orch.branch})"
+            )
 
 
 @app.command("task-cancel")
