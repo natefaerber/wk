@@ -74,6 +74,61 @@ def version() -> None:
     console.print(f"wk {__version__}")
 
 
+@app.command()
+def doctor() -> None:
+    """Check that wk's dependencies and tmux bindings are installed.
+
+    A mise/binary-only install gets the `wk` CLI but not the tmux config, so
+    the documented keystrokes (`prefix W`, `prefix M-g`, …) silently do
+    nothing. This reports what's present, points at what's missing, and exits
+    non-zero if a required tool is absent.
+    """
+    console.print(f"[bold]wk {__version__}[/bold]")
+    missing_required = False
+
+    def _tool(name: str, required: bool, note: str = "") -> None:
+        nonlocal missing_required
+        ok = shutil.which(name) is not None
+        if ok:
+            glyph, tag = "[green]✓[/green]", ""
+        elif required:
+            glyph, tag, missing_required = "[red]✗[/red]", " [red](required)[/red]", True
+        else:
+            glyph, tag = "[yellow]○[/yellow]", " [dim](optional)[/dim]"
+        suffix = f" [dim]— {note}[/dim]" if (note and not ok) else ""
+        console.print(f"  {glyph} {name}{tag}{suffix}")
+
+    console.print("[dim]tools[/dim]")
+    _tool("git", True)
+    _tool("tmux", True)
+    _tool("fzf", True)
+    _tool("lazygit", False, "the `prefix M-g` git popup")
+    _tool("fish", False)
+    _tool("uv", True)
+
+    console.print("[dim]tmux config[/dim]")
+    loaded = ""
+    if shutil.which("tmux"):
+        loaded = run(
+            ["tmux", "show-options", "-gv", "@wk-conf-loaded"], check=False
+        ).stdout.strip()
+    if loaded == "1":
+        console.print("  [green]✓[/green] wk.conf bindings loaded (prefix W, M-g, …)")
+    else:
+        console.print("  [yellow]○[/yellow] wk.conf not loaded — keystrokes won't work")
+        console.print(
+            "    [dim]→ clone the repo and run ./install.sh, or source wk.conf "
+            "from your tmux.conf[/dim]"
+        )
+        console.print(
+            "    [dim]  (a mise/binary-only install ships the CLI, not the "
+            "tmux bindings)[/dim]"
+        )
+
+    if missing_required:
+        raise typer.Exit(1)
+
+
 # ---------------------------------------------------------------------------
 # config
 # ---------------------------------------------------------------------------
@@ -3048,6 +3103,20 @@ def switch(
     require("tmux")
     workspaces = all_workspaces()
     if not workspaces:
+        # First-run dead-end: a new user's first `prefix W` lands here. When
+        # we're interactive (a tty, e.g. inside the popup), offer to create one
+        # inline instead of just erroring. Headless callers (piped, or
+        # `wk switch <branch>`) keep the non-zero die so scripts see the failure.
+        if branch is None and sys.stdin.isatty():
+            console.print("[dim]No wk workspaces yet — let's make your first one.[/dim]")
+            name = typer.prompt(
+                "new branch (or empty to cancel)", default="", show_default=False
+            ).strip()
+            if not name:
+                console.print("[dim](cancelled)[/dim]")
+                raise typer.Exit(0)
+            open_ref(name, DEFAULT_BASE, no_attach=False, no_fetch=False)
+            return
         die("no workspaces to switch to", hint="`wk new <branch>` creates one")
 
     target: Optional[Workspace] = None
