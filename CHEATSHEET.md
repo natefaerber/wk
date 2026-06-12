@@ -187,10 +187,12 @@ The sidebar pane is **read-only** — you don't navigate into it. To switch:
 
 | binding | what |
 |---|---|
-| `prefix W` | popup picker (fzf) over **existing wk workspaces**; switch on Enter |
+| `prefix W` | the **hub** — popup picker (fzf) over existing workspaces **and running tasks**; switch on Enter. A finished `--auto` task shows ✓. |
 | `prefix O` | popup picker over **all git branches** (local + remote), sorted by most recent commit. Markers show wk status (●=session running, ·=worktree only). Pick one → if it has a wk workspace, switches to it; otherwise creates one. |
 | `prefix W` then `ctrl-n` | prompt for a new branch and create it |
 | `prefix W` then `ctrl-d` | delete the highlighted workspace |
+| `prefix W` then `ctrl-x` | cancel the highlighted task (kill its session, keep the worktree) |
+| `prefix W` then `ctrl-r` | refresh the list (e.g. after a task finishes) |
 | `M-]` / `M-[` | **cycle next/prev running wk session** — no prefix, fires on bare keystroke. Like browser tabs. |
 | `M-m` | **toggle to last visited wk session** — alt-tab style. Repeated presses bounce between two recent workspaces. |
 

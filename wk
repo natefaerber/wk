@@ -3104,11 +3104,18 @@ def switch(
     """Switch to an existing workspace's tmux session.
 
     With BRANCH, jumps straight to that workspace (accepts the branch, its
-    session-form slug, or the full session name). With no argument, opens an
-    fzf picker over all workspaces with a live preview (task, recent commits,
-    git status). Attaches when run outside tmux, switches the client when
-    inside. Only moves between *existing* workspaces — use `wk open` to create
-    or rebuild one, or `wk cycle` to alt-tab between running sessions.
+    session-form slug, or the full session name). With no argument, opens the
+    fzf hub over all workspaces AND running tasks, with a live preview (task,
+    recent commits, git status) and single-key actions: enter=switch,
+    ctrl-n=new, ctrl-d=rm, ctrl-x=cancel a task, ctrl-r=refresh. A finished
+    `--auto` task shows ✓. Attaches when run outside tmux, switches the client
+    when inside.
+
+    The hub does the *non-blocking* verbs in place; reading a task's live
+    output or merging it are deliberately not bound here (they block or are
+    interactive) — switch into the task and use `wk task-output`/`task-merge`,
+    or the `--rm` flag. Auto-refresh is the passive sidebar's job; the hub
+    refreshes on demand (ctrl-r) to stay free of a background timer.
     """
     require("tmux")
     workspaces = all_workspaces()
@@ -3137,7 +3144,8 @@ def switch(
                 "--no-info",
                 "--no-scrollbar",
                 "--prompt=workspace❯ ",
-                "--header=enter=switch  j/k=move  /=filter  ctrl-n=new  ctrl-d=rm",
+                "--header=enter=switch  ctrl-n=new  ctrl-d=rm  ctrl-x=cancel  ctrl-r=refresh  /=filter\n"
+                "✓ task done   ● running   · idle   ✱ dirty",
                 "--reverse",
                 "--height=100%",
                 "--cycle",
@@ -3160,6 +3168,12 @@ def switch(
                 # is preserved here too.
                 f"--bind=ctrl-n:execute(tmux command-prompt -p 'new branch:' 'run-shell \"{wk} new %%\"')+abort",
                 f"--bind=ctrl-d:execute({wk} rm {{1}})+reload({wk} _list-once)",
+                # ctrl-x cancels a task (kills its session, keeps the worktree +
+                # output — non-destructive, recoverable via task-retry). ctrl-r
+                # refreshes the list on demand (no background timer; the sidebar
+                # is the always-on auto-refreshing view).
+                f"--bind=ctrl-x:execute({wk} task-cancel {{1}})+reload({wk} _list-once)",
+                f"--bind=ctrl-r:reload({wk} _list-once)",
             ],
             input="\n".join(lines),
             text=True,
