@@ -22,7 +22,7 @@ jobs:
 
       - name: Set up uv
         # Same pinned version the release workflow uses.
-        uses: astral-sh/setup-uv@v8.1.0
+        uses: astral-sh/setup-uv@v8.2.0
 
       - name: Validate wk script
         run: |
