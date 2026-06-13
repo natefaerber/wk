@@ -7,6 +7,8 @@ from the [GitHub releases](https://github.com/natefaerber/wk/releases).
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-06-13
+
 The "polish round" — easier to use, more agent-drivable.
 
 ### Added
@@ -44,7 +46,7 @@ The "polish round" — easier to use, more agent-drivable.
 - `wk rebalance` (`prefix M-w`) refuses on non-wk sessions instead of resizing
   their panes.
 
-## [0.7.0] — 2026-06-08
+## [0.7.0] - 2026-06-08
 ### Added
 - `wk --version` / `wk version`, backed by a single `__version__` kept in
   lockstep with the plugin manifests (enforced by CI + a test).
@@ -53,7 +55,7 @@ The "polish round" — easier to use, more agent-drivable.
 - Hardened the mise install: releases now publish arch-named asset copies so the
   bare `mise use github:natefaerber/wk` autodetects instead of erroring.
 
-## [0.6.0] — 2026-06-08
+## [0.6.0] - 2026-06-08
 ### Added
 - **Laptop layout profile** with width-based auto-detection (`--layout` /
   `$WK_LAYOUT` / `$WK_WIDE_COLS`) and `wk rebalance`.
@@ -61,7 +63,7 @@ The "polish round" — easier to use, more agent-drivable.
 - Unified workspace-state rendering (one glyph vocabulary across list / switch /
   sidebar / dashboard) and added next-step hints to error messages.
 
-## [0.5.0] — 2026-06-06
+## [0.5.0] - 2026-06-06
 ### Added
 - Test suite + CI.
 - Packaged wk as a Claude Code plugin (the `wk-tools` marketplace, shipping the
@@ -70,10 +72,11 @@ The "polish round" — easier to use, more agent-drivable.
 - Data-loss, resilience, and task-lifecycle hardening from a full review;
   hardened `workspace_status` and detached `rm`.
 
-## [0.4.0] — 2026-06-03
+## [0.4.0] - 2026-06-03
 - See the [v0.4.0 release](https://github.com/natefaerber/wk/releases/tag/v0.4.0).
 
-[Unreleased]: https://github.com/natefaerber/wk/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/natefaerber/wk/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/natefaerber/wk/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/natefaerber/wk/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/natefaerber/wk/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/natefaerber/wk/compare/v0.4.0...v0.5.0
