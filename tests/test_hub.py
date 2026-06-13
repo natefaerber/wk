@@ -83,3 +83,18 @@ def test_hub_workspaces_local_first(wk, monkeypatch):
     monkeypatch.setattr(wk, "all_workspaces", lambda: [local])
     monkeypatch.setattr(wk, "external_wk_sessions", lambda paths: [ext])
     assert [w.session for w in wk.hub_workspaces()] == ["here-main", "other-feat-y"]
+
+
+def test_preview_resolves_cross_repo_via_global_hub(wk, monkeypatch, capsys, tmp_path):
+    # The preview pane must resolve external (cross-repo) sessions too, or it
+    # prints "(no workspace for ...)" for them. So it uses hub_workspaces().
+    w = _ws(wk, branch="feat/x", session="other-feat-x", path=tmp_path)
+    monkeypatch.setattr(wk, "hub_workspaces", lambda: [w])
+    monkeypatch.setattr(
+        wk.subprocess, "run",
+        lambda *a, **k: subprocess.CompletedProcess(a[0] if a else [], 0, "", ""),
+    )
+    wk.preview("other-feat-x")
+    out = capsys.readouterr().out
+    assert "feat/x" in out
+    assert "no workspace for" not in out

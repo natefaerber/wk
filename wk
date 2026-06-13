@@ -3796,9 +3796,13 @@ def preview(session: str = typer.Argument(...)) -> None:
     Shows the task prompt (if any), recent commits, and `git status` for
     the worktree associated with SESSION. Designed to be invoked by fzf's
     --preview, so output is plain text + ANSI color (no Rich markup).
+
+    Uses the global hub set so it resolves cross-repo sessions too — matching
+    what the picker lists. (All the git below is keyed off the worktree path,
+    so it works regardless of which repo SESSION lives in.)
     """
     target = next(
-        (w for w in all_workspaces() if w.session == session),
+        (w for w in hub_workspaces() if w.session == session),
         None,
     )
     if target is None:
