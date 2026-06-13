@@ -12,7 +12,7 @@ wk — a tmux-based workspace manager modeled on Conductor / Superset.
 Each workspace is:
   - a git worktree on its own branch
   - a tmux session of the same name
-  - a 5-pane layout: (sidebar over shell) | Claude Code | (lazygit over terminal)
+  - a multi-column layout: sidebar | Claude Code | terminal (lazygit on demand)
 """
 
 from __future__ import annotations
@@ -72,6 +72,61 @@ def _main(
 def version() -> None:
     """Print the wk version (same as `wk --version`)."""
     console.print(f"wk {__version__}")
+
+
+@app.command()
+def doctor() -> None:
+    """Check that wk's dependencies and tmux bindings are installed.
+
+    A mise/binary-only install gets the `wk` CLI but not the tmux config, so
+    the documented keystrokes (`prefix W`, `prefix M-g`, …) silently do
+    nothing. This reports what's present, points at what's missing, and exits
+    non-zero if a required tool is absent.
+    """
+    console.print(f"[bold]wk {__version__}[/bold]")
+    missing_required = False
+
+    def _tool(name: str, required: bool, note: str = "") -> None:
+        nonlocal missing_required
+        ok = shutil.which(name) is not None
+        if ok:
+            glyph, tag = "[green]✓[/green]", ""
+        elif required:
+            glyph, tag, missing_required = "[red]✗[/red]", " [red](required)[/red]", True
+        else:
+            glyph, tag = "[yellow]○[/yellow]", " [dim](optional)[/dim]"
+        suffix = f" [dim]— {note}[/dim]" if (note and not ok) else ""
+        console.print(f"  {glyph} {name}{tag}{suffix}")
+
+    console.print("[dim]tools[/dim]")
+    _tool("git", True)
+    _tool("tmux", True)
+    _tool("fzf", True)
+    _tool("lazygit", False, "the `prefix M-g` git popup")
+    _tool("fish", False)
+    _tool("uv", True)
+
+    console.print("[dim]tmux config[/dim]")
+    loaded = ""
+    if shutil.which("tmux"):
+        loaded = run(
+            ["tmux", "show-options", "-gv", "@wk-conf-loaded"], check=False
+        ).stdout.strip()
+    if loaded == "1":
+        console.print("  [green]✓[/green] wk.conf bindings loaded (prefix W, M-g, …)")
+    else:
+        console.print("  [yellow]○[/yellow] wk.conf not loaded — keystrokes won't work")
+        console.print(
+            "    [dim]→ clone the repo and run ./install.sh, or source wk.conf "
+            "from your tmux.conf[/dim]"
+        )
+        console.print(
+            "    [dim]  (a mise/binary-only install ships the CLI, not the "
+            "tmux bindings)[/dim]"
+        )
+
+    if missing_required:
+        raise typer.Exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -326,6 +381,14 @@ GLYPH_CURRENT = "▶"
 GLYPH_RUNNING = "●"
 GLYPH_IDLE = "·"
 GLYPH_DIRTY = "✱"
+GLYPH_DONE = "✓"
+
+
+def task_done(w: "Workspace") -> bool:
+    """True if W is a finished `--auto` task — the `.wk/done` sentinel exists.
+    Only `--auto` task workspaces ever write it, so the file's presence alone
+    identifies a done task (no tmux call needed)."""
+    return (w.path / WK_MARKER_DIR / _TASK_DONE_MARKER).exists()
 
 
 def current_session() -> str:
@@ -347,7 +410,12 @@ def session_marker(w: "Workspace", current: str = "", *, rich: bool = True) -> s
 
     rich=True wraps it in Rich color tags (for console surfaces);
     rich=False returns the bare glyph (for fzf/ANSI surfaces).
+
+    A finished `--auto` task shows ✓ regardless of session state — "this task
+    is done, ready to merge" is the signal that matters most for it.
     """
+    if task_done(w):
+        return f"[green]{GLYPH_DONE}[/green]" if rich else GLYPH_DONE
     if w.session == current:
         return f"[green]{GLYPH_CURRENT}[/green]" if rich else GLYPH_CURRENT
     if w.has_session:
@@ -568,41 +636,19 @@ These environment variables are set on every pane of the session:
 
 ## Layout
 
-The wk session has 5 panes:
+The wk session is 3 full-height columns (the `wide` layout):
 
-  ┌──────────┬──────────────────────────┬──────────────────┐
-  │ sidebar  │                          │   lazygit        │
-  │ pane.1   │   agent (you)            │   pane.4         │
-  ├──────────┤   pane.2 (visual idx 3)  ├──────────────────┤
-  │ shell    │                          │   terminal       │
-  │ pane.4   │                          │   pane.5         │
-  └──────────┴──────────────────────────┴──────────────────┘
+  ┌──────────┬──────────────────────────┬──────────────┐
+  │ sidebar  │   agent (you)            │   terminal   │
+  │ pane.1   │   pane.2                 │   pane.3     │
+  └──────────┴──────────────────────────┴──────────────┘
 
-## Keep the lazygit pane following you
+On a narrow display the `laptop` layout is used instead: 2 columns, with
+the sidebar stacked over a terminal on the left and you on the right.
 
-The lazygit pane in the user's tmux layout is pointed at this worktree
-by default. Whenever you shift your working context to a different
-directory or repository, retarget it so the user's git UI follows along.
-Don't make them notice the mismatch and fix it themselves.
-
-**Run `wk lg-cd <path>` whenever:**
-
-- You create a new worktree with `git worktree add <path> <branch>` — the
-  user will want to see THAT worktree in lazygit, not the one wk started in.
-- You `cd` into a subrepo, submodule, or sibling repository to work there.
-- You create or clone a fresh repo for the user during the session.
-- You're about to do git operations (commit, rebase, push) in a directory
-  other than the one wk started in.
-
-The path arg is required for the lazygit pane to actually move to a new
-location — `wk lg-cd` with no arg follows the *active pane's* cwd, which
-is fine when called from a shell but isn't useful when you (the agent)
-are creating a new directory and want lazygit to jump there.
-
-```sh
-# After: git worktree add ../sibling-repo.worktrees/fix-thing fix-thing
-wk lg-cd ../sibling-repo.worktrees/fix-thing
-```
+There is no always-on lazygit pane. The user summons lazygit full-screen
+with `prefix M-g`; it opens at the active pane's cwd, so it already follows
+wherever you're working — you don't manage it.
 
 ## Useful wk commands
 
@@ -625,19 +671,17 @@ Lifecycle (when the user asks you to do something with a workspace):
 - `wk rm [branch]` — full destruction: kill session, remove worktree,
   delete branch. Default: current session (user binding is `prefix D`).
 
-Lazygit:
-
-- `wk lg-cd <path>` — retarget the lazygit pane at a directory. See the
-  "Keep the lazygit pane following you" section above for when to call.
-
 Parallel work (only from an orchestrator workspace — see ORCHESTRATOR.md):
 
 - `wk task <prompt>` — spawn another wk workspace on a new branch.
 - `wk task-status [branch]` — running / done / failed for task workspaces.
 - `wk task-output <branch> [--tail N] [--follow]` — read a task's
   `.wk/output.md` (the `--auto` Claude's stdout).
-- `wk task-merge <branch> [--squash]` — merge a finished task branch
-  back into the current workspace's branch.
+- `wk task-merge <branch> [--squash] [--rm] [--into <orch>]` — merge a
+  finished task branch back into the orchestrator's branch. `--rm` tears
+  the task workspace down after a clean merge; `--into` targets an
+  orchestrator other than the current session. A finished `--auto` task
+  shows ✓ in the sidebar and messages the orchestrator when it's done.
 - `wk task-cancel <branch>` — stop a running task's agent (kill its
   session), keeping the worktree and partial output.
 - `wk task-retry <branch>` — re-run a task's agent against its existing
@@ -702,8 +746,11 @@ directions), you should:
    ```
    wk task-merge <task-branch>          # --no-ff merge commit
    wk task-merge <task-branch> --squash # squash into one commit
+   wk task-merge <task-branch> --rm     # merge, then tear the task down
    ```
    The merge happens in *this* worktree, against the current branch.
+   `--rm` folds the clean-up step (6) into the merge: it removes the
+   task's worktree and, when the branch is ancestor-merged, deletes it.
 6. **Clean up** — after a task is merged, the child workspace is no
    longer needed. Either `wk close <task-branch>` (kill the session but
    keep the worktree on disk, in case you want to revisit) or
@@ -713,12 +760,6 @@ directions), you should:
 
 ## Rules
 
-- **Keep lazygit pointed at this orchestrator.** When you spawn child
-  workspaces with `wk task`, those get their own tmux sessions and their
-  own lazygit panes. *Your* lazygit pane should stay focused on this
-  orchestrator's worktree — that's where merges happen. Don't `wk lg-cd`
-  to a child's path unless you specifically want to inspect its diff
-  visually, and `wk lg-cd` back to `$WK_PATH` when you're done.
 - **Don't recurse.** Never run `wk task` from inside a child workspace.
   If a worker needs sub-tasks, surface that back to the user — let them
   decide whether to split further from the orchestrator.
@@ -843,6 +884,15 @@ def in_tmux() -> bool:
     return "TMUX" in os.environ
 
 
+def in_git_repo() -> bool:
+    """True if the cwd is inside a git work tree, without raising the way
+    `repo_root()` does. Lets commands tell "not in a repo" apart from "in a
+    repo with nothing to show" — the resilience fallbacks return [] for both."""
+    return run(
+        ["git", "rev-parse", "--is-inside-work-tree"], check=False
+    ).stdout.strip() == "true"
+
+
 def attach_or_switch(session: str) -> None:
     """Attach if outside tmux, switch-client if inside."""
     if in_tmux():
@@ -873,18 +923,16 @@ def _shell_wrap(cmd: str) -> list[str]:
 # them proportionally when a client attaches. So these are the ratios that
 # look right, expressed in the cols / height-percent that tmux splits take.
 #
-# WIDE — the 5-pane widescreen layout (sidebar|agent|lazygit + shell/term).
-# Tuned for ~290-col windows (UWQHD 3440px). Each number earns its value:
+# WIDE — 3-column widescreen layout: sidebar | agent | terminal, all full
+# height. Tuned for ~290-col windows (UWQHD 3440px). No lazygit pane (summon
+# it full-screen with `prefix M-g`) and no separate shell — the old layout's
+# always-on lazygit and its redundant second shell were dropped.
 WIDE_WINDOW_COLS = 290    # virtual width the detached session is built at
 WIDE_WINDOW_ROWS = 75     # virtual height (reshaped on attach)
-WIDE_LEFT_COL_COLS = 42   # sidebar+shell column — ~40 cols fits branch names
-                          # and `git status -sb` lines without wrapping
-WIDE_RIGHT_COL_COLS = 75  # lazygit+terminal column — lazygit's files+diff
-                          # panes need ~70 cols to be readable
-WIDE_SIDEBAR_PCT = 20     # sidebar's share of the left column height; the
-                          # workspace list is short, so the shell gets the rest
-WIDE_LAZYGIT_PCT = 60     # lazygit's share of the right column; its log/diff
-                          # view wants the larger share over the terminal
+WIDE_SIDEBAR_COLS = 42    # sidebar column — ~40 cols fits branch names and
+                          # `git status -sb` lines without wrapping
+WIDE_TERMINAL_COLS = 60   # right-hand terminal column; the agent takes the
+                          # whole middle remainder
 
 # LAPTOP — 2-column layout for narrow displays: left column is the sidebar
 # stacked over a terminal, right column is a full-height agent. No lazygit or
@@ -906,15 +954,13 @@ WK_DEFAULT_WIDE_COLS = 220
 class LayoutProfile:
     """A named pane layout: how to build it and how to rebalance it.
 
-    `name` is stored on the session as @wk-layout so `wk rebalance` and
-    `wk lg-cd` can tell which layout a running session was built with.
-    `build` finishes the layout from the initial sidebar pane; `rebalance`
-    resets the geometry of an already-attached window in place.
+    `name` is stored on the session as @wk-layout so `wk rebalance` knows
+    which geometry to reset to. `build` finishes the layout from the initial
+    sidebar pane; `rebalance` resets the geometry of an attached window.
     """
     name: str
     window_cols: int
     window_rows: int
-    has_lazygit: bool
     build: Callable[[str, Path, str, str], None]
     rebalance: Callable[[str], None]
 
@@ -934,64 +980,33 @@ LAZYGIT_CMD = (
 
 
 def _build_wide(session: str, wt: Path, sidebar_id: str, agent: str) -> None:
-    """Finish the 5-pane widescreen layout from an existing sidebar pane.
+    """Finish the 3-column widescreen layout from an existing sidebar pane:
+    sidebar | agent | terminal, all full height. Selects the agent so the user
+    lands there on attach. No lazygit pane (summon it with `prefix M-g`).
 
-    Sets @wk-lazygit-pane so `wk lg-cd` can find the lazygit pane later, and
-    selects the agent pane so the user lands there on attach.
-
-        ┌────────┬──────────────────┬──────────┐
-        │ sidebar│                  │ lazygit  │
-        ├────────┤      agent       ├──────────┤
-        │ shell  │                  │ terminal │
-        └────────┴──────────────────┴──────────┘
+        ┌────────┬──────────────────────┬──────────┐
+        │ sidebar│        agent         │ terminal │
+        └────────┴──────────────────────┴──────────┘
     """
-    # Agent. Split right of sidebar; new pane takes everything except the
-    # left column.
-    agent_width = WIDE_WINDOW_COLS - WIDE_LEFT_COL_COLS
+    # Agent — everything right of the sidebar column.
     agent_id = run(
         [
             "tmux", "split-window", "-h",
             "-t", sidebar_id,
             "-c", str(wt),
-            "-l", str(agent_width),
+            "-l", str(WIDE_WINDOW_COLS - WIDE_SIDEBAR_COLS),
             "-P", "-F", "#{pane_id}",
             agent,
         ]
     ).stdout.strip()
 
-    # Lazygit — right column, top. Split right of agent.
-    lazygit_id = run(
+    # Terminal — carve the right-hand column off the agent (default shell).
+    run(
         [
             "tmux", "split-window", "-h",
             "-t", agent_id,
             "-c", str(wt),
-            "-l", str(WIDE_RIGHT_COL_COLS),
-            "-P", "-F", "#{pane_id}",
-            *_shell_wrap(LAZYGIT_CMD),
-        ]
-    ).stdout.strip()
-
-    # Remember the lazygit pane id so `wk lg-cd` can retarget it later,
-    # even after the layout has been resized or rearranged.
-    run(["tmux", "set-option", "-t", session, "@wk-lazygit-pane", lazygit_id])
-
-    # Shell — left column, bottom. Split below sidebar.
-    run(
-        [
-            "tmux", "split-window", "-v",
-            "-t", sidebar_id,
-            "-c", str(wt),
-            "-l", f"{100 - WIDE_SIDEBAR_PCT}%",
-        ]
-    )
-
-    # Terminal — right column, bottom. Split below lazygit.
-    run(
-        [
-            "tmux", "split-window", "-v",
-            "-t", lazygit_id,
-            "-c", str(wt),
-            "-l", f"{100 - WIDE_LAZYGIT_PCT}%",
+            "-l", str(WIDE_TERMINAL_COLS),
         ]
     )
 
@@ -1009,8 +1024,7 @@ def _build_laptop(session: str, wt: Path, sidebar_id: str, agent: str) -> None:
         │ terminal│                             │
         └────────┴──────────────────────────────┘
 
-    No lazygit pane (so @wk-lazygit-pane is intentionally left unset) and no
-    separate shell pane — the left-bottom terminal covers both.
+    No separate shell pane — the left-bottom terminal covers both.
     """
     # Agent — the entire right column. Split right of sidebar; it takes
     # everything except the left column.
@@ -1043,16 +1057,14 @@ def _build_laptop(session: str, wt: Path, sidebar_id: str, agent: str) -> None:
 def _rebalance_wide(session: str) -> None:
     """Reset the widescreen geometry on SESSION's active window.
 
-    Targets panes by visual index, which is safe here: rebalance only runs
-    on a fully-built, stable wk layout (tmux only renumbers indices while
-    splits are happening). Visual order: 1=sidebar, 2=shell, 3=agent,
-    4=lazygit, 5=terminal. The `session:.N` form pins the target to SESSION
-    rather than the attached client's current session.
+    Targets panes by visual index, safe here because rebalance only runs on a
+    fully-built, stable layout (tmux renumbers indices only while splitting).
+    Visual order: 1=sidebar, 2=agent, 3=terminal — all full height, so only
+    widths are set. `session:.N` pins the target to SESSION, not the attached
+    client's current session.
     """
-    run(["tmux", "resize-pane", "-t", f"{session}:.1", "-x", str(WIDE_LEFT_COL_COLS)], check=False)
-    run(["tmux", "resize-pane", "-t", f"{session}:.4", "-x", str(WIDE_RIGHT_COL_COLS)], check=False)
-    run(["tmux", "resize-pane", "-t", f"{session}:.1", "-y", f"{WIDE_SIDEBAR_PCT}%"], check=False)
-    run(["tmux", "resize-pane", "-t", f"{session}:.4", "-y", f"{WIDE_LAZYGIT_PCT}%"], check=False)
+    run(["tmux", "resize-pane", "-t", f"{session}:.1", "-x", str(WIDE_SIDEBAR_COLS)], check=False)
+    run(["tmux", "resize-pane", "-t", f"{session}:.3", "-x", str(WIDE_TERMINAL_COLS)], check=False)
 
 
 def _rebalance_laptop(session: str) -> None:
@@ -1066,11 +1078,11 @@ def _rebalance_laptop(session: str) -> None:
 LAYOUTS: dict[str, LayoutProfile] = {
     "wide": LayoutProfile(
         name="wide", window_cols=WIDE_WINDOW_COLS, window_rows=WIDE_WINDOW_ROWS,
-        has_lazygit=True, build=_build_wide, rebalance=_rebalance_wide,
+        build=_build_wide, rebalance=_rebalance_wide,
     ),
     "laptop": LayoutProfile(
         name="laptop", window_cols=LAPTOP_WINDOW_COLS, window_rows=LAPTOP_WINDOW_ROWS,
-        has_lazygit=False, build=_build_laptop, rebalance=_rebalance_laptop,
+        build=_build_laptop, rebalance=_rebalance_laptop,
     ),
 }
 # Accepted aliases for the user-facing layout name (env / flag / @wk-layout).
@@ -1144,16 +1156,15 @@ def build_session(
     """Create a detached session with the wk pane layout.
 
     LAYOUT picks the profile ("wide" / "laptop"); None auto-selects by the
-    attach display's width (see `resolve_profile`). The widescreen layout is
-    5 panes, the laptop layout is 2 columns — both build the sidebar first,
-    then `profile.build` finishes the rest:
+    attach display's width (see `resolve_profile`). Both build the sidebar
+    first, then `profile.build` finishes the rest (lazygit is summoned on
+    demand with `prefix M-g`, not a pane):
 
         wide (1-indexed panes)            laptop
         ┌────────┬──────────┬─────────┐   ┌────────┬─────────────────┐
-        │ sidebar│          │ lazygit │   │ sidebar│                 │
-        │ pane.1 │  agent   │ pane.4  │   ├────────┤      agent      │
-        │ shell  │  pane.3  │ terminal│   │terminal│                 │
-        │ pane.2 │          │ pane.5  │   │        │                 │
+        │ sidebar│          │         │   │ sidebar│                 │
+        │ pane.1 │  agent   │terminal │   ├────────┤      agent      │
+        │        │  pane.2  │ pane.3  │   │terminal│                 │
         └────────┴──────────┴─────────┘   └────────┴─────────────────┘
     """
     wk = _wk_bin()
@@ -1206,7 +1217,7 @@ def build_session(
         run(["tmux", "set-option", "-t", session, "@wk-branch", real_branch])
         run(["tmux", "set-option", "-t", session, "@wk-path", str(wt)])
         # Record which layout this session was built with, so `wk rebalance`
-        # and `wk lg-cd` can behave correctly (e.g. laptop has no lazygit).
+        # so `wk rebalance` knows which geometry to reset to.
         run(["tmux", "set-option", "-t", session, "@wk-layout", profile.name])
 
         profile.build(session, wt, sidebar_id, agent)
@@ -2065,7 +2076,7 @@ def adopt(
     path from a branch name and creates it if missing. `adopt` goes the
     other way: you already have a checkout on disk — a plain clone, a
     `git worktree add` you made by hand, or the main repo itself — and you
-    just want wk's 5-pane session, env vars, and `.wk/` marker wrapped
+    just want wk's multi-pane session, env vars, and `.wk/` marker wrapped
     around it, without moving or recreating anything.
 
     The directory must be inside a git work tree; the workspace is anchored
@@ -2124,6 +2135,14 @@ def adopt(
 _AUTO_TASK_CMD = (
     "claude -p \"$(cat .wk/task.md)\" 2>&1 | tee .wk/output.md; "
     "touch .wk/done; "
+    # Report back to the orchestrator that spawned us, if any. @wk-task-orch is
+    # set on this session by `wk task`; reading it at completion (not spawn)
+    # avoids the set-option race. display-message surfaces in the orchestrator's
+    # status line; the sidebar's ✓ glyph is the persistent signal. No daemon.
+    'orch=$(tmux show-options -qv @wk-task-orch 2>/dev/null); '
+    '[ -n "$orch" ] && tmux display-message -t "$orch" '
+    '"wk: task ${WK_BRANCH:-?} done — wk task-merge ${WK_BRANCH:-} --rm" '
+    '2>/dev/null; '
     "echo; echo '── task complete ── press any key to close ──'; "
     "read -n 1"
 )
@@ -2224,6 +2243,12 @@ def task(
     # Tag the session as a task workspace so the sidebar can mark it.
     run(["tmux", "set-option", "-t", session, "@wk-task", "1"])
     run(["tmux", "set-option", "-t", session, "@wk-task-prompt", prompt.strip()[:200]])
+    # Record who spawned us so the auto-task command can report completion back.
+    # Captured from the current session (the orchestrator); empty when `wk task`
+    # is run outside a wk session, in which case the child stays silent.
+    orch_session = current_session()
+    if orch_session:
+        run(["tmux", "set-option", "-t", session, "@wk-task-orch", orch_session])
 
     console.print(f"[green]✓[/green] task workspace [bold]{branch}[/bold] ready")
     console.print(f"  [dim]task file: {task_file}[/dim]")
@@ -2456,23 +2481,48 @@ def task_merge(
         False, "--no-commit",
         help="Merge but don't commit (lets you inspect before finalizing).",
     ),
+    into: Optional[str] = typer.Option(
+        None, "--into",
+        help="Orchestrator workspace to merge into (branch / session / slug). "
+             "Default: the current tmux session. Pass this to merge from "
+             "outside the orchestrator session (e.g. headless).",
+    ),
+    rm: bool = typer.Option(
+        False, "--rm",
+        help="After a successful merge, tear down the task workspace "
+             "(worktree + session). The branch is deleted only if it's "
+             "ancestor-merged into the orchestrator branch.",
+    ),
 ) -> None:
-    """Merge a task branch into the *current* wk workspace's branch.
+    """Merge a task branch into an orchestrator workspace's branch.
 
-    Run from inside the orchestrator's tmux session. The merge happens in
-    that worktree, against its current branch. Errors if either side has
-    uncommitted changes or the task workspace has unsaved work.
+    Defaults to the *current* wk session as the orchestrator; pass `--into`
+    to target another (which also lets you run this from outside any session).
+    The merge happens in the orchestrator's worktree, against its branch.
+    Errors if either side has uncommitted changes. With `--rm`, the merged
+    task workspace is torn down in one step.
     """
     require("git")
-    if not in_tmux():
-        die("run from inside a wk session (the orchestrator workspace)")
-    r = run(["tmux", "display-message", "-p", "#S"], check=False)
-    orch_session = r.stdout.strip()
     workspaces = all_workspaces()
-    orch = next((w for w in workspaces if w.session == orch_session), None)
-    if orch is None:
-        die("current tmux session isn't a wk workspace",
-            hint="`wk relayout` converts the current session into one")
+    # Resolve the orchestrator: an explicit --into target, else the current
+    # session. Resolving by query (not bare #S) is what lets `--into` be fired
+    # from anywhere — the deferred merge-when-done latch and agent callers need
+    # this, and it sidesteps the "#S is the child, not the orchestrator" bug.
+    if into:
+        orch = require_workspace(into, workspaces)
+    else:
+        if not in_tmux():
+            die("run from inside a wk session (the orchestrator workspace)",
+                hint="or pass `--into <orchestrator>` to target one explicitly")
+        orch_session = run(["tmux", "display-message", "-p", "#S"]).stdout.strip()
+        orch = next((w for w in workspaces if w.session == orch_session), None)
+        if orch is None:
+            die("current tmux session isn't a wk workspace",
+                hint="`wk relayout` converts the current session into one, "
+                     "or pass `--into <orchestrator>`")
+    if rm and (squash or no_commit):
+        die("--rm needs a finalized merge; it can't combine with "
+            "--squash or --no-commit")
     task = require_workspace(branch, workspaces)
     if task.session == orch.session:
         die("can't merge a workspace into itself")
@@ -2512,6 +2562,32 @@ def task_merge(
         console.print(
             f"[dim]squashed — commit manually in {orch.path}[/dim]"
         )
+
+    if rm:
+        # Tear down the merged task. Delete the branch only if it's genuinely
+        # ancestor-merged into the orchestrator branch — checking against the
+        # orchestrator branch specifically, not the main checkout's HEAD (which
+        # `wk rm`'s plain `-d` would, and wrongly refuse). When confirmed merged,
+        # the force delete is safe; otherwise keep the branch and only drop the
+        # worktree, so no committed-but-unmerged work is ever silently lost.
+        main = repo_root()
+        merged = run(
+            ["git", "-C", str(main), "branch", "--merged", orch.branch,
+             "--format=%(refname:short)"],
+            check=False,
+        )
+        is_merged = task.branch in merged.stdout.split()
+        _do_rm(task, main, force=is_merged, keep_branch=not is_merged)
+        if is_merged:
+            console.print(
+                f"[green]✓[/green] removed task workspace [bold]{task.branch}[/bold]"
+            )
+        else:
+            console.print(
+                f"[yellow]warning:[/yellow] removed worktree but kept branch "
+                f"[bold]{task.branch}[/bold] (not ancestor-merged into "
+                f"{orch.branch})"
+            )
 
 
 @app.command("task-cancel")
@@ -2656,7 +2732,7 @@ def restore(
 ) -> None:
     """Rebuild tmux session(s) for existing worktree(s).
 
-    Use after a reboot or `tmux kill-server` to re-create the 5-pane layout
+    Use after a reboot or `tmux kill-server` to re-create the wk layout
     on top of worktrees that still exist on disk. No git operations; the
     branch must already have a worktree.
 
@@ -2851,7 +2927,7 @@ def _relayout_detached(
     # `_rm-detached`. (repo_root() resolves from the worktree we're relaying out.)
     try:
         # Mark the worktree and tag the session so subsequent wk commands
-        # (sidebar, lg-cd, switch, etc.) recognize it.
+        # (sidebar, switch, etc.) recognize it.
         mark_wk_workspace(wt_path, branch=branch)
         run(["tmux", "set-option", "-t", session, "@wk", "1"])
         run(["tmux", "set-option", "-t", session, "@wk-branch", branch])
@@ -2904,13 +2980,18 @@ def rebalance() -> None:
     require("tmux")
     if not in_tmux():
         die("not inside tmux; run `wk rebalance` from within a wk session")
-    r = run(["tmux", "display-message", "-p", "#S"], check=False)
-    session = r.stdout.strip()
+    session = run(["tmux", "display-message", "-p", "#S"]).stdout.strip()
+    # Refuse on a non-wk session: M-w fires globally, and resizing a plain
+    # tmux session's panes to wk's column widths would mangle it.
+    is_wk = run(
+        ["tmux", "show-options", "-v", "-t", session, "@wk"], check=False
+    ).stdout.strip()
+    if is_wk != "1":
+        die(f"{session!r} isn't a wk session; nothing to rebalance",
+            hint="run `wk rebalance` from inside a wk workspace")
     name = run(
         ["tmux", "show-options", "-v", "-t", session, "@wk-layout"], check=False
     ).stdout.strip()
-    # Sessions built before @wk-layout existed (or non-wk windows) default to
-    # the widescreen geometry, matching the historical M-w behavior.
     profile = LAYOUTS.get(name, LAYOUTS["wide"])
     profile.rebalance(session)
 
@@ -3006,9 +3087,15 @@ def list_cmd() -> None:
     `wk dashboard` for the same table on an auto-refreshing clock.
     """
     require("git")
+    # Distinguish "not in a repo" from "repo has no workspaces": all_workspaces()
+    # returns [] for both (git failures are swallowed for resilience), so a bare
+    # "no workspaces" outside a repo reads as a false negative.
+    if not in_git_repo():
+        die("not inside a git repository",
+            hint="cd into a repo to see its wk workspaces")
     workspaces = all_workspaces()
     if not workspaces:
-        console.print("[dim]no workspaces[/dim]")
+        console.print("[dim]no workspaces[/dim] [dim](wk new <branch> to create one)[/dim]")
         return
     console.print(workspace_table(workspaces, current_session()))
 
@@ -3020,15 +3107,43 @@ def switch(
     """Switch to an existing workspace's tmux session.
 
     With BRANCH, jumps straight to that workspace (accepts the branch, its
-    session-form slug, or the full session name). With no argument, opens an
-    fzf picker over all workspaces with a live preview (task, recent commits,
-    git status). Attaches when run outside tmux, switches the client when
-    inside. Only moves between *existing* workspaces — use `wk open` to create
-    or rebuild one, or `wk cycle` to alt-tab between running sessions.
+    session-form slug, or the full session name). With no argument, opens the
+    fzf hub over all workspaces AND running tasks, with a live preview (task,
+    recent commits, git status) and single-key actions: enter=switch,
+    ctrl-n=new, ctrl-d=rm, ctrl-x=cancel a task, ctrl-r=refresh. A finished
+    `--auto` task shows ✓. Attaches when run outside tmux, switches the client
+    when inside.
+
+    The hub does the *non-blocking* verbs in place; reading a task's live
+    output or merging it are deliberately not bound here (they block or are
+    interactive) — switch into the task and use `wk task-output`/`task-merge`,
+    or the `--rm` flag. Auto-refresh is the passive sidebar's job; the hub
+    refreshes on demand (ctrl-r) to stay free of a background timer.
     """
     require("tmux")
     workspaces = all_workspaces()
     if not workspaces:
+        # First-run dead-end: a new user's first `prefix W` lands here. When
+        # we're interactive (a tty, e.g. inside the popup), offer to create one
+        # inline instead of just erroring. Headless callers (piped, or
+        # `wk switch <branch>`) keep the non-zero die so scripts see the failure.
+        if branch is None and sys.stdin.isatty():
+            # We got here, so all_workspaces() succeeded — we're in a repo.
+            # Name it (and the base) so it's clear WHERE the branch will land.
+            repo = repo_root()
+            console.print(
+                f"No wk workspaces in [bold]{repo.name}[/bold] "
+                f"[dim]({repo})[/dim] yet — let's make your first one."
+            )
+            name = typer.prompt(
+                f"new branch in {repo.name} off {DEFAULT_BASE} (empty to cancel)",
+                default="", show_default=False,
+            ).strip()
+            if not name:
+                console.print("[dim](cancelled)[/dim]")
+                raise typer.Exit(0)
+            open_ref(name, DEFAULT_BASE, no_attach=False, no_fetch=False)
+            return
         die("no workspaces to switch to", hint="`wk new <branch>` creates one")
 
     target: Optional[Workspace] = None
@@ -3053,7 +3168,8 @@ def switch(
                 "--no-info",
                 "--no-scrollbar",
                 "--prompt=workspace❯ ",
-                "--header=enter=switch  j/k=move  /=filter  ctrl-n=new  ctrl-d=rm",
+                "--header=enter=switch  ctrl-n=new  ctrl-d=rm  ctrl-x=cancel  ctrl-r=refresh  /=filter\n"
+                "✓ task done   ● running   · idle   ✱ dirty",
                 "--reverse",
                 "--height=100%",
                 "--cycle",
@@ -3076,6 +3192,12 @@ def switch(
                 # is preserved here too.
                 f"--bind=ctrl-n:execute(tmux command-prompt -p 'new branch:' 'run-shell \"{wk} new %%\"')+abort",
                 f"--bind=ctrl-d:execute({wk} rm {{1}})+reload({wk} _list-once)",
+                # ctrl-x cancels a task (kills its session, keeps the worktree +
+                # output — non-destructive, recoverable via task-retry). ctrl-r
+                # refreshes the list on demand (no background timer; the sidebar
+                # is the always-on auto-refreshing view).
+                f"--bind=ctrl-x:execute({wk} task-cancel {{1}})+reload({wk} _list-once)",
+                f"--bind=ctrl-r:reload({wk} _list-once)",
             ],
             input="\n".join(lines),
             text=True,
@@ -3365,7 +3487,7 @@ def _rm_detached(
         raise
 
 
-# --- paths & panes: cd / lg-cd ---
+# --- paths: cd ---
 @app.command()
 def cd(
     branch: Optional[str] = typer.Argument(
@@ -3399,17 +3521,6 @@ def cd(
                 print(w.path)
                 return
         die(f"no workspace for {branch!r}", hint="`wk list` shows every workspace")
-
-
-def _active_pane_cwd() -> Optional[str]:
-    """The cwd of the currently focused tmux pane (None if not inside tmux)."""
-    if not in_tmux():
-        return None
-    r = run(
-        ["tmux", "display-message", "-p", "#{pane_current_path}"],
-        check=False,
-    )
-    return r.stdout.strip() or None
 
 
 def _pick_branch() -> Optional[str]:
@@ -3519,181 +3630,6 @@ def _pick_branch() -> Optional[str]:
     if proc.returncode != 0 or not proc.stdout.strip():
         return None
     return proc.stdout.strip().split("\t", 1)[0]
-
-
-def _pick_zoxide() -> Optional[Path]:
-    """Open zoxide's fzf-based jump list. Returns the selected dir, or None."""
-    if shutil.which("zoxide") is None:
-        die("zoxide not installed (https://github.com/ajeetdsouza/zoxide)")
-    # `zoxide query -i` opens fzf over the frecency database. fzf does its UI
-    # on the tty, prints the chosen path to stdout. capture_output=True is
-    # safe — fzf reads/writes /dev/tty directly for the UI.
-    r = run(["zoxide", "query", "-i"], check=False)
-    if r.returncode != 0 or not r.stdout.strip():
-        return None
-    return Path(r.stdout.strip()).expanduser().resolve()
-
-
-def _pick_fd(starting_dir: Path) -> Optional[Path]:
-    """Filesystem-explore picker built on `fd | fzf`. Lists directories
-    rooted at STARTING_DIR (skipping the usual noise: .git, node_modules,
-    build dirs) and lets the user fuzzy-pick one. Returns the selected
-    absolute path, or None on cancel.
-
-    Faster and more predictable than a TUI file manager: no terminal probes,
-    no config schema gotchas. fzf does the UI on /dev/tty, fd pipes paths.
-    """
-    if shutil.which("fd") is None:
-        die("fd not installed (https://github.com/sharkdp/fd)")
-    if shutil.which("fzf") is None:
-        die("fzf not installed")
-
-    fd_cmd = [
-        "fd", "--type", "d",
-        "--hidden",
-        "--max-depth", "8",
-        "--exclude", ".git",
-        "--exclude", "node_modules",
-        "--exclude", ".venv",
-        "--exclude", "venv",
-        "--exclude", "target",
-        "--exclude", "build",
-        "--exclude", "dist",
-        "--exclude", ".next",
-        "--exclude", ".cache",
-        ".",
-        str(starting_dir),
-    ]
-    fd_proc = subprocess.Popen(fd_cmd, stdout=subprocess.PIPE, text=True)
-    try:
-        fzf_proc = subprocess.run(
-            [
-                "fzf",
-                "--prompt=dir❯ ",
-                "--reverse",
-                "--height=100%",
-                "--no-info",
-                "--cycle",
-                "--header", f"pick a directory  (root: {starting_dir})",
-            ],
-            stdin=fd_proc.stdout,
-            capture_output=True,
-            text=True,
-        )
-    finally:
-        if fd_proc.stdout:
-            fd_proc.stdout.close()
-        fd_proc.wait()
-
-    if fzf_proc.returncode != 0 or not fzf_proc.stdout.strip():
-        return None
-    return Path(fzf_proc.stdout.strip()).expanduser().resolve()
-
-
-@app.command("lg-cd")
-def lg_cd(
-    path: Optional[str] = typer.Argument(
-        None,
-        help="Directory to point lazygit at. Defaults to the active pane's cwd.",
-    ),
-    pick: Optional[str] = typer.Option(
-        None, "--pick", "-p",
-        help="Pop a picker instead of taking PATH. 'zoxide' = frecency jump list, "
-             "'fd' = fuzzy-pick a directory under the current root via fd+fzf.",
-    ),
-    session: Optional[str] = typer.Option(
-        None, "--session", "-s",
-        help="Target session. Defaults to the current tmux session.",
-    ),
-) -> None:
-    """Retarget the lazygit pane to PATH (default: active pane's cwd).
-
-    Useful when you're working in a subrepo, submodule, or sibling repo and
-    want lazygit to follow you there. Safe to call from anywhere (the agent
-    pane, a shell, or `claude` via Bash) — looks up the lazygit pane by id
-    that `build_session` stored as @wk-lazygit-pane.
-    """
-    require("tmux")
-
-    # Resolve target dir. Priority: explicit path > interactive picker >
-    # active pane's cwd > process cwd.
-    if pick:
-        if path:
-            die("pass either PATH or --pick, not both")
-        if pick == "zoxide":
-            target = _pick_zoxide()
-        elif pick == "fd":
-            start = Path(_active_pane_cwd() or os.getcwd()).resolve()
-            target = _pick_fd(start)
-        else:
-            die(f"unknown picker {pick!r}; expected 'zoxide' or 'fd'")
-        if target is None:
-            console.print("[dim](cancelled)[/dim]")
-            return
-    elif path:
-        target = Path(path).expanduser().resolve()
-    elif in_tmux():
-        target = Path(_active_pane_cwd() or os.getcwd()).resolve()
-    else:
-        target = Path.cwd().resolve()
-    if not target.is_dir():
-        die(f"not a directory: {target}")
-
-    # Resolve target session.
-    sess = session
-    if sess is None and in_tmux():
-        r = run(["tmux", "display-message", "-p", "#S"], check=False)
-        sess = r.stdout.strip()
-    if not sess:
-        die("specify --session or run inside a tmux session")
-
-    # Look up the lazygit pane id stored at build time.
-    r = run(
-        ["tmux", "show-options", "-v", "-t", sess, "@wk-lazygit-pane"],
-        check=False,
-    )
-    pane_id = r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
-    if not pane_id:
-        # Pre-marker sessions don't have @wk-lazygit-pane stored. Find the pane
-        # actually running lazygit instead of guessing a visual index like
-        # `work.4` — tmux renumbers indices on every split, so a stale guess can
-        # land on the shell/terminal pane, and `respawn-pane -k` would then
-        # force-kill it (destroying that pane's process).
-        lp = run(
-            ["tmux", "list-panes", "-t", sess, "-F",
-             "#{pane_id} #{pane_current_command}"],
-            check=False,
-        )
-        for line in lp.stdout.splitlines():
-            pid, _, cmd = line.partition(" ")
-            if cmd.strip() == "lazygit":
-                pane_id = pid
-                break
-    if not pane_id:
-        # The laptop layout has no lazygit pane by design — say so rather than
-        # suggesting a reopen that wouldn't add one.
-        layout_name = run(
-            ["tmux", "show-options", "-v", "-t", sess, "@wk-layout"], check=False
-        ).stdout.strip()
-        if layout_name == "laptop":
-            die(
-                f"session {sess!r} uses the laptop layout, which has no lazygit pane",
-                hint="`wk relayout --layout wide` to switch to the 5-pane layout",
-            )
-        die(
-            f"no lazygit pane found in session {sess!r}",
-            hint="reopen the workspace with `wk open` so wk can track its lazygit pane",
-        )
-
-    run(
-        [
-            "tmux", "respawn-pane", "-k",
-            "-t", pane_id,
-            "-c", str(target),
-            *_shell_wrap(LAZYGIT_CMD),
-        ]
-    )
-    console.print(f"[green]✓[/green] lazygit → [dim]{target}[/dim]")
 
 
 # --- passive views: sidebar / dashboard (+ internal renderers) ---

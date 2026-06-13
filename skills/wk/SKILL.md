@@ -54,7 +54,7 @@ is the fastest). Don't flail on `command not found`.
 | "kill / clean up this workspace" | `wk close` (keep worktree) or `wk rm` (full destroy) |
 | "rebuild the tmux layout for `<branch>`" | `wk restore <branch>` |
 | "where's the worktree for `<branch>`?" | `wk cd <branch>` (prints path) |
-| "point lazygit at this dir" | `wk lg-cd` (current pane's cwd) |
+| "merge a finished task back" | `wk task-merge <branch> --rm` (merge + tear down) |
 
 `wk open` is the forgiving default — it creates the branch, fetches from origin,
 adds the worktree, builds the session, or just attaches, depending on what
@@ -134,8 +134,9 @@ to die mid-command.
 - **Don't `tmux kill-session` a wk workspace directly** — `wk close`/`wk rm`
   do the right thing with the marker dir and branch ref.
 - **Don't manually `git worktree remove`** for the same reason.
-- **Lazygit pane retargeting**: `wk lg-cd <path>` respawns the lazygit pane
-  with a new cwd. Don't try to `cd` inside lazygit — it doesn't take.
+- **Lazygit is on demand, not a pane**: the user summons it full-screen with
+  `prefix M-g` (it opens at the active pane's cwd). There's no lazygit pane to
+  manage.
 - **Slug vs canonical in paths**: worktree directories use slug form
   (`release-v35`), but `git branch --show-current` returns canonical
   (`release/v35`). Trust `WK_BRANCH` when both are available.

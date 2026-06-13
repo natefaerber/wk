@@ -9,8 +9,8 @@
 ## What this is
 
 `wk` is a tmux-based workspace manager: every workspace is one git
-worktree + one tmux session of the same name, in a 5-pane layout
-(sidebar | agent | lazygit | shell | terminal). It's a single-file Python
+worktree + one tmux session of the same name, in a multi-column layout
+(sidebar | agent | terminal; lazygit on demand). It's a single-file Python
 CLI built on Typer + Rich, with a thin tmux.conf binding layer.
 
 Designed to work alongside [sesh](https://github.com/joshmedeski/sesh) —
@@ -86,17 +86,18 @@ A wk workspace is the triple of:
 The layout is built by `build_session()`, which picks a `LayoutProfile`
 (via `resolve_profile()`) and delegates the splits to `profile.build`.
 Two profiles live in the `LAYOUTS` registry:
-- **wide** (`_build_wide`) — the 5-pane widescreen layout. Visual pane
-  indices (after tmux's tree-traversal renumbering): 1=sidebar, 2=shell,
-  3=agent, 4=lazygit, 5=terminal.
+- **wide** (`_build_wide`) — 3 full-height columns. Visual pane indices
+  (after tmux's tree-traversal renumbering): 1=sidebar, 2=agent, 3=terminal.
 - **laptop** (`_build_laptop`) — 2 columns: left = sidebar over terminal,
-  right = full-height agent. No lazygit/shell panes. Visual indices:
-  1=sidebar, 2=terminal, 3=agent.
+  right = full-height agent. Visual indices: 1=sidebar, 2=terminal, 3=agent.
+
+Neither layout has a lazygit or second-shell pane: lazygit is summoned
+full-screen on demand (`prefix M-g` popup at the active pane's cwd).
 
 `resolve_profile()` precedence: explicit `--layout` > `$WK_LAYOUT` > auto
 by attach-display width (`_client_cols()` vs `$WK_WIDE_COLS`, default 220;
 headless → wide). The chosen profile's name is stored on the session as
-`@wk-layout` so `wk rebalance` and `wk lg-cd` can behave per-layout.
+`@wk-layout` so `wk rebalance` knows which geometry to reset to.
 Per-profile geometry constants (`WIDE_*` / `LAPTOP_*`) and the rebalance
 sequences live next to the builders — change sizes there, not in `wk.conf`
 (the `M-w` binding just calls `wk rebalance`, which reads `@wk-layout`).
@@ -115,10 +116,10 @@ Other `@wk-*` options set on sessions:
 - `@wk-branch`: canonical branch name (with slashes preserved)
 - `@wk-path`: absolute path to the worktree
 - `@wk-layout`: layout profile name (`wide`/`laptop`) the session was built
-  with; read by `wk rebalance` and `wk lg-cd`
-- `@wk-lazygit-pane`: the `%NN` id of the lazygit pane, used by `wk lg-cd`
-  (unset in the laptop layout, which has no lazygit pane)
+  with; read by `wk rebalance`
 - `@wk-task`, `@wk-task-prompt`: set by `wk task` for tracking
+- `@wk-task-orch`: on a `--auto` task session, the orchestrator session that
+  spawned it — the child messages it on completion (the done signal)
 - `@wk-last-session` (server-scoped): for `wk cycle last` (alt-tab style)
 - `@wk-dashboard`: set on the `wk-dashboard` session
 
@@ -184,9 +185,11 @@ trigger an immediate redraw.
   user's personal yazi.toml schema and a `Terminal response timeout`
   inside tmux popups. fd+fzf is simpler, fast, and has no terminal
   probe.
-- **Lazygit retargeting uses `tmux respawn-pane -k`.** Killing the
-  pane's process and respawning with `-c <new-dir>` is cleaner than
-  trying to make lazygit accept a runtime cwd change.
+- **Lazygit is a summoned popup, not a pane.** `prefix M-g` runs
+  `display-popup -d "#{pane_current_path}"`, so it opens where you're
+  working and needs no retargeting. (An earlier design parked it in a
+  pane and chased the cwd with `wk lg-cd`; that was more machinery than
+  an intermittently-watched tool earns.)
 - **Format strings don't reach into nested single quotes in tmux
   bindings.** `display-popup "sh -c 'cmd --x=#{session_name}'"` would
   pass the literal `#{session_name}` to sh. Use `tmux display-message

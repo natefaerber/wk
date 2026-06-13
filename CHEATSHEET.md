@@ -1,8 +1,8 @@
 # wk cheatsheet
 
 A tmux-based workspace manager: every workspace is one git worktree + one tmux
-session of the same name, in a 5-pane layout (sidebar, agent, shell, lazygit,
-terminal).
+session of the same name, in a multi-column layout (sidebar, agent, terminal;
+lazygit on demand).
 
 ---
 
@@ -91,7 +91,7 @@ wk task "investigate tenant-settings 500 errors customer reported on v35" \
 ### Resume tomorrow
 
 `wk open <branch>` is forgiving — if the session was killed but the worktree
-still exists, it rebuilds the 5-pane layout. If the session is already running,
+still exists, it rebuilds the layout. If the session is already running,
 it just attaches.
 
 ```fish
@@ -131,28 +131,26 @@ wk rm release/v35 --keep-branch   # remove worktree but keep the branch ref
 
 ## Pane layout
 
-wk has two layout profiles. The **widescreen** layout (5 panes) is the default
+wk has two layout profiles. The **widescreen** layout (3 columns) is the default
 on wide displays; the **laptop** layout (2 columns) kicks in on narrow ones.
+Either way, lazygit is summoned on demand with `prefix M-g` (full-screen popup),
+not an always-on pane.
 
 ### Widescreen (`wide`)
 
 ```
 ┌──────────┬──────────────────────────┬──────────────────┐
-│ sidebar  │                          │   lazygit        │
-│ pane.1   │                          │   pane.4         │
-├──────────┤   agent (Claude Code)    ├──────────────────┤
-│          │   pane.2 (visual idx 3)  │                  │
-│ shell    │                          │   terminal       │
-│ pane.4   │                          │   pane.5         │
+│ sidebar  │                          │                  │
+│ pane.1   │   agent (Claude Code)    │   terminal       │
+│          │   pane.2                 │   pane.3         │
 └──────────┴──────────────────────────┴──────────────────┘
 ```
 
 - **sidebar** — passive read-only dashboard of all wk workspaces (auto-refreshes
   every 3s; tune with `WK_SIDEBAR_REFRESH`)
 - **agent** — Claude Code (or whatever `WK_AGENT_CMD` is set to)
-- **shell** — a regular login shell
-- **lazygit** — `lazygit -ucf ~/.config/wk/lazygit.yml` (narrow-pane config)
-- **terminal** — another login shell
+- **terminal** — a regular login shell
+- **lazygit** — `prefix M-g` opens it full-screen at the active pane's cwd
 
 ### Laptop (`laptop`)
 
@@ -165,8 +163,7 @@ on wide displays; the **laptop** layout (2 columns) kicks in on narrow ones.
 ```
 
 Two columns: the left stacks the **sidebar** over a **terminal**; the right is
-a full-height **agent**. No lazygit or separate shell pane — on a narrow display
-they cost more width than they're worth.
+a full-height **agent**. Same as `wide` minus the dedicated terminal column.
 
 ### Choosing a layout
 
@@ -187,10 +184,12 @@ The sidebar pane is **read-only** — you don't navigate into it. To switch:
 
 | binding | what |
 |---|---|
-| `prefix W` | popup picker (fzf) over **existing wk workspaces**; switch on Enter |
+| `prefix W` | the **hub** — popup picker (fzf) over existing workspaces **and running tasks**; switch on Enter. A finished `--auto` task shows ✓. |
 | `prefix O` | popup picker over **all git branches** (local + remote), sorted by most recent commit. Markers show wk status (●=session running, ·=worktree only). Pick one → if it has a wk workspace, switches to it; otherwise creates one. |
 | `prefix W` then `ctrl-n` | prompt for a new branch and create it |
 | `prefix W` then `ctrl-d` | delete the highlighted workspace |
+| `prefix W` then `ctrl-x` | cancel the highlighted task (kill its session, keep the worktree) |
+| `prefix W` then `ctrl-r` | refresh the list (e.g. after a task finishes) |
 | `M-]` / `M-[` | **cycle next/prev running wk session** — no prefix, fires on bare keystroke. Like browser tabs. |
 | `M-m` | **toggle to last visited wk session** — alt-tab style. Repeated presses bounce between two recent workspaces. |
 
@@ -211,26 +210,16 @@ wk list
 
 ---
 
-## Retargeting lazygit at a different repo
+## Lazygit
 
-Common when the agent is working in a subrepo or sibling repo of where wk
-started.
+Lazygit is summoned on demand, not parked in a pane:
 
 | binding | what |
 |---|---|
-| `prefix M-g` | command-prompt pre-filled with the active pane's cwd; Enter to follow |
-| `prefix M-z` | zoxide popup (frecency-sorted jump list) |
-| `prefix M-y` | fd + fzf fuzzy picker, rooted at the active pane's cwd |
+| `prefix M-g` | open lazygit full-screen (popup) at the active pane's cwd; `q` closes it |
 
-CLI equivalents (Claude can call any of these):
-
-```fish
-wk lg-cd                              # follow the calling pane's cwd
-wk lg-cd ~/some/other/repo            # exact path
-wk lg-cd --pick=zoxide                # zoxide jump list
-wk lg-cd --pick=fd                    # fd + fzf, scoped to cwd
-wk lg-cd ~/some/repo --session=feat-foo  # target a specific session
-```
+Because it opens where you are, it already follows you into a subrepo or sibling
+repo — there's nothing to retarget.
 
 ---
 
@@ -302,6 +291,8 @@ wk task-retry  fix-tenant-500s       # re-run the agent on the same task.md
 git -C ~/_Work/credo-backend/.worktrees/fix-tenant-500s diff main..
 wk task-merge fix-tenant-500s         # --no-ff merge commit (default)
 wk task-merge fix-tenant-500s --squash # squash into one commit
+wk task-merge fix-tenant-500s --rm     # merge, then tear down the task workspace
+wk task-merge fix-tenant-500s --into main  # target an orchestrator explicitly
 ```
 
 | binding | what |
@@ -344,13 +335,13 @@ wk relayout [--layout wide|laptop] # rebuild the layout in the current session (
 wk rebalance                     # reset pane sizes to the current layout's defaults (prefix M-w)
 wk refresh-agents [branch|--all] # regenerate .wk/AGENTS.md and ORCHESTRATOR.md
 wk cd [branch]                   # print worktree path (for shell cd integration)
-wk lg-cd [path] [--pick=...]     # retarget lazygit pane
 wk task-status [branch]          # status table / detail of task workspaces
 wk task-output <branch> [-n N]   # dump a task's .wk/output.md (--follow streams)
 wk task-merge <branch>           # merge task branch into orchestrator's branch
 wk sidebar                       # the dashboard renderer (runs in pane.1)
 wk dashboard                     # cross-workspace overview session
 wk version                       # print the wk version (also `wk --version` / `-V`)
+wk doctor                        # check deps + whether the tmux bindings are installed
 ```
 
 ---
