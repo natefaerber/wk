@@ -143,3 +143,23 @@ def test_find_and_require_workspace(wk):
     assert wk.require_workspace("feat/login", ws) is a
     with pytest.raises(typer.Exit):
         wk.require_workspace("nope", ws)
+
+
+# --------------------------------------------------------------------------- #
+# list outside a git repo must say so, not "no workspaces" (the resilience
+# fallbacks return [] for both "no repo" and "empty repo").
+# --------------------------------------------------------------------------- #
+
+def test_list_outside_repo_says_not_a_repo(wk, monkeypatch):
+    import typer
+    monkeypatch.setattr(wk, "require", lambda *a, **k: None)
+    monkeypatch.setattr(wk, "in_git_repo", lambda: False)
+    with pytest.raises(typer.Exit):
+        wk.list_cmd()
+
+
+def test_list_in_repo_with_no_workspaces_does_not_raise(wk, monkeypatch):
+    monkeypatch.setattr(wk, "require", lambda *a, **k: None)
+    monkeypatch.setattr(wk, "in_git_repo", lambda: True)
+    monkeypatch.setattr(wk, "all_workspaces", lambda: [])
+    wk.list_cmd()  # prints "no workspaces", returns cleanly

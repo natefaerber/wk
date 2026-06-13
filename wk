@@ -884,6 +884,15 @@ def in_tmux() -> bool:
     return "TMUX" in os.environ
 
 
+def in_git_repo() -> bool:
+    """True if the cwd is inside a git work tree, without raising the way
+    `repo_root()` does. Lets commands tell "not in a repo" apart from "in a
+    repo with nothing to show" — the resilience fallbacks return [] for both."""
+    return run(
+        ["git", "rev-parse", "--is-inside-work-tree"], check=False
+    ).stdout.strip() == "true"
+
+
 def attach_or_switch(session: str) -> None:
     """Attach if outside tmux, switch-client if inside."""
     if in_tmux():
@@ -3078,9 +3087,15 @@ def list_cmd() -> None:
     `wk dashboard` for the same table on an auto-refreshing clock.
     """
     require("git")
+    # Distinguish "not in a repo" from "repo has no workspaces": all_workspaces()
+    # returns [] for both (git failures are swallowed for resilience), so a bare
+    # "no workspaces" outside a repo reads as a false negative.
+    if not in_git_repo():
+        die("not inside a git repository",
+            hint="cd into a repo to see its wk workspaces")
     workspaces = all_workspaces()
     if not workspaces:
-        console.print("[dim]no workspaces[/dim]")
+        console.print("[dim]no workspaces[/dim] [dim](wk new <branch> to create one)[/dim]")
         return
     console.print(workspace_table(workspaces, current_session()))
 
