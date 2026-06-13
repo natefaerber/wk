@@ -38,7 +38,7 @@ from rich.table import Table
 # release tag and the plugin manifests (`.claude-plugin/*.json`) — the release
 # workflow fails if they don't all match. Surfaced via `wk --version` and the
 # `wk version` command.
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 app = typer.Typer(
     add_completion=False,
