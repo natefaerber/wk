@@ -44,3 +44,42 @@ def test_hub_binds_have_no_blocking_commands(wk):
     # the non-blocking verbs we DO expect on the hub
     for good in ("ctrl-n", "ctrl-d", "ctrl-x", "ctrl-r"):
         assert good in binds
+
+
+# --------------------------------------------------------------------------- #
+# Global hub — external (cross-repo) running sessions, derived live from tmux.
+# --------------------------------------------------------------------------- #
+import subprocess  # noqa: E402
+
+
+def test_repo_label_fast_path_no_subprocess(wk):
+    # `<repo>/.worktrees/<slug>` → repo name, without shelling out to git.
+    assert wk._repo_label(wk.Path("/x/myrepo/.worktrees/feat-x")) == "myrepo"
+
+
+def test_external_wk_sessions_parses_and_excludes_local(wk, monkeypatch):
+    rows = "\n".join([
+        "wk-feat-x\t1\tfeat/x\t/other/.worktrees/feat-x",   # external → keep
+        "here-main\t1\tmain\t/here/repo",                    # local → excluded by path
+        "wk-dashboard\t\t\t",                                # not @wk-tagged → skip
+        "junk\t1\t\t/p",                                     # empty branch → skip
+    ])
+
+    def fake_run(cmd, *a, **k):
+        if "ls" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, rows, "")
+        return subprocess.CompletedProcess(cmd, 0, "", "")  # git status / rev-list
+
+    monkeypatch.setattr(wk, "run", fake_run)
+    ext = wk.external_wk_sessions({wk.Path("/here/repo").resolve()})
+    assert [w.session for w in ext] == ["wk-feat-x"]
+    assert ext[0].branch == "feat/x" and ext[0].has_session is True
+
+
+def test_hub_workspaces_local_first(wk, monkeypatch):
+    local = _ws(wk, branch="main", session="here-main", path=wk.Path("/here/repo"))
+    ext = _ws(wk, branch="feat/y", session="other-feat-y",
+              path=wk.Path("/other/.worktrees/feat-y"))
+    monkeypatch.setattr(wk, "all_workspaces", lambda: [local])
+    monkeypatch.setattr(wk, "external_wk_sessions", lambda paths: [ext])
+    assert [w.session for w in wk.hub_workspaces()] == ["here-main", "other-feat-y"]

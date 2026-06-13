@@ -184,7 +184,7 @@ The sidebar pane is **read-only** — you don't navigate into it. To switch:
 
 | binding | what |
 |---|---|
-| `prefix W` | the **hub** — popup picker (fzf) over existing workspaces **and running tasks**; switch on Enter. A finished `--auto` task shows ✓. |
+| `prefix W` | the **hub** — popup picker (fzf) over this repo's workspaces **and every running wk session across all repos** (a `repo` column disambiguates); switch on Enter, from anywhere. A finished `--auto` task shows ✓. |
 | `prefix O` | popup picker over **all git branches** (local + remote), sorted by most recent commit. Markers show wk status (●=session running, ·=worktree only). Pick one → if it has a wk workspace, switches to it; otherwise creates one. |
 | `prefix W` then `ctrl-n` | prompt for a new branch and create it |
 | `prefix W` then `ctrl-d` | delete the highlighted workspace |

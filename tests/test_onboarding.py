@@ -8,9 +8,13 @@ import pytest
 import typer
 
 
-def _no_workspaces(wk, monkeypatch, *, tty: bool):
+def _no_workspaces(wk, monkeypatch, *, tty: bool, in_repo: bool = True):
     monkeypatch.setattr(wk, "require", lambda *a, **k: None)
-    monkeypatch.setattr(wk, "all_workspaces", lambda: [])
+    # switch() uses the global hub set; mock it (and the repo check) so the
+    # test never touches real tmux / git / fzf.
+    monkeypatch.setattr(wk, "hub_workspaces", lambda: [])
+    monkeypatch.setattr(wk, "in_git_repo", lambda: in_repo)
+    monkeypatch.setattr(wk, "repo_root", lambda: wk.Path("/repo"))
     monkeypatch.setattr(wk.sys.stdin, "isatty", lambda: tty)
 
 
