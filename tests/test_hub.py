@@ -44,3 +44,57 @@ def test_hub_binds_have_no_blocking_commands(wk):
     # the non-blocking verbs we DO expect on the hub
     for good in ("ctrl-n", "ctrl-d", "ctrl-x", "ctrl-r"):
         assert good in binds
+
+
+# --------------------------------------------------------------------------- #
+# Global hub — external (cross-repo) running sessions, derived live from tmux.
+# --------------------------------------------------------------------------- #
+import subprocess  # noqa: E402
+
+
+def test_repo_label_fast_path_no_subprocess(wk):
+    # `<repo>/.worktrees/<slug>` → repo name, without shelling out to git.
+    assert wk._repo_label(wk.Path("/x/myrepo/.worktrees/feat-x")) == "myrepo"
+
+
+def test_external_wk_sessions_parses_and_excludes_local(wk, monkeypatch):
+    rows = "\n".join([
+        "wk-feat-x\t1\tfeat/x\t/other/.worktrees/feat-x",   # external → keep
+        "here-main\t1\tmain\t/here/repo",                    # local → excluded by path
+        "wk-dashboard\t\t\t",                                # not @wk-tagged → skip
+        "junk\t1\t\t/p",                                     # empty branch → skip
+    ])
+
+    def fake_run(cmd, *a, **k):
+        if "ls" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, rows, "")
+        return subprocess.CompletedProcess(cmd, 0, "", "")  # git status / rev-list
+
+    monkeypatch.setattr(wk, "run", fake_run)
+    ext = wk.external_wk_sessions({wk.Path("/here/repo").resolve()})
+    assert [w.session for w in ext] == ["wk-feat-x"]
+    assert ext[0].branch == "feat/x" and ext[0].has_session is True
+
+
+def test_hub_workspaces_local_first(wk, monkeypatch):
+    local = _ws(wk, branch="main", session="here-main", path=wk.Path("/here/repo"))
+    ext = _ws(wk, branch="feat/y", session="other-feat-y",
+              path=wk.Path("/other/.worktrees/feat-y"))
+    monkeypatch.setattr(wk, "all_workspaces", lambda: [local])
+    monkeypatch.setattr(wk, "external_wk_sessions", lambda paths: [ext])
+    assert [w.session for w in wk.hub_workspaces()] == ["here-main", "other-feat-y"]
+
+
+def test_preview_resolves_cross_repo_via_global_hub(wk, monkeypatch, capsys, tmp_path):
+    # The preview pane must resolve external (cross-repo) sessions too, or it
+    # prints "(no workspace for ...)" for them. So it uses hub_workspaces().
+    w = _ws(wk, branch="feat/x", session="other-feat-x", path=tmp_path)
+    monkeypatch.setattr(wk, "hub_workspaces", lambda: [w])
+    monkeypatch.setattr(
+        wk.subprocess, "run",
+        lambda *a, **k: subprocess.CompletedProcess(a[0] if a else [], 0, "", ""),
+    )
+    wk.preview("other-feat-x")
+    out = capsys.readouterr().out
+    assert "feat/x" in out
+    assert "no workspace for" not in out

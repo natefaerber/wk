@@ -446,7 +446,10 @@ def _picker_line(w: "Workspace", current: str) -> str:
     marker = session_marker(w, current, rich=False)
     ab = ahead_behind(w) or " "
     status = dirty_marker(w, rich=False)
-    display = f"{marker} {w.branch[:30]:<30} {ab:>8} {status}"
+    # Repo column so the global hub's cross-repo rows are legible (two `main`s
+    # in different repos are otherwise indistinguishable by branch alone).
+    repo = _repo_label(w.path)
+    display = f"{marker} {w.branch[:24]:<24} {repo[:14]:<14} {ab:>8} {status}"
     return f"{w.session}\t{display}"
 
 
@@ -818,18 +821,17 @@ def wk_tmux_sessions() -> set[str]:
     return out
 
 
-def workspace_status(branch: str, path: Path, sessions: set[str]) -> Workspace:
-    name = session_name(branch)
-    # dirty? A worktree dir can vanish out-of-band (a manual `rm -rf` of a
-    # stale `.worktrees/<x>`), which would make this git call exit nonzero.
-    # With check=True that CalledProcessError propagates out of
-    # all_workspaces() and crashes `wk ls`, `wk rm`, `wk switch`, and the
-    # dashboard render loop. Tolerate it: an unreadable worktree is "not dirty".
-    status = run(
-        ["git", "-C", str(path), "status", "--porcelain"], check=False
-    )
+def _git_dirty_ahead_behind(path: Path) -> tuple[bool, int, int]:
+    """(dirty, ahead, behind) for the worktree at PATH, vs the base ref.
+
+    Tolerant of an unreadable/vanished worktree (a manual `rm -rf` of a stale
+    `.worktrees/<x>`): git failures count as clean / in-sync rather than
+    propagating and crashing `wk ls`, `wk switch`, or the render loops. Works
+    on any path (used both for current-repo worktrees and cross-repo sessions
+    in the global hub), since it's keyed only off PATH, not the cwd's repo.
+    """
+    status = run(["git", "-C", str(path), "status", "--porcelain"], check=False)
     dirty = bool(status.stdout.strip()) if status.returncode == 0 else False
-    # ahead/behind vs base
     ahead = behind = 0
     base = os.environ.get("WK_BASE", DEFAULT_BASE)
     rev = run(
@@ -840,6 +842,12 @@ def workspace_status(branch: str, path: Path, sessions: set[str]) -> Workspace:
         parts = rev.stdout.split()
         if len(parts) == 2:
             behind, ahead = int(parts[0]), int(parts[1])
+    return dirty, ahead, behind
+
+
+def workspace_status(branch: str, path: Path, sessions: set[str]) -> Workspace:
+    name = session_name(branch)
+    dirty, ahead, behind = _git_dirty_ahead_behind(path)
     return Workspace(
         branch=branch,
         path=path,
@@ -856,6 +864,71 @@ def all_workspaces() -> list[Workspace]:
     # not "any tmux session with this name exists".
     sessions = wk_tmux_sessions()
     return [workspace_status(b, p, sessions) for b, p in list_wk_worktrees()]
+
+
+def _repo_label(path: Path) -> str:
+    """Short repo name for a worktree PATH, for the global hub's repo column.
+
+    Fast path: wk worktrees live at `<repo>/.worktrees/<slug>`, so the repo is
+    two parents up — no subprocess. Falls back to `git rev-parse` for adopted
+    worktrees or a custom WK_WORKTREE_ROOT.
+    """
+    if path.parent.name == ".worktrees":
+        return path.parent.parent.name
+    r = run(["git", "-C", str(path), "rev-parse", "--show-toplevel"], check=False)
+    top = r.stdout.strip() if r.returncode == 0 else ""
+    return Path(top).name if top else path.name
+
+
+def external_wk_sessions(local_paths: set[Path]) -> list[Workspace]:
+    """Running wk sessions whose worktree is NOT in the current repo — the
+    cross-repo half of the global hub. Derived live from tmux: every session
+    carries @wk / @wk-branch / @wk-path, so no persistent registry is needed.
+    LOCAL_PATHS are the current repo's worktree paths, excluded to avoid dupes.
+    """
+    r = run(
+        ["tmux", "ls", "-F",
+         "#{session_name}\t#{@wk}\t#{@wk-branch}\t#{@wk-path}"],
+        check=False,
+    )
+    if r.returncode != 0:
+        return []
+    out: list[Workspace] = []
+    for line in r.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 4:
+            continue
+        name, flag, branch, path = (p.strip() for p in parts[:4])
+        if flag != "1" or not branch or not path:
+            continue  # not a wk workspace session (e.g. the dashboard)
+        p = Path(path).expanduser()
+        try:
+            resolved = p.resolve()
+        except OSError:
+            resolved = p
+        if resolved in local_paths:
+            continue  # this repo's own session — already in all_workspaces()
+        dirty, ahead, behind = _git_dirty_ahead_behind(p)
+        out.append(Workspace(
+            branch=branch, path=p, session=name, has_session=True,
+            dirty=dirty, ahead=ahead, behind=behind,
+        ))
+    return out
+
+
+def hub_workspaces() -> list[Workspace]:
+    """The global hub set: this repo's workspaces (running + idle) first, then
+    every running wk session in OTHER repos. Outside any repo, the local half
+    is empty and you still get all running agents — so the hub works anywhere.
+    """
+    local = all_workspaces()
+    local_paths: set[Path] = set()
+    for w in local:
+        try:
+            local_paths.add(w.path.resolve())
+        except OSError:
+            local_paths.add(w.path)
+    return local + external_wk_sessions(local_paths)
 
 
 def find_workspace(
@@ -3108,11 +3181,18 @@ def switch(
 
     With BRANCH, jumps straight to that workspace (accepts the branch, its
     session-form slug, or the full session name). With no argument, opens the
-    fzf hub over all workspaces AND running tasks, with a live preview (task,
-    recent commits, git status) and single-key actions: enter=switch,
-    ctrl-n=new, ctrl-d=rm, ctrl-x=cancel a task, ctrl-r=refresh. A finished
-    `--auto` task shows ✓. Attaches when run outside tmux, switches the client
-    when inside.
+    fzf hub — this repo's workspaces (running + idle) first, then every running
+    wk session in OTHER repos (a `repo` column disambiguates), so you can jump
+    to any agent from anywhere, even outside a repo. Live preview (task, recent
+    commits, git status) and single-key actions: enter=switch, ctrl-n=new,
+    ctrl-d=rm, ctrl-x=cancel, ctrl-r=refresh. A finished `--auto` task shows ✓.
+    Attaches when run outside tmux, switches the client when inside.
+
+    Cross-repo discovery is derived live from tmux (each wk session is tagged
+    with its branch + path) — no registry, no new state. Idle workspaces in
+    OTHER repos aren't listed (nothing running to tag them); cd there to resume.
+    enter/switch works on any row; ctrl-d/ctrl-x act on the current repo (on a
+    cross-repo row they report no-match — switch in and act there).
 
     The hub does the *non-blocking* verbs in place; reading a task's live
     output or merging it are deliberately not bound here (they block or are
@@ -3121,15 +3201,15 @@ def switch(
     refreshes on demand (ctrl-r) to stay free of a background timer.
     """
     require("tmux")
-    workspaces = all_workspaces()
+    # The hub is global: this repo's workspaces first, then every running wk
+    # session in other repos — so `prefix W` works from anywhere, even outside
+    # a repo, and lets you jump to any agent.
+    workspaces = hub_workspaces()
     if not workspaces:
-        # First-run dead-end: a new user's first `prefix W` lands here. When
-        # we're interactive (a tty, e.g. inside the popup), offer to create one
-        # inline instead of just erroring. Headless callers (piped, or
-        # `wk switch <branch>`) keep the non-zero die so scripts see the failure.
-        if branch is None and sys.stdin.isatty():
-            # We got here, so all_workspaces() succeeded — we're in a repo.
-            # Name it (and the base) so it's clear WHERE the branch will land.
+        # Nothing anywhere to switch to. Interactive + in a repo → offer to
+        # create the first workspace (named so it's clear WHERE it lands).
+        # Headless or outside a repo → a clear die (scripts still see failure).
+        if branch is None and sys.stdin.isatty() and in_git_repo():
             repo = repo_root()
             console.print(
                 f"No wk workspaces in [bold]{repo.name}[/bold] "
@@ -3144,6 +3224,9 @@ def switch(
                 raise typer.Exit(0)
             open_ref(name, DEFAULT_BASE, no_attach=False, no_fetch=False)
             return
+        if not in_git_repo():
+            die("no running wk sessions",
+                hint="cd into a repo and `wk new <branch>` to start one")
         die("no workspaces to switch to", hint="`wk new <branch>` creates one")
 
     target: Optional[Workspace] = None
@@ -3698,10 +3781,11 @@ def sidebar() -> None:
 
 @app.command("_list-once", hidden=True)
 def list_once() -> None:
-    """Internal: dump one workspace list line per workspace, tab-delimited
-    `session\\tdisplay`. Used by fzf --reload after destructive actions."""
+    """Internal: dump one row per workspace, tab-delimited `session\\tdisplay`.
+    Used by the hub's fzf --reload. Must match the picker's initial set exactly
+    (the global hub) or the list jumps on reload — so it uses hub_workspaces()."""
     current = current_session()
-    for w in all_workspaces():
+    for w in hub_workspaces():
         print(_picker_line(w, current))
 
 
@@ -3712,9 +3796,13 @@ def preview(session: str = typer.Argument(...)) -> None:
     Shows the task prompt (if any), recent commits, and `git status` for
     the worktree associated with SESSION. Designed to be invoked by fzf's
     --preview, so output is plain text + ANSI color (no Rich markup).
+
+    Uses the global hub set so it resolves cross-repo sessions too — matching
+    what the picker lists. (All the git below is keyed off the worktree path,
+    so it works regardless of which repo SESSION lives in.)
     """
     target = next(
-        (w for w in all_workspaces() if w.session == session),
+        (w for w in hub_workspaces() if w.session == session),
         None,
     )
     if target is None:
