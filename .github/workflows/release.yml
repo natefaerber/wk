@@ -62,6 +62,21 @@ jobs:
           fi
           echo "versions match tag v$VERSION (wk + both plugin manifests)"
 
+      - name: Read changelog section for this version
+        # CHANGELOG.md is the single source of truth for release notes: extract
+        # the `## [X.Y.Z]` section and use it as the GitHub release body (below),
+        # instead of GitHub's PR-title auto-notes. So a release ships the curated,
+        # hand-written entry (including any "BREAKING" callout). The action writes
+        # the section to a temp file exposed as `changes_file`. Pinned to a commit
+        # SHA (v2.4.0) for supply-chain safety, matching how we pin setup-uv.
+        id: changelog
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: mindsers/changelog-reader-action@1faaf50aa09d5793d9a100819973df801febfb31  # v2.4.0
+        with:
+          version: ${{ steps.version.outputs.version }}
+          path: ./CHANGELOG.md
+          validation_level: warn
+
       - name: Set up uv
         # Pin to an exact release: astral-sh/setup-uv publishes no moving `v8`
         # major tag (only `v7` and exact tags like `v8.1.0`), so `@v8` fails to
@@ -106,10 +121,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.version.outputs.tag }}
+          NOTES_FILE: ${{ steps.changelog.outputs.changes_file }}
         run: |
+          # Release body = the curated CHANGELOG section (via --notes-file).
+          # Passed as a file the action wrote, so changelog text never gets
+          # interpolated into this shell command.
           gh release create "$TAG" \
             --title "wk $TAG" \
-            --generate-notes \
+            --notes-file "$NOTES_FILE" \
             dist/wk \
             dist/wk-* \
             dist/wk.sha256
