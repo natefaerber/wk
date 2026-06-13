@@ -47,8 +47,14 @@ the stale doc.
 
 ## Releasing
 
-Tag `vX.Y.Z` and push the tag; `release.yml` validates and publishes. The
-version lives in three places that must match the tag — `__version__` in `wk`
-and the `version` field in both `.claude-plugin/*.json` — enforced by the
-release workflow and `tests/test_version_lockstep.py`. Add a `CHANGELOG.md`
-entry for the release.
+To cut `vX.Y.Z`:
+
+1. Rename the `## [Unreleased]` heading in `CHANGELOG.md` to
+   `## [X.Y.Z] — YYYY-MM-DD` (and start a fresh empty `## [Unreleased]` above
+   it). `release.yml` extracts this exact section and uses it as the GitHub
+   release body, so it must exist for the tag.
+2. Bump the version in all three places that must match the tag — `__version__`
+   in `wk` and the `version` field in both `.claude-plugin/*.json` — enforced by
+   the release workflow and `tests/test_version_lockstep.py`.
+3. Tag `vX.Y.Z` and push it; `release.yml` validates, builds the assets, and
+   publishes the release with that changelog section as its notes.
