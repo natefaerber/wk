@@ -639,15 +639,17 @@ These environment variables are set on every pane of the session:
 
 ## Layout
 
-The wk session is 3 full-height columns (the `wide` layout):
+The wk session is three columns (the `wide` layout):
 
-  ┌──────────┬──────────────────────────┬──────────────┐
-  │ sidebar  │   agent (you)            │   terminal   │
-  │ pane.1   │   pane.2                 │   pane.3     │
-  └──────────┴──────────────────────────┴──────────────┘
+  ┌──────────┬──────────────────────┬──────────────┐
+  │ sidebar  │                      │              │
+  ├──────────┤   agent (you)        │   terminal   │
+  │ shell    │                      │              │
+  └──────────┴──────────────────────┴──────────────┘
 
-On a narrow display the `laptop` layout is used instead: 2 columns, with
-the sidebar stacked over a terminal on the left and you on the right.
+The left column stacks the sidebar over a shell; you're the centre; a
+terminal is the right column. On a narrow display the `laptop` layout is
+used instead: 2 columns, sidebar over a terminal on the left, you on the right.
 
 There is no always-on lazygit pane. The user summons lazygit full-screen
 with `prefix M-g`; it opens at the active pane's cwd, so it already follows
@@ -996,16 +998,20 @@ def _shell_wrap(cmd: str) -> list[str]:
 # them proportionally when a client attaches. So these are the ratios that
 # look right, expressed in the cols / height-percent that tmux splits take.
 #
-# WIDE — 3-column widescreen layout: sidebar | agent | terminal, all full
-# height. Tuned for ~290-col windows (UWQHD 3440px). No lazygit pane (summon
-# it full-screen with `prefix M-g`) and no separate shell — the old layout's
-# always-on lazygit and its redundant second shell were dropped.
+# WIDE — widescreen layout: (sidebar over shell) | agent | terminal. Four
+# panes, three columns. No lazygit pane (summon it full-screen with
+# `prefix M-g`). The terminal column is deliberately wide so the agent doesn't
+# sprawl to ~65% of a big display — sessions are built at this virtual width
+# then scaled proportionally on attach, so the cap is a ratio, not absolute
+# cols.
 WIDE_WINDOW_COLS = 290    # virtual width the detached session is built at
 WIDE_WINDOW_ROWS = 75     # virtual height (reshaped on attach)
-WIDE_SIDEBAR_COLS = 42    # sidebar column — ~40 cols fits branch names and
-                          # `git status -sb` lines without wrapping
-WIDE_TERMINAL_COLS = 60   # right-hand terminal column; the agent takes the
-                          # whole middle remainder
+WIDE_SIDEBAR_COLS = 42    # left column (sidebar + shell) — ~40 cols fits branch
+                          # names and `git status -sb` lines without wrapping
+WIDE_TERMINAL_COLS = 90   # right-hand terminal column; wide enough that the
+                          # agent lands near ~half the screen, not ~two-thirds
+WIDE_SIDEBAR_PCT = 30     # sidebar's share of the left column height; the shell
+                          # below it gets the larger remainder
 
 # LAPTOP — 2-column layout for narrow displays: left column is the sidebar
 # stacked over a terminal, right column is a full-height agent. No lazygit or
@@ -1053,15 +1059,17 @@ LAZYGIT_CMD = (
 
 
 def _build_wide(session: str, wt: Path, sidebar_id: str, agent: str) -> None:
-    """Finish the 3-column widescreen layout from an existing sidebar pane:
-    sidebar | agent | terminal, all full height. Selects the agent so the user
+    """Finish the widescreen layout from an existing sidebar pane:
+    (sidebar over shell) | agent | terminal. Selects the agent so the user
     lands there on attach. No lazygit pane (summon it with `prefix M-g`).
 
-        ┌────────┬──────────────────────┬──────────┐
-        │ sidebar│        agent         │ terminal │
-        └────────┴──────────────────────┴──────────┘
+        ┌────────┬──────────────────┬──────────────┐
+        │ sidebar│                  │              │
+        ├────────┤      agent       │   terminal   │
+        │ shell  │                  │              │
+        └────────┴──────────────────┴──────────────┘
     """
-    # Agent — everything right of the sidebar column.
+    # Agent — everything right of the left column.
     agent_id = run(
         [
             "tmux", "split-window", "-h",
@@ -1080,6 +1088,16 @@ def _build_wide(session: str, wt: Path, sidebar_id: str, agent: str) -> None:
             "-t", agent_id,
             "-c", str(wt),
             "-l", str(WIDE_TERMINAL_COLS),
+        ]
+    )
+
+    # Shell — split the left column below the sidebar (default shell).
+    run(
+        [
+            "tmux", "split-window", "-v",
+            "-t", sidebar_id,
+            "-c", str(wt),
+            "-l", f"{100 - WIDE_SIDEBAR_PCT}%",
         ]
     )
 
@@ -1132,12 +1150,14 @@ def _rebalance_wide(session: str) -> None:
 
     Targets panes by visual index, safe here because rebalance only runs on a
     fully-built, stable layout (tmux renumbers indices only while splitting).
-    Visual order: 1=sidebar, 2=agent, 3=terminal — all full height, so only
-    widths are set. `session:.N` pins the target to SESSION, not the attached
-    client's current session.
+    Visual order: 1=sidebar, 2=shell, 3=agent, 4=terminal. Resizing pane 1 sets
+    the left column's width and the sidebar's share of its height; pane 4 sets
+    the terminal column width. `session:.N` pins the target to SESSION, not the
+    attached client's current session.
     """
     run(["tmux", "resize-pane", "-t", f"{session}:.1", "-x", str(WIDE_SIDEBAR_COLS)], check=False)
-    run(["tmux", "resize-pane", "-t", f"{session}:.3", "-x", str(WIDE_TERMINAL_COLS)], check=False)
+    run(["tmux", "resize-pane", "-t", f"{session}:.1", "-y", f"{WIDE_SIDEBAR_PCT}%"], check=False)
+    run(["tmux", "resize-pane", "-t", f"{session}:.4", "-x", str(WIDE_TERMINAL_COLS)], check=False)
 
 
 def _rebalance_laptop(session: str) -> None:
@@ -1237,7 +1257,9 @@ def build_session(
         ┌────────┬──────────┬─────────┐   ┌────────┬─────────────────┐
         │ sidebar│          │         │   │ sidebar│                 │
         │ pane.1 │  agent   │terminal │   ├────────┤      agent      │
-        │        │  pane.2  │ pane.3  │   │terminal│                 │
+        ├────────┤  pane.3  │ pane.4  │   │terminal│                 │
+        │ shell  │          │         │   │        │                 │
+        │ pane.2 │          │         │   │        │                 │
         └────────┴──────────┴─────────┘   └────────┴─────────────────┘
     """
     wk = _wk_bin()

@@ -16,6 +16,13 @@ from the [GitHub releases](https://github.com/natefaerber/wk/releases).
   in other repos aren't listed (nothing running to tag them). `enter`/switch
   works on any row; `ctrl-d`/`ctrl-x` act on the current repo.
 
+### Changed
+- **Widescreen layout is `(sidebar over shell) | agent | terminal`** (4 panes).
+  0.8.0 had pared `wide` to 3 panes, but on a big display the agent sprawled to
+  ~two-thirds and the lone terminal looked stranded. The shell returns under the
+  sidebar and the terminal column is widened, so the agent caps near ~half the
+  screen. Lazygit stays a `prefix M-g` popup. (The laptop layout is unchanged.)
+
 ## [0.8.0] - 2026-06-13
 
 The "polish round" — easier to use, more agent-drivable.

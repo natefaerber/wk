@@ -37,25 +37,38 @@ class SplitRec:
         return " ".join(" ".join(map(str, c)) for c in self.calls)
 
 
-def test_build_wide_is_three_columns_no_lazygit(wk, monkeypatch):
+def test_build_wide_is_sidebar_shell_agent_terminal(wk, monkeypatch):
     rec = SplitRec()
     monkeypatch.setattr(wk, "run", rec)
     wk._build_wide("sess", wk.Path("/wt"), "%1", "agent-cmd")
 
     splits = rec.splits()
-    assert len(splits) == 2, "wide = sidebar + 2 splits (agent, terminal)"
-    # all full-height columns: horizontal splits only, never vertical
-    assert all("-h" in s for s in splits)
-    assert all("-v" not in s for s in splits)
-    # agent carves the window minus the sidebar column; terminal carves the right
-    assert str(wk.WIDE_WINDOW_COLS - wk.WIDE_SIDEBAR_COLS) in splits[0]
-    assert str(wk.WIDE_TERMINAL_COLS) in splits[1]
+    assert len(splits) == 3, "wide = sidebar + 3 splits (agent, terminal, shell)"
+    horiz = [s for s in splits if "-h" in s]
+    vert = [s for s in splits if "-v" in s]
+    assert len(horiz) == 2, "agent + terminal are horizontal columns"
+    assert len(vert) == 1, "shell is a vertical split of the left column"
+    # agent carves the window minus the left column; terminal carves the right
+    assert str(wk.WIDE_WINDOW_COLS - wk.WIDE_SIDEBAR_COLS) in horiz[0]
+    assert str(wk.WIDE_TERMINAL_COLS) in horiz[1]
     # no lazygit pane, no @wk-lazygit-pane bookkeeping
     assert "lazygit" not in rec.joined().lower()
     assert "@wk-lazygit-pane" not in rec.joined()
     # land on the agent (the first -P split → %2)
     selects = [c for c in rec.calls if "select-pane" in c]
     assert selects and "%2" in selects[-1]
+
+
+def test_rebalance_wide_targets_sidebar_and_terminal(wk, monkeypatch):
+    # Visual order is 1=sidebar, 2=shell, 3=agent, 4=terminal: rebalance sets
+    # the left column width + sidebar height (pane 1) and terminal width (pane 4).
+    rec = SplitRec()
+    monkeypatch.setattr(wk, "run", rec)
+    wk._rebalance_wide("sess")
+    resizes = [" ".join(map(str, c)) for c in rec.calls if "resize-pane" in c]
+    assert any("sess:.1" in r and "-x" in r and str(wk.WIDE_SIDEBAR_COLS) in r for r in resizes)
+    assert any("sess:.1" in r and "-y" in r for r in resizes)
+    assert any("sess:.4" in r and str(wk.WIDE_TERMINAL_COLS) in r for r in resizes)
 
 
 def test_build_laptop_is_two_columns(wk, monkeypatch):
@@ -107,13 +120,3 @@ def test_rebalance_runs_on_wk_session(wk, monkeypatch):
     assert any("resize-pane" in c for c in calls)
 
 
-def test_rebalance_wide_targets_match_build_order(wk, monkeypatch):
-    # The rebalance indices MUST track the build: 1=sidebar, 3=terminal.
-    rec = SplitRec()
-    monkeypatch.setattr(wk, "run", rec)
-    wk._rebalance_wide("sess")
-    resizes = [" ".join(map(str, c)) for c in rec.calls if "resize-pane" in c]
-    assert any("sess:.1" in r and str(wk.WIDE_SIDEBAR_COLS) in r for r in resizes)
-    assert any("sess:.3" in r and str(wk.WIDE_TERMINAL_COLS) in r for r in resizes)
-    # no vertical (-y) resizes — every wide pane is full height
-    assert all("-y" not in r for r in resizes)
