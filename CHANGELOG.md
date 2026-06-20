@@ -7,6 +7,8 @@ from the [GitHub releases](https://github.com/natefaerber/wk/releases).
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-06-20
+
 ### Added
 - **Global hub.** `prefix W` / `wk switch` now lists this repo's workspaces
   **plus every running wk session across all other repos** (a `repo` column
@@ -91,7 +93,8 @@ The "polish round" — easier to use, more agent-drivable.
 ## [0.4.0] - 2026-06-03
 - See the [v0.4.0 release](https://github.com/natefaerber/wk/releases/tag/v0.4.0).
 
-[Unreleased]: https://github.com/natefaerber/wk/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/natefaerber/wk/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/natefaerber/wk/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/natefaerber/wk/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/natefaerber/wk/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/natefaerber/wk/compare/v0.5.0...v0.6.0
