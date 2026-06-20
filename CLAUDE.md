@@ -86,8 +86,10 @@ A wk workspace is the triple of:
 The layout is built by `build_session()`, which picks a `LayoutProfile`
 (via `resolve_profile()`) and delegates the splits to `profile.build`.
 Two profiles live in the `LAYOUTS` registry:
-- **wide** (`_build_wide`) — 3 full-height columns. Visual pane indices
-  (after tmux's tree-traversal renumbering): 1=sidebar, 2=agent, 3=terminal.
+- **wide** (`_build_wide`) — three columns: (sidebar over shell) | agent |
+  terminal. Visual pane indices (after tmux's tree-traversal renumbering):
+  1=sidebar, 2=shell, 3=agent, 4=terminal. The terminal column is widened so
+  the agent caps near ~half the screen instead of sprawling on a widescreen.
 - **laptop** (`_build_laptop`) — 2 columns: left = sidebar over terminal,
   right = full-height agent. Visual indices: 1=sidebar, 2=terminal, 3=agent.
 

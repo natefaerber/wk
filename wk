@@ -446,7 +446,10 @@ def _picker_line(w: "Workspace", current: str) -> str:
     marker = session_marker(w, current, rich=False)
     ab = ahead_behind(w) or " "
     status = dirty_marker(w, rich=False)
-    display = f"{marker} {w.branch[:30]:<30} {ab:>8} {status}"
+    # Repo column so the global hub's cross-repo rows are legible (two `main`s
+    # in different repos are otherwise indistinguishable by branch alone).
+    repo = _repo_label(w.path)
+    display = f"{marker} {w.branch[:24]:<24} {repo[:14]:<14} {ab:>8} {status}"
     return f"{w.session}\t{display}"
 
 
@@ -636,15 +639,17 @@ These environment variables are set on every pane of the session:
 
 ## Layout
 
-The wk session is 3 full-height columns (the `wide` layout):
+The wk session is three columns (the `wide` layout):
 
-  ┌──────────┬──────────────────────────┬──────────────┐
-  │ sidebar  │   agent (you)            │   terminal   │
-  │ pane.1   │   pane.2                 │   pane.3     │
-  └──────────┴──────────────────────────┴──────────────┘
+  ┌──────────┬──────────────────────┬──────────────┐
+  │ sidebar  │                      │              │
+  ├──────────┤   agent (you)        │   terminal   │
+  │ shell    │                      │              │
+  └──────────┴──────────────────────┴──────────────┘
 
-On a narrow display the `laptop` layout is used instead: 2 columns, with
-the sidebar stacked over a terminal on the left and you on the right.
+The left column stacks the sidebar over a shell; you're the centre; a
+terminal is the right column. On a narrow display the `laptop` layout is
+used instead: 2 columns, sidebar over a terminal on the left, you on the right.
 
 There is no always-on lazygit pane. The user summons lazygit full-screen
 with `prefix M-g`; it opens at the active pane's cwd, so it already follows
@@ -818,18 +823,17 @@ def wk_tmux_sessions() -> set[str]:
     return out
 
 
-def workspace_status(branch: str, path: Path, sessions: set[str]) -> Workspace:
-    name = session_name(branch)
-    # dirty? A worktree dir can vanish out-of-band (a manual `rm -rf` of a
-    # stale `.worktrees/<x>`), which would make this git call exit nonzero.
-    # With check=True that CalledProcessError propagates out of
-    # all_workspaces() and crashes `wk ls`, `wk rm`, `wk switch`, and the
-    # dashboard render loop. Tolerate it: an unreadable worktree is "not dirty".
-    status = run(
-        ["git", "-C", str(path), "status", "--porcelain"], check=False
-    )
+def _git_dirty_ahead_behind(path: Path) -> tuple[bool, int, int]:
+    """(dirty, ahead, behind) for the worktree at PATH, vs the base ref.
+
+    Tolerant of an unreadable/vanished worktree (a manual `rm -rf` of a stale
+    `.worktrees/<x>`): git failures count as clean / in-sync rather than
+    propagating and crashing `wk ls`, `wk switch`, or the render loops. Works
+    on any path (used both for current-repo worktrees and cross-repo sessions
+    in the global hub), since it's keyed only off PATH, not the cwd's repo.
+    """
+    status = run(["git", "-C", str(path), "status", "--porcelain"], check=False)
     dirty = bool(status.stdout.strip()) if status.returncode == 0 else False
-    # ahead/behind vs base
     ahead = behind = 0
     base = os.environ.get("WK_BASE", DEFAULT_BASE)
     rev = run(
@@ -840,6 +844,12 @@ def workspace_status(branch: str, path: Path, sessions: set[str]) -> Workspace:
         parts = rev.stdout.split()
         if len(parts) == 2:
             behind, ahead = int(parts[0]), int(parts[1])
+    return dirty, ahead, behind
+
+
+def workspace_status(branch: str, path: Path, sessions: set[str]) -> Workspace:
+    name = session_name(branch)
+    dirty, ahead, behind = _git_dirty_ahead_behind(path)
     return Workspace(
         branch=branch,
         path=path,
@@ -856,6 +866,71 @@ def all_workspaces() -> list[Workspace]:
     # not "any tmux session with this name exists".
     sessions = wk_tmux_sessions()
     return [workspace_status(b, p, sessions) for b, p in list_wk_worktrees()]
+
+
+def _repo_label(path: Path) -> str:
+    """Short repo name for a worktree PATH, for the global hub's repo column.
+
+    Fast path: wk worktrees live at `<repo>/.worktrees/<slug>`, so the repo is
+    two parents up — no subprocess. Falls back to `git rev-parse` for adopted
+    worktrees or a custom WK_WORKTREE_ROOT.
+    """
+    if path.parent.name == ".worktrees":
+        return path.parent.parent.name
+    r = run(["git", "-C", str(path), "rev-parse", "--show-toplevel"], check=False)
+    top = r.stdout.strip() if r.returncode == 0 else ""
+    return Path(top).name if top else path.name
+
+
+def external_wk_sessions(local_paths: set[Path]) -> list[Workspace]:
+    """Running wk sessions whose worktree is NOT in the current repo — the
+    cross-repo half of the global hub. Derived live from tmux: every session
+    carries @wk / @wk-branch / @wk-path, so no persistent registry is needed.
+    LOCAL_PATHS are the current repo's worktree paths, excluded to avoid dupes.
+    """
+    r = run(
+        ["tmux", "ls", "-F",
+         "#{session_name}\t#{@wk}\t#{@wk-branch}\t#{@wk-path}"],
+        check=False,
+    )
+    if r.returncode != 0:
+        return []
+    out: list[Workspace] = []
+    for line in r.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 4:
+            continue
+        name, flag, branch, path = (p.strip() for p in parts[:4])
+        if flag != "1" or not branch or not path:
+            continue  # not a wk workspace session (e.g. the dashboard)
+        p = Path(path).expanduser()
+        try:
+            resolved = p.resolve()
+        except OSError:
+            resolved = p
+        if resolved in local_paths:
+            continue  # this repo's own session — already in all_workspaces()
+        dirty, ahead, behind = _git_dirty_ahead_behind(p)
+        out.append(Workspace(
+            branch=branch, path=p, session=name, has_session=True,
+            dirty=dirty, ahead=ahead, behind=behind,
+        ))
+    return out
+
+
+def hub_workspaces() -> list[Workspace]:
+    """The global hub set: this repo's workspaces (running + idle) first, then
+    every running wk session in OTHER repos. Outside any repo, the local half
+    is empty and you still get all running agents — so the hub works anywhere.
+    """
+    local = all_workspaces()
+    local_paths: set[Path] = set()
+    for w in local:
+        try:
+            local_paths.add(w.path.resolve())
+        except OSError:
+            local_paths.add(w.path)
+    return local + external_wk_sessions(local_paths)
 
 
 def find_workspace(
@@ -923,16 +998,20 @@ def _shell_wrap(cmd: str) -> list[str]:
 # them proportionally when a client attaches. So these are the ratios that
 # look right, expressed in the cols / height-percent that tmux splits take.
 #
-# WIDE — 3-column widescreen layout: sidebar | agent | terminal, all full
-# height. Tuned for ~290-col windows (UWQHD 3440px). No lazygit pane (summon
-# it full-screen with `prefix M-g`) and no separate shell — the old layout's
-# always-on lazygit and its redundant second shell were dropped.
+# WIDE — widescreen layout: (sidebar over shell) | agent | terminal. Four
+# panes, three columns. No lazygit pane (summon it full-screen with
+# `prefix M-g`). The terminal column is deliberately wide so the agent doesn't
+# sprawl to ~65% of a big display — sessions are built at this virtual width
+# then scaled proportionally on attach, so the cap is a ratio, not absolute
+# cols.
 WIDE_WINDOW_COLS = 290    # virtual width the detached session is built at
 WIDE_WINDOW_ROWS = 75     # virtual height (reshaped on attach)
-WIDE_SIDEBAR_COLS = 42    # sidebar column — ~40 cols fits branch names and
-                          # `git status -sb` lines without wrapping
-WIDE_TERMINAL_COLS = 60   # right-hand terminal column; the agent takes the
-                          # whole middle remainder
+WIDE_SIDEBAR_COLS = 42    # left column (sidebar + shell) — ~40 cols fits branch
+                          # names and `git status -sb` lines without wrapping
+WIDE_TERMINAL_COLS = 90   # right-hand terminal column; wide enough that the
+                          # agent lands near ~half the screen, not ~two-thirds
+WIDE_SIDEBAR_PCT = 30     # sidebar's share of the left column height; the shell
+                          # below it gets the larger remainder
 
 # LAPTOP — 2-column layout for narrow displays: left column is the sidebar
 # stacked over a terminal, right column is a full-height agent. No lazygit or
@@ -980,15 +1059,17 @@ LAZYGIT_CMD = (
 
 
 def _build_wide(session: str, wt: Path, sidebar_id: str, agent: str) -> None:
-    """Finish the 3-column widescreen layout from an existing sidebar pane:
-    sidebar | agent | terminal, all full height. Selects the agent so the user
+    """Finish the widescreen layout from an existing sidebar pane:
+    (sidebar over shell) | agent | terminal. Selects the agent so the user
     lands there on attach. No lazygit pane (summon it with `prefix M-g`).
 
-        ┌────────┬──────────────────────┬──────────┐
-        │ sidebar│        agent         │ terminal │
-        └────────┴──────────────────────┴──────────┘
+        ┌────────┬──────────────────┬──────────────┐
+        │ sidebar│                  │              │
+        ├────────┤      agent       │   terminal   │
+        │ shell  │                  │              │
+        └────────┴──────────────────┴──────────────┘
     """
-    # Agent — everything right of the sidebar column.
+    # Agent — everything right of the left column.
     agent_id = run(
         [
             "tmux", "split-window", "-h",
@@ -1007,6 +1088,16 @@ def _build_wide(session: str, wt: Path, sidebar_id: str, agent: str) -> None:
             "-t", agent_id,
             "-c", str(wt),
             "-l", str(WIDE_TERMINAL_COLS),
+        ]
+    )
+
+    # Shell — split the left column below the sidebar (default shell).
+    run(
+        [
+            "tmux", "split-window", "-v",
+            "-t", sidebar_id,
+            "-c", str(wt),
+            "-l", f"{100 - WIDE_SIDEBAR_PCT}%",
         ]
     )
 
@@ -1059,12 +1150,14 @@ def _rebalance_wide(session: str) -> None:
 
     Targets panes by visual index, safe here because rebalance only runs on a
     fully-built, stable layout (tmux renumbers indices only while splitting).
-    Visual order: 1=sidebar, 2=agent, 3=terminal — all full height, so only
-    widths are set. `session:.N` pins the target to SESSION, not the attached
-    client's current session.
+    Visual order: 1=sidebar, 2=shell, 3=agent, 4=terminal. Resizing pane 1 sets
+    the left column's width and the sidebar's share of its height; pane 4 sets
+    the terminal column width. `session:.N` pins the target to SESSION, not the
+    attached client's current session.
     """
     run(["tmux", "resize-pane", "-t", f"{session}:.1", "-x", str(WIDE_SIDEBAR_COLS)], check=False)
-    run(["tmux", "resize-pane", "-t", f"{session}:.3", "-x", str(WIDE_TERMINAL_COLS)], check=False)
+    run(["tmux", "resize-pane", "-t", f"{session}:.1", "-y", f"{WIDE_SIDEBAR_PCT}%"], check=False)
+    run(["tmux", "resize-pane", "-t", f"{session}:.4", "-x", str(WIDE_TERMINAL_COLS)], check=False)
 
 
 def _rebalance_laptop(session: str) -> None:
@@ -1164,7 +1257,9 @@ def build_session(
         ┌────────┬──────────┬─────────┐   ┌────────┬─────────────────┐
         │ sidebar│          │         │   │ sidebar│                 │
         │ pane.1 │  agent   │terminal │   ├────────┤      agent      │
-        │        │  pane.2  │ pane.3  │   │terminal│                 │
+        ├────────┤  pane.3  │ pane.4  │   │terminal│                 │
+        │ shell  │          │         │   │        │                 │
+        │ pane.2 │          │         │   │        │                 │
         └────────┴──────────┴─────────┘   └────────┴─────────────────┘
     """
     wk = _wk_bin()
@@ -3108,11 +3203,18 @@ def switch(
 
     With BRANCH, jumps straight to that workspace (accepts the branch, its
     session-form slug, or the full session name). With no argument, opens the
-    fzf hub over all workspaces AND running tasks, with a live preview (task,
-    recent commits, git status) and single-key actions: enter=switch,
-    ctrl-n=new, ctrl-d=rm, ctrl-x=cancel a task, ctrl-r=refresh. A finished
-    `--auto` task shows ✓. Attaches when run outside tmux, switches the client
-    when inside.
+    fzf hub — this repo's workspaces (running + idle) first, then every running
+    wk session in OTHER repos (a `repo` column disambiguates), so you can jump
+    to any agent from anywhere, even outside a repo. Live preview (task, recent
+    commits, git status) and single-key actions: enter=switch, ctrl-n=new,
+    ctrl-d=rm, ctrl-x=cancel, ctrl-r=refresh. A finished `--auto` task shows ✓.
+    Attaches when run outside tmux, switches the client when inside.
+
+    Cross-repo discovery is derived live from tmux (each wk session is tagged
+    with its branch + path) — no registry, no new state. Idle workspaces in
+    OTHER repos aren't listed (nothing running to tag them); cd there to resume.
+    enter/switch works on any row; ctrl-d/ctrl-x act on the current repo (on a
+    cross-repo row they report no-match — switch in and act there).
 
     The hub does the *non-blocking* verbs in place; reading a task's live
     output or merging it are deliberately not bound here (they block or are
@@ -3121,15 +3223,15 @@ def switch(
     refreshes on demand (ctrl-r) to stay free of a background timer.
     """
     require("tmux")
-    workspaces = all_workspaces()
+    # The hub is global: this repo's workspaces first, then every running wk
+    # session in other repos — so `prefix W` works from anywhere, even outside
+    # a repo, and lets you jump to any agent.
+    workspaces = hub_workspaces()
     if not workspaces:
-        # First-run dead-end: a new user's first `prefix W` lands here. When
-        # we're interactive (a tty, e.g. inside the popup), offer to create one
-        # inline instead of just erroring. Headless callers (piped, or
-        # `wk switch <branch>`) keep the non-zero die so scripts see the failure.
-        if branch is None and sys.stdin.isatty():
-            # We got here, so all_workspaces() succeeded — we're in a repo.
-            # Name it (and the base) so it's clear WHERE the branch will land.
+        # Nothing anywhere to switch to. Interactive + in a repo → offer to
+        # create the first workspace (named so it's clear WHERE it lands).
+        # Headless or outside a repo → a clear die (scripts still see failure).
+        if branch is None and sys.stdin.isatty() and in_git_repo():
             repo = repo_root()
             console.print(
                 f"No wk workspaces in [bold]{repo.name}[/bold] "
@@ -3144,6 +3246,9 @@ def switch(
                 raise typer.Exit(0)
             open_ref(name, DEFAULT_BASE, no_attach=False, no_fetch=False)
             return
+        if not in_git_repo():
+            die("no running wk sessions",
+                hint="cd into a repo and `wk new <branch>` to start one")
         die("no workspaces to switch to", hint="`wk new <branch>` creates one")
 
     target: Optional[Workspace] = None
@@ -3698,10 +3803,11 @@ def sidebar() -> None:
 
 @app.command("_list-once", hidden=True)
 def list_once() -> None:
-    """Internal: dump one workspace list line per workspace, tab-delimited
-    `session\\tdisplay`. Used by fzf --reload after destructive actions."""
+    """Internal: dump one row per workspace, tab-delimited `session\\tdisplay`.
+    Used by the hub's fzf --reload. Must match the picker's initial set exactly
+    (the global hub) or the list jumps on reload — so it uses hub_workspaces()."""
     current = current_session()
-    for w in all_workspaces():
+    for w in hub_workspaces():
         print(_picker_line(w, current))
 
 
@@ -3712,9 +3818,13 @@ def preview(session: str = typer.Argument(...)) -> None:
     Shows the task prompt (if any), recent commits, and `git status` for
     the worktree associated with SESSION. Designed to be invoked by fzf's
     --preview, so output is plain text + ANSI color (no Rich markup).
+
+    Uses the global hub set so it resolves cross-repo sessions too — matching
+    what the picker lists. (All the git below is keyed off the worktree path,
+    so it works regardless of which repo SESSION lives in.)
     """
     target = next(
-        (w for w in all_workspaces() if w.session == session),
+        (w for w in hub_workspaces() if w.session == session),
         None,
     )
     if target is None:

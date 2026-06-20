@@ -131,25 +131,30 @@ wk rm release/v35 --keep-branch   # remove worktree but keep the branch ref
 
 ## Pane layout
 
-wk has two layout profiles. The **widescreen** layout (3 columns) is the default
-on wide displays; the **laptop** layout (2 columns) kicks in on narrow ones.
+wk has two layout profiles. The **widescreen** layout (3 columns, 4 panes) is
+the default on wide displays; the **laptop** layout (2 columns) kicks in on
+narrow ones.
 Either way, lazygit is summoned on demand with `prefix M-g` (full-screen popup),
 not an always-on pane.
 
 ### Widescreen (`wide`)
 
 ```
-┌──────────┬──────────────────────────┬──────────────────┐
-│ sidebar  │                          │                  │
-│ pane.1   │   agent (Claude Code)    │   terminal       │
-│          │   pane.2                 │   pane.3         │
-└──────────┴──────────────────────────┴──────────────────┘
+┌──────────┬──────────────────────┬──────────────────┐
+│ sidebar  │                      │                  │
+│ pane.1   │   agent (Claude)     │   terminal       │
+├──────────┤   pane.3             │   pane.4         │
+│ shell    │                      │                  │
+│ pane.2   │                      │                  │
+└──────────┴──────────────────────┴──────────────────┘
 ```
 
 - **sidebar** — passive read-only dashboard of all wk workspaces (auto-refreshes
   every 3s; tune with `WK_SIDEBAR_REFRESH`)
+- **shell** — a login shell, stacked under the sidebar for quick commands
 - **agent** — Claude Code (or whatever `WK_AGENT_CMD` is set to)
-- **terminal** — a regular login shell
+- **terminal** — the right column; a generous login shell (kept wide so the
+  agent doesn't sprawl on a big display)
 - **lazygit** — `prefix M-g` opens it full-screen at the active pane's cwd
 
 ### Laptop (`laptop`)
@@ -184,7 +189,7 @@ The sidebar pane is **read-only** — you don't navigate into it. To switch:
 
 | binding | what |
 |---|---|
-| `prefix W` | the **hub** — popup picker (fzf) over existing workspaces **and running tasks**; switch on Enter. A finished `--auto` task shows ✓. |
+| `prefix W` | the **hub** — popup picker (fzf) over this repo's workspaces **and every running wk session across all repos** (a `repo` column disambiguates); switch on Enter, from anywhere. A finished `--auto` task shows ✓. |
 | `prefix O` | popup picker over **all git branches** (local + remote), sorted by most recent commit. Markers show wk status (●=session running, ·=worktree only). Pick one → if it has a wk workspace, switches to it; otherwise creates one. |
 | `prefix W` then `ctrl-n` | prompt for a new branch and create it |
 | `prefix W` then `ctrl-d` | delete the highlighted workspace |
