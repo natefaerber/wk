@@ -69,9 +69,19 @@ The `wk` script uses `#!/usr/bin/env -S uv run --script` and inline
 
 ### Workspace = worktree + session + marker
 A wk workspace is the triple of:
-1. A git worktree on its own branch (at `<repo>/.worktrees/<branch-slug>/`
+1. A git worktree on its own branch (at `<repo>/.worktrees/<branch>/`
    by default — nested inside the repo, kept out of `git status` via
    `.git/info/exclude`; override the location via `WK_WORKTREE_ROOT`).
+   `worktree_path()` preserves the branch's `/` as directory hierarchy, so
+   `fix/LPE-1544` lives at `.worktrees/fix/LPE-1544`. Directory naming and
+   session naming are deliberately decoupled: only sessions flatten to a
+   slug. Consequences to keep in mind when touching this code — a worktree
+   sits at a *variable* depth below `.worktrees`, so never derive the repo
+   or branch by walking a fixed number of parents (see `_repo_label`); and
+   `wk rm` must prune the now-empty prefix dirs it leaves behind (see
+   `_prune_empty_parents`). Pre-0.10 flat worktrees keep working untouched,
+   since every path comes from `git worktree list`, never from re-deriving
+   it from the branch.
 2. A tmux session named after the branch, project-scoped via
    `session_name()`: the slugified repo name is prefixed (slashes/dots →
    hyphens), so `<repo>-<branch-slug>`. The prefix is what keeps two

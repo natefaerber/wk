@@ -268,9 +268,30 @@ def worktree_root() -> Path:
 
 
 def worktree_path(branch: str) -> Path:
-    # branches like `feat/foo` become `feat-foo` on disk to avoid nested dirs
-    safe = branch.replace("/", "-")
-    return worktree_root() / safe
+    """Where BRANCH's worktree goes on disk, preserving its hierarchy.
+
+    `fix/LPE-1544` lands at `.worktrees/fix/LPE-1544`, not
+    `.worktrees/fix-LPE-1544`. Prefixes (`feat/`, `fix/`, `chore/`) stay
+    browsable subdirs instead of becoming part of one long flat name, and the
+    result matches what a hand-rolled `git worktree add <path>` produces — so
+    wk and manually-made worktrees agree on one layout rather than fragmenting
+    a repo across two.
+
+    Session names still flatten (tmux rejects `/`), so directory naming and
+    session naming are deliberately decoupled — see `session_name`.
+
+    Git's ref rules already forbid the shapes that would escape the root
+    (`..`, leading/trailing `/`, `//`), but this builds a filesystem path out
+    of a name that arrives as user input, so the containment check is cheap
+    insurance rather than a theoretical nicety.
+    """
+    # normpath both sides: a WK_WORKTREE_ROOT with `..` in it would otherwise
+    # fail the containment check against its own normalized descendant.
+    root = Path(os.path.normpath(worktree_root()))
+    path = Path(os.path.normpath(root / branch))
+    if root not in path.parents:
+        die(f"refusing to place a worktree outside {root}: {branch!r}")
+    return path
 
 
 def ensure_worktrees_ignored() -> None:
@@ -871,12 +892,20 @@ def all_workspaces() -> list[Workspace]:
 def _repo_label(path: Path) -> str:
     """Short repo name for a worktree PATH, for the global hub's repo column.
 
-    Fast path: wk worktrees live at `<repo>/.worktrees/<slug>`, so the repo is
-    two parents up — no subprocess. Falls back to `git rev-parse` for adopted
-    worktrees or a custom WK_WORKTREE_ROOT.
+    Fast path: wk worktrees live under `<repo>/.worktrees/`, so the repo is
+    whatever sits directly above the `.worktrees` component — no subprocess.
+    Branch hierarchy is preserved in the path (`.worktrees/fix/foo`), so the
+    depth below `.worktrees` varies and we can't just walk two parents up.
+    Falls back to `git rev-parse` for adopted worktrees or a custom
+    WK_WORKTREE_ROOT.
     """
-    if path.parent.name == ".worktrees":
-        return path.parent.parent.name
+    parts = path.parts
+    if ".worktrees" in parts:
+        # rindex: the nearest `.worktrees` wins if a repo is itself nested
+        # inside another repo's worktree.
+        i = len(parts) - 1 - parts[::-1].index(".worktrees")
+        if i > 0:
+            return parts[i - 1]
     r = run(["git", "-C", str(path), "rev-parse", "--show-toplevel"], check=False)
     top = r.stdout.strip() if r.returncode == 0 else ""
     return Path(top).name if top else path.name
@@ -1554,7 +1583,10 @@ def resolve_workspace(
             f"  remove or rename it, then re-run"
         )
 
-    wt.parent.mkdir(parents=True, exist_ok=True)
+    # Only the root — `git worktree add` creates the branch's prefix dirs
+    # (`.worktrees/fix/`) itself, and only once it actually succeeds. Making
+    # them up front would strand empty prefix dirs whenever a later step dies.
+    worktree_root().mkdir(parents=True, exist_ok=True)
     # Nested `.worktrees/` would show as untracked in the main repo; exclude it.
     ensure_worktrees_ignored()
 
@@ -1988,7 +2020,10 @@ def open_pr_pull_ref(number: str, no_attach: bool) -> None:
             f"path exists but isn't a registered git worktree: {wt}\n"
             f"  remove or rename it, then re-run"
         )
-    wt.parent.mkdir(parents=True, exist_ok=True)
+    # Only the root — `git worktree add` creates the branch's prefix dirs
+    # (`.worktrees/fix/`) itself, and only once it actually succeeds. Making
+    # them up front would strand empty prefix dirs whenever a later step dies.
+    worktree_root().mkdir(parents=True, exist_ok=True)
     # Nested `.worktrees/` would show as untracked in the main repo; exclude it.
     ensure_worktrees_ignored()
 
@@ -3460,6 +3495,29 @@ def close(
     )
 
 
+def _prune_empty_parents(path: Path, root: Path) -> None:
+    """Delete now-empty prefix dirs left behind by a nested worktree.
+
+    Removing `.worktrees/fix/foo` leaves an empty `.worktrees/fix/` behind;
+    without this, `ls .worktrees/` slowly fills with hollow prefix dirs. Walks
+    up from PATH, stopping at ROOT (never removed) or at the first directory
+    that still has contents. Best-effort: any rmdir failure — a sibling
+    worktree, a permissions problem, an adopted worktree living outside ROOT —
+    just ends the walk.
+    """
+    try:
+        root = root.resolve()
+        cur = path.resolve().parent
+    except OSError:
+        return
+    while cur != root and root in cur.parents:
+        try:
+            cur.rmdir()  # only succeeds on an empty dir
+        except OSError:
+            return
+        cur = cur.parent
+
+
 def _do_rm(w: Workspace, main: Path, force: bool, keep_branch: bool) -> None:
     """The actual destructive work for `wk rm`: kill session, remove worktree,
     optionally delete the branch. Best-effort — git failures don't bubble up
@@ -3467,6 +3525,10 @@ def _do_rm(w: Workspace, main: Path, force: bool, keep_branch: bool) -> None:
     better than a half-done abort."""
     if w.has_session:
         run(["tmux", "kill-session", "-t", w.session], check=False)
+    # Capture the root *before* the removal: worktree_root() resolves from the
+    # cwd's repo, and in the detached-rm case the cwd is the worktree we're
+    # about to delete out from under ourselves.
+    wt_root = worktree_root()
     args = ["git", "-C", str(main), "worktree", "remove", str(w.path)]
     if force:
         args.append("--force")
@@ -3479,6 +3541,7 @@ def _do_rm(w: Workspace, main: Path, force: bool, keep_branch: bool) -> None:
             f"{wt_result.stderr.strip() or 'git worktree remove failed'}"
         )
         return
+    _prune_empty_parents(w.path, wt_root)
     if not keep_branch:
         # `-d` refuses to delete an unmerged branch; only escalate to the
         # force-delete `-D` when the caller passed --force. A clean worktree can

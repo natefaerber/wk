@@ -23,7 +23,7 @@ wk open release/v35
 
 - If a worktree already exists for `release/v35` anywhere, wk reuses it.
 - If only the branch exists, wk adds a worktree at
-  `~/_Work/credo-backend/.worktrees/release-v35` and checks it out.
+  `~/_Work/credo-backend/.worktrees/release/v35` and checks it out.
 - If the branch only exists on `origin`, wk fetches and creates a local tracking
   branch.
 - If neither exists, wk creates `release/v35` from `origin/main`.
@@ -237,7 +237,7 @@ Every pane in a wk session has these env vars set:
 | `WK_IN_WORKSPACE` | `1` |
 | `WK_SESSION` | `credo-backend-release-v35` (repo-prefixed slug, no slashes) |
 | `WK_BRANCH` | `release/v35` (canonical ref) |
-| `WK_PATH` | `/Users/nate/_Work/credo-backend/.worktrees/release-v35` |
+| `WK_PATH` | `/Users/nate/_Work/credo-backend/.worktrees/release/v35` |
 
 And `.wk/AGENTS.md` in the worktree root documents the layout + commands for
 the agent. Reference it from your project `CLAUDE.md` to give Claude
@@ -263,7 +263,11 @@ auto-context:
 - Commands that take a branch (`open`, `close`, `rm`, `switch`, `cd`, …) still
   accept any of three forms: the real branch (`release/v35`), the bare slug
   (`release-v35`), or the full prefixed session name (`credo-backend-release-v35`).
-- Worktree paths use the bare slug (no prefix): `<repo>/.worktrees/release-v35`.
+- Worktree paths keep the branch's hierarchy: `<repo>/.worktrees/release/v35`.
+  Prefixes (`feat/`, `fix/`, `chore/`) stay browsable subdirs, and the layout
+  matches a hand-rolled `git worktree add`. Only session names flatten to a
+  slug — tmux rejects `/`. Worktrees created before 0.10 keep their flat
+  paths and keep working; wk reads the real path from git.
 
 ---
 

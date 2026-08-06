@@ -12,6 +12,7 @@ from __future__ import annotations
 import subprocess
 
 import pytest
+import typer
 
 
 def fake_run(stdout: str = "", returncode: int = 0):
@@ -123,18 +124,50 @@ def test_orchestrator_env_override_trims_whitespace(wk, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# worktree_path — pure (+ env override). `feat/foo` maps to `feat-foo` on disk.
+# worktree_path — pure (+ env override). `feat/foo` keeps its hierarchy on
+# disk as `feat/foo`, so branch prefixes stay browsable subdirs.
 # --------------------------------------------------------------------------- #
 
 def test_worktree_path_env_override(wk, monkeypatch, tmp_path):
     monkeypatch.setenv(wk.WORKTREE_ROOT_ENV, str(tmp_path))
-    assert wk.worktree_path("feat/foo") == tmp_path / "feat-foo"
+    assert wk.worktree_path("feat/foo") == tmp_path / "feat" / "foo"
 
 
 def test_worktree_path_default_nested(wk, monkeypatch):
     monkeypatch.delenv(wk.WORKTREE_ROOT_ENV, raising=False)
-    monkeypatch.setattr(wk, "repo_root", lambda: pytest.importorskip("pathlib").Path("/repo"))
-    assert wk.worktree_path("feat/foo") == wk.Path("/repo/.worktrees/feat-foo")
+    monkeypatch.setattr(wk, "repo_root", lambda: wk.Path("/repo"))
+    assert wk.worktree_path("feat/foo") == wk.Path("/repo/.worktrees/feat/foo")
+
+
+def test_worktree_path_flat_branch_unchanged(wk, monkeypatch):
+    """A branch with no `/` sits directly in the root, exactly as before."""
+    monkeypatch.delenv(wk.WORKTREE_ROOT_ENV, raising=False)
+    monkeypatch.setattr(wk, "repo_root", lambda: wk.Path("/repo"))
+    assert wk.worktree_path("hotfix") == wk.Path("/repo/.worktrees/hotfix")
+
+
+def test_worktree_path_deep_hierarchy(wk, monkeypatch):
+    monkeypatch.delenv(wk.WORKTREE_ROOT_ENV, raising=False)
+    monkeypatch.setattr(wk, "repo_root", lambda: wk.Path("/repo"))
+    assert wk.worktree_path("fix/LPE-1544/part-2") == wk.Path(
+        "/repo/.worktrees/fix/LPE-1544/part-2"
+    )
+
+
+@pytest.mark.parametrize("branch", ["../escape", "feat/../../escape", "/abs", ""])
+def test_worktree_path_refuses_to_escape_root(wk, monkeypatch, branch):
+    """Git's ref rules forbid these, but the path is built from user input —
+    never resolve one outside the worktree root."""
+    monkeypatch.delenv(wk.WORKTREE_ROOT_ENV, raising=False)
+    monkeypatch.setattr(wk, "repo_root", lambda: wk.Path("/repo"))
+    with pytest.raises(typer.Exit):
+        wk.worktree_path(branch)
+
+
+def test_worktree_path_normalizes_root_with_dotdot(wk, monkeypatch, tmp_path):
+    """A WK_WORKTREE_ROOT containing `..` must not trip the containment check."""
+    monkeypatch.setenv(wk.WORKTREE_ROOT_ENV, str(tmp_path / "sub" / ".." / "wt"))
+    assert wk.worktree_path("feat/foo") == tmp_path / "wt" / "feat" / "foo"
 
 
 # --------------------------------------------------------------------------- #
@@ -290,3 +323,58 @@ def test_workspace_status_tolerates_vanished_worktree(wk, monkeypatch):
     assert ws.dirty is False
     assert ws.ahead == 0 and ws.behind == 0
     assert ws.branch == "feat/x"
+
+
+# --------------------------------------------------------------------------- #
+# _prune_empty_parents — nested worktree paths (`.worktrees/fix/foo`) leave an
+# empty `fix/` behind on `wk rm`. Prune it, but never past the root and never
+# a dir that still holds a sibling worktree.
+# --------------------------------------------------------------------------- #
+
+def test_prune_empty_parents_removes_empty_prefix(wk, tmp_path):
+    root = tmp_path / ".worktrees"
+    wt = root / "fix" / "foo"
+    wt.mkdir(parents=True)
+    wt.rmdir()  # git worktree remove already took the leaf
+    wk._prune_empty_parents(wt, root)
+    assert not (root / "fix").exists()
+    assert root.exists()  # the root itself is never removed
+
+
+def test_prune_empty_parents_stops_at_sibling(wk, tmp_path):
+    root = tmp_path / ".worktrees"
+    (root / "fix" / "bar").mkdir(parents=True)
+    wt = root / "fix" / "foo"
+    wt.mkdir()
+    wt.rmdir()
+    wk._prune_empty_parents(wt, root)
+    assert (root / "fix" / "bar").exists()  # sibling keeps the prefix alive
+
+
+def test_prune_empty_parents_walks_multiple_levels(wk, tmp_path):
+    root = tmp_path / ".worktrees"
+    wt = root / "a" / "b" / "c"
+    wt.mkdir(parents=True)
+    wt.rmdir()
+    wk._prune_empty_parents(wt, root)
+    assert not (root / "a").exists()
+    assert root.exists()
+
+
+def test_prune_empty_parents_leaves_flat_layout_alone(wk, tmp_path):
+    """A branch with no `/` has the root as its parent — nothing to prune."""
+    root = tmp_path / ".worktrees"
+    root.mkdir()
+    wk._prune_empty_parents(root / "hotfix", root)
+    assert root.exists()
+
+
+def test_prune_empty_parents_ignores_paths_outside_root(wk, tmp_path):
+    """Adopted worktrees live outside the root; never walk up into them."""
+    root = tmp_path / ".worktrees"
+    root.mkdir()
+    elsewhere = tmp_path / "adopted" / "thing"
+    elsewhere.mkdir(parents=True)
+    elsewhere.rmdir()
+    wk._prune_empty_parents(elsewhere, root)
+    assert (tmp_path / "adopted").exists()
