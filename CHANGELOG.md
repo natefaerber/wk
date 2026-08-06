@@ -7,6 +7,28 @@ from the [GitHub releases](https://github.com/natefaerber/wk/releases).
 
 ## [Unreleased]
 
+### Changed
+- **Worktree paths preserve the branch hierarchy.** `fix/LPE-1544` now lands at
+  `.worktrees/fix/LPE-1544` instead of `.worktrees/fix-LPE-1544`. Branch
+  prefixes (`feat/`, `fix/`, `chore/`) stay browsable subdirs rather than
+  becoming part of one long flat name, and the layout now matches what a
+  hand-rolled `git worktree add <path>` produces — so wk-made and manually-made
+  worktrees no longer fragment a repo across two conventions. Session names are
+  unaffected and still flatten to a slug (tmux rejects `/`).
+
+  **Existing worktrees keep working and are not migrated.** wk reads every path
+  from `git worktree list`, so pre-0.10 flat worktrees open, list, and remove
+  exactly as before. To adopt the new layout for one, `wk rm` it and `wk open`
+  it again.
+
+### Fixed
+- `wk rm` prunes the empty prefix dirs a nested worktree leaves behind, so
+  `.worktrees/` doesn't accumulate hollow `fix/` and `feat/` directories. Stops
+  at the first prefix that still holds a sibling worktree.
+- A failed `wk open` / `wk pr` no longer strands an empty prefix directory.
+  wk now pre-creates only `.worktrees/` itself and lets `git worktree add`
+  create the branch's prefix dirs, which it only does on success.
+
 ## [0.9.0] - 2026-06-20
 
 ### Added

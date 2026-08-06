@@ -20,7 +20,7 @@ allowed-tools:
 
 `wk` is a single-file Python CLI (`uv run --script`) that ties together git
 worktrees and tmux sessions. One workspace = one worktree at
-`<repo>/.worktrees/<branch-slug>/` + one tmux session (the slug, project-scoped
+`<repo>/.worktrees/<branch>/` + one tmux session (the slug, project-scoped
 with the repo name) + a `.wk/` marker dir. Sessions are tagged with `@wk = 1`
 so they show up in pickers and cycle bindings.
 
@@ -137,9 +137,12 @@ to die mid-command.
 - **Lazygit is on demand, not a pane**: the user summons it full-screen with
   `prefix M-g` (it opens at the active pane's cwd). There's no lazygit pane to
   manage.
-- **Slug vs canonical in paths**: worktree directories use slug form
-  (`release-v35`), but `git branch --show-current` returns canonical
-  (`release/v35`). Trust `WK_BRANCH` when both are available.
+- **Paths keep the branch hierarchy, sessions don't**: the worktree for
+  `release/v35` is at `.worktrees/release/v35`, but its session is the flat
+  slug `<repo>-release-v35` (tmux rejects `/`). So a path is not a session
+  name and vice versa — trust `WK_PATH` and `WK_BRANCH` when available rather
+  than converting between the two. Worktrees made before 0.10 may still sit at
+  a flat `.worktrees/release-v35`; both layouts work.
 
 ## When NOT to use wk
 

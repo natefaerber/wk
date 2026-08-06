@@ -57,6 +57,20 @@ def test_repo_label_fast_path_no_subprocess(wk):
     assert wk._repo_label(wk.Path("/x/myrepo/.worktrees/feat-x")) == "myrepo"
 
 
+def test_repo_label_fast_path_nested_branch(wk):
+    # Branch hierarchy is preserved on disk, so the worktree can sit several
+    # levels below `.worktrees` — the repo is still the dir just above it.
+    assert wk._repo_label(wk.Path("/x/myrepo/.worktrees/fix/LPE-1544")) == "myrepo"
+    assert wk._repo_label(wk.Path("/x/myrepo/.worktrees/a/b/c")) == "myrepo"
+
+
+def test_repo_label_fast_path_prefers_nearest_worktrees(wk):
+    # A repo cloned inside another repo's worktree: the nearest `.worktrees`
+    # component is the one that names the owning repo.
+    path = wk.Path("/x/outer/.worktrees/feat/inner/.worktrees/fix/y")
+    assert wk._repo_label(path) == "inner"
+
+
 def test_external_wk_sessions_parses_and_excludes_local(wk, monkeypatch):
     rows = "\n".join([
         "wk-feat-x\t1\tfeat/x\t/other/.worktrees/feat-x",   # external → keep
