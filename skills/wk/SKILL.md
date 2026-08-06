@@ -48,7 +48,8 @@ is the fastest). Don't flail on `command not found`.
 | user says… | run |
 |---|---|
 | "open / switch to `<branch>`" | `wk open <branch>` — forgiving: create or attach |
-| "new branch off `<base>`" | `wk new <branch> --base <base>` |
+| "set up a workspace to do X" | `wk open <branch> --task "<what and why>"` |
+| "new branch off `<base>`" | `wk new <branch> --base <base> --task "<what and why>"` |
 | "spawn a task to do X" (from an orchestrator branch) | `wk task "<prompt>" --base main` (add `--auto` for headless) |
 | "switch workspaces" / "what's running" | `wk switch` (fzf) or `wk list` |
 | "kill / clean up this workspace" | `wk close` (keep worktree) or `wk rm` (full destroy) |
@@ -60,6 +61,44 @@ is the fastest). Don't flail on `command not found`.
 adds the worktree, builds the session, or just attaches, depending on what
 already exists. Reach for `wk new` only when you specifically want it to error
 on collision.
+
+## Non-negotiables when setting up a workspace
+
+These are the three ways workspace setup actually goes wrong. Follow them even
+when the user's request is short.
+
+1. **Never create the worktree yourself.** No `git worktree add`, no
+   `tmux new-session`. wk owns the worktree/session/marker triple; a
+   hand-rolled worktree has no `.wk/` marker, so it's invisible to `wk ls`,
+   the sidebar, and every cleanup command. If a wk command seems not to fit,
+   say so rather than working around it.
+
+2. **Always pass the task.** `wk open <branch> --task "..."` / `wk task "..."`
+   generate `.wk/task.md` — a Goal / Context / Acceptance brief. This is the
+   *only* thing the agent that later opens that workspace will know: it did
+   not see your conversation. A workspace with no brief is one that re-derives
+   intent from a branch name and confidently does the wrong thing. Pass the
+   user's actual intent and constraints, not a restatement of the branch name.
+
+3. **Let wk name the branch when the user hasn't.** `wk task` names it from
+   the prompt (`<type>/<slug>`, e.g. `fix/flaky-session-test`) and asks you to
+   confirm. Don't invent `feature-1` or `my-changes`. If you're using
+   `wk open`, pick a name in that same `<type>/<slug>` shape — types are
+   `feat`, `fix`, `chore`, `docs`, `refactor`, `test`, `perf`, `spike`.
+   The `<type>/` becomes a real `.worktrees/<type>/` subdir.
+
+## Choosing a layout
+
+Panes are a per-workspace choice — `--layout wide|laptop|minimal` on `open`,
+`new`, and `task`:
+
+- `wide` — sidebar + shell | agent | terminal (a docked widescreen)
+- `laptop` — sidebar/terminal | agent (a narrow display)
+- `minimal` — agent | terminal, no sidebar (one focused task, or a screen-share)
+
+Default is the repo's `.wk/config` (`layout = minimal`), else auto by display
+width. Only pass `--layout` when the user asks for a specific shape; don't
+guess at it.
 
 ## Detecting context
 

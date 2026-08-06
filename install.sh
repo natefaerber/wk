@@ -6,7 +6,6 @@
 #   ~/.config/tmux/bin/wk-resurrect-filter       (resurrect hook helper)
 #   ~/.config/tmux/conf/wk.conf                  (tmux bindings + hook config)
 #   ~/.config/fish/functions/cdw.fish            (fish helper for `cd`)
-#   ~/.config/wk/lazygit.yml                     (narrow-pane lazygit config)
 #
 # Config edits:
 #   ~/.config/tmux/tmux.conf — adds a `source-file` line for wk.conf
@@ -78,7 +77,6 @@ FILES=(
   "wk-resurrect-filter:$TMUX_BIN_DIR/wk-resurrect-filter:0755"
   "wk.conf:$TMUX_CONF_DIR/wk.conf:0644"
   "cdw.fish:$FISH_FN_DIR/cdw.fish:0644"
-  "lazygit.yml:$WK_CONF_DIR/lazygit.yml:0644"
 )
 
 # The line we'll add to tmux.conf. Quoted as it'll appear in the file.

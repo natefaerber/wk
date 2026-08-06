@@ -26,7 +26,6 @@ User-facing docs:
 wk                  Single-file Python CLI (uv run --script). The whole program.
 wk.conf             tmux config — bindings, server options, pane border format.
 install.sh          Installer. Copies or symlinks files to ~/.local/bin etc.
-lazygit.yml         Narrow-pane lazygit config, installed to ~/.config/wk/lazygit.yml.
 cdw.fish            Fish helper: `cd (wk cd <branch>)` shortcut.
 wk-resurrect-filter Helper for tmux-resurrect: only saves wk-tagged sessions.
 CHEATSHEET.md       User-facing reference (single source of truth for flags).
@@ -95,22 +94,31 @@ A wk workspace is the triple of:
 
 The layout is built by `build_session()`, which picks a `LayoutProfile`
 (via `resolve_profile()`) and delegates the splits to `profile.build`.
-Two profiles live in the `LAYOUTS` registry:
+Three profiles live in the `LAYOUTS` registry:
 - **wide** (`_build_wide`) — three columns: (sidebar over shell) | agent |
   terminal. Visual pane indices (after tmux's tree-traversal renumbering):
   1=sidebar, 2=shell, 3=agent, 4=terminal. The terminal column is widened so
   the agent caps near ~half the screen instead of sprawling on a widescreen.
 - **laptop** (`_build_laptop`) — 2 columns: left = sidebar over terminal,
   right = full-height agent. Visual indices: 1=sidebar, 2=terminal, 3=agent.
+- **minimal** (`_build_minimal`) — 2 panes, no sidebar: agent | terminal.
+  Visual indices: 1=agent, 2=terminal.
 
-Neither layout has a lazygit or second-shell pane: lazygit is summoned
+No layout has a lazygit or second-shell pane: lazygit is summoned
 full-screen on demand (`prefix M-g` popup at the active pane's cwd).
 
-`resolve_profile()` precedence: explicit `--layout` > `$WK_LAYOUT` > auto
+`LayoutProfile.has_sidebar` is the one structural switch. `build_session`
+starts its *initial* pane on the sidebar when it's True and on the **agent**
+when it's False, then hands that pane's id to `profile.build` — so a builder
+always receives "the pane that already exists", whatever it's running.
+`_relayout-detached` mirrors the same choice when it respawns the survivor.
+
+`resolve_profile()` precedence: explicit `--layout` > `$WK_LAYOUT` >
+`<repo>/.wk/config` (`layout = …`, read by `repo_config()`) > auto
 by attach-display width (`_client_cols()` vs `$WK_WIDE_COLS`, default 220;
 headless → wide). The chosen profile's name is stored on the session as
 `@wk-layout` so `wk rebalance` knows which geometry to reset to.
-Per-profile geometry constants (`WIDE_*` / `LAPTOP_*`) and the rebalance
+Per-profile geometry constants (`WIDE_*` / `LAPTOP_*` / `MINIMAL_*`) and the rebalance
 sequences live next to the builders — change sizes there, not in `wk.conf`
 (the `M-w` binding just calls `wk rebalance`, which reads `@wk-layout`).
 `resolve_profile` is resolved in the *attached* parent for `wk relayout`
@@ -160,6 +168,39 @@ Users type branch names in either form — `feat/admin-phase-1` or
 any git operations. Without this, `wk open feat-admin-phase-1` would
 create a brand-new `feat-admin-phase-1` branch alongside the real
 `feat/admin-phase-1`. (We had that bug; fixed.)
+
+### Handoff briefs (`.wk/task.md`)
+
+A workspace outlives the conversation that created it, and the agent that
+opens it later never saw that conversation. `render_handoff()` one-shots
+`claude -p` to turn a `--task` string into a Goal/Context/Acceptance brief;
+`write_handoff()` persists it and **never clobbers an existing one** (the
+agent may have been editing it). Every failure mode degrades to
+`_handoff_fallback()`, which keeps the user's own words verbatim under Goal —
+losing them to a flaky AI call would be worse than no generation at all. A
+structurally-wrong reply (no `## Goal` / `## Acceptance`) is treated as a
+failure, because it reads authoritative while omitting what agents look for.
+
+Creation paths that write one: `wk new`, `wk open` (only when
+`state.created`), and `wk task`. Reopening never regenerates.
+
+### Per-repo config (`<repo>/.wk/config`)
+
+`key = value` lines in the **main checkout's** `.wk/`, read by
+`repo_config()` (cached on path+mtime so the always-on render loops don't
+re-read it per tick but still see edits). `repo_config_path()` swallows
+`SystemExit` as well as `Exception` — `repo_root()` exits outside a repo, and
+that must degrade to "no config" rather than killing a render loop. Only
+`layout` is consumed today.
+
+### Command-name shadowing
+
+Command functions live at module scope, so a helper that takes a `task=` or
+`layout=` kwarg but forgets to declare the parameter silently binds the
+*command function* instead of the caller's value. That shipped as a bug once
+(`open_ref` missing `task`), surfacing as
+`AttributeError: 'function' object has no attribute 'strip'`. When threading a
+new option through a helper chain, add the parameter at every hop.
 
 ### Orchestrator detection
 Branches in `{main, master, develop, trunk}` (override via
@@ -238,6 +279,7 @@ trigger an immediate redraw.
 | Yazi: TOML schema errors | yazi 26.5+ broke many older personal configs | wk-scoped `YAZI_CONFIG_HOME` (then later, dropped yazi for fd+fzf) |
 | `wk rm` kills its own Python process before finishing | killing the tmux session your process runs in → SIGHUP | `Popen` with `start_new_session=True` to detach |
 | Sidebar/dashboard never refreshes after a state change | the render loop is asleep | SIGUSR1 wakes `time.sleep()` early; bound to `prefix M-r` |
+| `AttributeError: 'function' object has no attribute 'strip'` | a helper took `task=`/`layout=` without declaring the parameter, so the name bound the module-level *command* | add the parameter at every hop of the helper chain |
 | Two branches with similar paths got confused | `.worktrees/feat/admin-phase-1` was on a *different* branch than its path suggested | always trust `git worktree list --porcelain`'s `branch refs/heads/X` line, not the path |
 
 ## Testing approach

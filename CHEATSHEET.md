@@ -131,9 +131,9 @@ wk rm release/v35 --keep-branch   # remove worktree but keep the branch ref
 
 ## Pane layout
 
-wk has two layout profiles. The **widescreen** layout (3 columns, 4 panes) is
+wk has three layout profiles. The **widescreen** layout (3 columns, 4 panes) is
 the default on wide displays; the **laptop** layout (2 columns) kicks in on
-narrow ones.
+narrow ones; **minimal** (2 panes, no sidebar) is opt-in.
 Either way, lazygit is summoned on demand with `prefix M-g` (full-screen popup),
 not an always-on pane.
 
@@ -170,14 +170,32 @@ not an always-on pane.
 Two columns: the left stacks the **sidebar** over a **terminal**; the right is
 a full-height **agent**. Same as `wide` minus the dedicated terminal column.
 
+### Minimal (`minimal`)
+
+```
+┌──────────────────────────────────────┬──────────────────┐
+│        agent (Claude Code)           │   terminal       │
+│        pane.1                        │   pane.2         │
+└──────────────────────────────────────┴──────────────────┘
+```
+
+Two panes, no sidebar — for a single focused task, a narrow split, or a
+screen-share where a live workspace list is noise. `wk ls` and `prefix W` still
+show everything the sidebar would, on demand instead of always-on. Aliased as
+`solo`.
+
 ### Choosing a layout
 
-By default wk **auto-detects** from the display width when it builds a session:
-a client at least `WK_WIDE_COLS` (default 220) columns wide gets `wide`, narrower
-gets `laptop`. Override per-invocation with `--layout wide|laptop` on `wk new` /
-`wk open` / `wk relayout`, or globally with `WK_LAYOUT=wide|laptop` (e.g. set it
-in your laptop's shell profile). Docked and undocked the same machine? Just
-`wk relayout` after switching displays — it re-detects.
+Precedence, highest first:
+
+1. `--layout wide|laptop|minimal` on `wk new` / `wk open` / `wk task` / `wk relayout`
+2. `WK_LAYOUT=wide|laptop|minimal` (e.g. set in your laptop's shell profile)
+3. `layout = minimal` in the repo's [`.wk/config`](#per-repo-config)
+4. **auto-detect** from display width — a client at least `WK_WIDE_COLS`
+   (default 220) columns wide gets `wide`, narrower gets `laptop`
+
+Docked and undocked the same machine? Just `wk relayout` after switching
+displays — it re-detects.
 
 `prefix M-w` (`wk rebalance`) resets pane sizes to the current layout's defaults.
 
@@ -251,6 +269,12 @@ auto-context:
 
 ## Branch naming gotchas
 
+- **Generated names use `<type>/<slug>`.** When wk names a branch for you
+  (`wk task`, or `wk open` without an explicit name), it asks Claude for
+  `fix/flaky-session-test` — one of `feat`, `fix`, `chore`, `docs`, `refactor`,
+  `test`, `perf`, `spike`, then a 2-6 word hyphenated slug. Override the type
+  vocabulary with `WK_BRANCH_TYPES`. Unprefixed names stay valid; the
+  deterministic fallback (used when `claude` is unavailable) produces one.
 - wk accepts both slash form (`release/v35`) and slug form (`release-v35`)
   for `open`. It resolves slug → canonical (with slashes) before doing any
   git ops, so you won't accidentally create a duplicate hyphen-named branch.
@@ -268,6 +292,50 @@ auto-context:
   matches a hand-rolled `git worktree add`. Only session names flatten to a
   slug — tmux rejects `/`. Worktrees created before 0.10 keep their flat
   paths and keep working; wk reads the real path from git.
+
+---
+
+## Handoff briefs (`.wk/task.md`)
+
+A workspace outlives the conversation that created it. The agent that opens it
+later never saw that conversation — so wk writes the intent down.
+
+Pass `--task` when you create one:
+
+```sh
+wk open fix/tenant-500s --task "500s on the tenant endpoint since the caching \
+  change; reproduce first, don't touch the schema"
+wk new  feat/bulk-export --task "..."
+wk task "investigate the tenant 500s"     # task always writes one
+```
+
+wk one-shots `claude -p` to turn that into `.wk/task.md` — **Goal**, **Context**,
+**Acceptance** — and the agent in the workspace is told to read it first. If
+`claude` is missing, slow, or returns something unstructured, you get a skeleton
+with your own words preserved verbatim under Goal; workspace creation never
+fails over this.
+
+Existing briefs are never overwritten, so reopening a workspace won't wipe notes
+the agent has been keeping. Without `--task` you get the empty skeleton to fill
+in yourself.
+
+## Per-repo config
+
+`<repo>/.wk/config` in the **main checkout** sets defaults for every workspace
+that repo spawns. Plain `key = value`, `#` comments:
+
+```ini
+# .wk/config
+layout = minimal
+```
+
+Worktree `.wk/` dirs are wk-managed scratch (gitignored by their own
+`.gitignore`); this one is in the main checkout and is yours to commit if you
+want the default shared with your team.
+
+| key | values | effect |
+|---|---|---|
+| `layout` | `wide` \| `laptop` \| `minimal` | default layout profile (below `--layout` and `WK_LAYOUT`) |
 
 ---
 
@@ -322,7 +390,8 @@ or to the orchestrator instead.
 
 ```
 wk new <branch>                  # create + attach (errors if branch exists)
-wk new <branch> --layout laptop  # force a layout (wide|laptop); default auto-detects
+wk new <branch> --layout laptop  # force a layout (wide|laptop|minimal); default auto-detects
+wk new <branch> --task "..."     # write a .wk/task.md handoff brief for the agent
 wk open <branch>                 # create-or-attach a branch workspace (forgiving)
 wk open <number|pr-url>          # open a pull request (same as `wk pr`)
 wk open <issue-url|KEY>          # resolve an issue (e.g. DEV-6266) to its PR, else start a branch
@@ -340,7 +409,7 @@ wk restore [branch]              # rebuild tmux session(s) for existing worktree
 wk restore --list                # show which worktrees would be restored (dry-run)
 wk restore                       # on a TTY: fzf multi-select picker (tab to mark)
 wk restore --all                 # rebuild every missing session, skip the picker
-wk relayout [--layout wide|laptop] # rebuild the layout in the current session (re-detects)
+wk relayout [--layout wide|laptop|minimal] # rebuild the layout in the current session (re-detects)
 wk rebalance                     # reset pane sizes to the current layout's defaults (prefix M-w)
 wk refresh-agents [branch|--all] # regenerate .wk/AGENTS.md and ORCHESTRATOR.md
 wk cd [branch]                   # print worktree path (for shell cd integration)
@@ -360,7 +429,8 @@ wk doctor                        # check deps + whether the tmux bindings are in
 | var | default | what |
 |---|---|---|
 | `WK_AGENT_CMD` | `claude -c \|\| claude` | command run in the agent pane |
-| `WK_LAYOUT` | _(auto)_ | force a layout profile: `wide` or `laptop` (overrides auto-detect) |
+| `WK_LAYOUT` | _(auto)_ | force a layout profile: `wide`, `laptop`, or `minimal` (overrides auto-detect) |
+| `WK_BRANCH_TYPES` | `feat,fix,chore,docs,refactor,test,perf,spike` | allowed `<type>/` branch prefixes |
 | `WK_WIDE_COLS` | `220` | auto-detect threshold: clients ≥ this many cols get `wide`, else `laptop` |
 | `WK_WORKTREE_ROOT` | `<repo>/.worktrees/` | where to put worktrees |
 | `WK_PR_REPO_ROOT` | `~/_Work` | where `wk open`/`wk pr` look for a PR-by-URL's local clone |
@@ -372,7 +442,7 @@ wk doctor                        # check deps + whether the tmux bindings are in
 
 ## Install / update
 
-### From source (full setup — installs tmux config, fish helper, lazygit config)
+### From source (full setup — installs tmux config and the fish `cd` helper)
 
 ```fish
 cd ~/path/to/wk

@@ -7,7 +7,37 @@ from the [GitHub releases](https://github.com/natefaerber/wk/releases).
 
 ## [Unreleased]
 
+### Added
+- **Handoff briefs.** `wk open` / `wk new` take `--task "<what and why>"`, and
+  `wk task` always writes one: wk one-shots `claude -p` to turn it into a
+  `.wk/task.md` with **Goal**, **Context**, and **Acceptance** sections, and
+  the workspace's `.wk/AGENTS.md` now tells the agent to read it first. A
+  workspace outlives the conversation that made it — without this, the agent
+  that opens it later re-derives intent from a branch name. Existing briefs
+  are never overwritten. Every failure path (no `claude`, timeout, malformed
+  or unstructured reply) falls back to a skeleton that preserves your own
+  words verbatim; workspace creation never fails over it.
+- **`minimal` layout** (`--layout minimal`, alias `solo`): two panes, agent |
+  terminal, no sidebar — for a single focused task, a narrow split, or a
+  screen-share. `wk ls` / `prefix W` still show everything the sidebar would.
+- **Per-repo config at `<repo>/.wk/config`.** `key = value` lines in the main
+  checkout; `layout = minimal` sets that repo's default. Sits below `--layout`
+  and `$WK_LAYOUT` in precedence, above width auto-detection.
+- **`--layout` on `wk task`**, matching `wk open` / `wk new`.
+
 ### Changed
+- **Generated branch names are `<type>/<slug>`** — `fix/flaky-session-test`
+  rather than `fix-flaky-session-test`. Now that worktree paths preserve
+  hierarchy, the `<type>/` is a real `.worktrees/fix/` subdir. Types are
+  `feat`, `fix`, `chore`, `docs`, `refactor`, `test`, `perf`, `spike`,
+  overridable with `WK_BRANCH_TYPES`. Unprefixed names remain valid, and the
+  deterministic fallback still produces one.
+- **`wk task` writes a structured brief** instead of dumping the raw prompt
+  into `.wk/task.md`.
+- **The `/wk` skill states the three workspace-setup non-negotiables** — never
+  hand-roll the worktree, always pass the task, let wk name the branch — after
+  agents were observed doing all three wrong.
+
 - **Worktree paths preserve the branch hierarchy.** `fix/LPE-1544` now lands at
   `.worktrees/fix/LPE-1544` instead of `.worktrees/fix-LPE-1544`. Branch
   prefixes (`feat/`, `fix/`, `chore/`) stay browsable subdirs rather than
@@ -28,6 +58,11 @@ from the [GitHub releases](https://github.com/natefaerber/wk/releases).
 - A failed `wk open` / `wk pr` no longer strands an empty prefix directory.
   wk now pre-creates only `.worktrees/` itself and lets `git worktree add`
   create the branch's prefix dirs, which it only does on success.
+
+### Removed
+- **`lazygit.yml`** and its install step. It tuned lazygit for the narrow side
+  pane that 0.8.0 removed, and the `prefix M-g` popup never actually loaded it
+  (`LAZYGIT_CMD` was dead code). The popup now uses your normal lazygit config.
 
 ## [0.9.0] - 2026-06-20
 
