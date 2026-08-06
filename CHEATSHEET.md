@@ -295,6 +295,43 @@ auto-context:
 
 ---
 
+## Issue refs (Jira / Linear)
+
+`wk open` accepts a ticket instead of a branch. It finds the PR for that issue
+(current repo, then org-wide) and opens its workspace; with no PR it starts a
+branch named after the key off `--base`.
+
+```sh
+wk open https://acme.atlassian.net/browse/DEV-6266   # Jira URL
+wk open https://linear.app/acme/issue/ENG-123/fix-it # Linear URL
+wk open DEV-6266                                     # bare key
+```
+
+Tracker **URLs** always work. **Bare keys** are ambiguous — `API-2` could be a
+ticket or a branch — so tell wk which projects are real:
+
+```ini
+# .wk/config
+issue_prefixes = LPE, ENG
+```
+
+or `WK_ISSUE_PREFIXES=LPE,ENG` (env wins). With prefixes configured, matching
+gets both stricter and more forgiving:
+
+| ref | unconfigured | `issue_prefixes = LPE, ENG` |
+|---|---|---|
+| `LPE-1544` | ticket | ticket |
+| `lpe-1544` | branch name | ticket |
+| `ENG-123/fix-it` (Linear picker) | branch name | ticket |
+| `eng-123-fix-it` (Linear "copy git branch name") | branch name | ticket |
+| `API-2` (not a real project) | **ticket** ← false positive | branch name |
+
+If a workspace already exists for the issue's branch, `wk open <key>` reopens it
+rather than re-resolving the ticket — so you land back where you were working,
+not on whatever PR the search turns up today.
+
+---
+
 ## Handoff briefs (`.wk/task.md`)
 
 A workspace outlives the conversation that created it. The agent that opens it
@@ -336,6 +373,7 @@ want the default shared with your team.
 | key | values | effect |
 |---|---|---|
 | `layout` | `wide` \| `laptop` \| `minimal` | default layout profile (below `--layout` and `WK_LAYOUT`) |
+| `issue_prefixes` | e.g. `LPE, ENG` | project/team keys that mark a ref as a ticket (below `WK_ISSUE_PREFIXES`) |
 
 ---
 
@@ -431,6 +469,7 @@ wk doctor                        # check deps + whether the tmux bindings are in
 | `WK_AGENT_CMD` | `claude -c \|\| claude` | command run in the agent pane |
 | `WK_LAYOUT` | _(auto)_ | force a layout profile: `wide`, `laptop`, or `minimal` (overrides auto-detect) |
 | `WK_BRANCH_TYPES` | `feat,fix,chore,docs,refactor,test,perf,spike` | allowed `<type>/` branch prefixes |
+| `WK_ISSUE_PREFIXES` | _(none)_ | project/team keys (`LPE,ENG`) that make issue-ref matching exact |
 | `WK_WIDE_COLS` | `220` | auto-detect threshold: clients ≥ this many cols get `wide`, else `laptop` |
 | `WK_WORKTREE_ROOT` | `<repo>/.worktrees/` | where to put worktrees |
 | `WK_PR_REPO_ROOT` | `~/_Work` | where `wk open`/`wk pr` look for a PR-by-URL's local clone |

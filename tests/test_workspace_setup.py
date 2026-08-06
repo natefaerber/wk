@@ -233,3 +233,100 @@ def test_minimal_profile_has_no_sidebar(wk):
 def test_layout_aliases(wk, monkeypatch, alias, expected):
     monkeypatch.delenv("WK_LAYOUT", raising=False)
     assert wk.resolve_profile(alias).name == expected
+
+
+# --------------------------------------------------------------------------- #
+# Issue refs — Jira / Linear. Configured prefixes turn a plausible match into a
+# precise one: unconfigured, any uppercase `AB-1` token is treated as a ticket.
+# --------------------------------------------------------------------------- #
+
+@pytest.fixture
+def no_prefixes(wk, monkeypatch):
+    monkeypatch.delenv("WK_ISSUE_PREFIXES", raising=False)
+    monkeypatch.setattr(wk, "repo_config", dict)
+
+
+@pytest.fixture
+def prefixes(wk, monkeypatch):
+    monkeypatch.setenv("WK_ISSUE_PREFIXES", "LPE,ENG")
+    monkeypatch.setattr(wk, "repo_config", dict)
+
+
+@pytest.mark.parametrize("url,key", [
+    ("https://acme.atlassian.net/browse/DEV-6266", "DEV-6266"),
+    ("https://linear.app/acme/issue/ENG-123/fix-the-thing", "ENG-123"),
+    ("https://linear.app/acme/issue/ENG-123", "ENG-123"),
+])
+def test_issue_urls_match_without_config(wk, no_prefixes, url, key):
+    """A tracker URL is unambiguous — it shouldn't need configuring."""
+    assert wk.parse_issue_ref(url) == key
+
+
+def test_issue_url_matches_even_if_prefix_not_configured(wk, prefixes):
+    assert wk.parse_issue_ref("https://acme.atlassian.net/browse/DEV-6266") == "DEV-6266"
+
+
+@pytest.mark.parametrize("ref,key", [
+    ("DEV-6266", "DEV-6266"),
+    ("ENG-123", "ENG-123"),
+    ("API-2", "API-2"),      # the false-positive prefixes exist to prevent
+])
+def test_bare_keys_fall_back_to_generic_shape(wk, no_prefixes, ref, key):
+    assert wk.parse_issue_ref(ref) == key
+
+
+@pytest.mark.parametrize("ref", ["lpe-1544", "ENG-123/fix-the-thing", "feat/x"])
+def test_generic_shape_rejects_lowercase_and_slugs(wk, no_prefixes, ref):
+    """Unanchored to a known project, these would swallow branch names."""
+    assert wk.parse_issue_ref(ref) is None
+
+
+@pytest.mark.parametrize("ref,key", [
+    ("LPE-1544", "LPE-1544"),
+    ("lpe-1544", "LPE-1544"),                 # case-insensitive once configured
+    ("ENG-123/fix-the-thing", "ENG-123"),     # Linear issue picker
+    ("eng-123-fix-the-thing", "ENG-123"),     # Linear "copy git branch name"
+])
+def test_configured_prefixes_match(wk, prefixes, ref, key):
+    assert wk.parse_issue_ref(ref) == key
+
+
+@pytest.mark.parametrize("ref", ["DEV-6266", "API-2", "fix-tenant-500s", "feat/x"])
+def test_configured_prefixes_reject_everything_else(wk, prefixes, ref):
+    """The whole point: an unconfigured key is a branch name, not a ticket."""
+    assert wk.parse_issue_ref(ref) is None
+
+
+def test_issue_prefixes_from_repo_config(wk, monkeypatch):
+    monkeypatch.delenv("WK_ISSUE_PREFIXES", raising=False)
+    monkeypatch.setattr(wk, "repo_config", lambda: {"issue_prefixes": "lpe, eng"})
+    assert wk.issue_prefixes() == ("LPE", "ENG")
+    assert wk.parse_issue_ref("lpe-1544") == "LPE-1544"
+
+
+def test_env_beats_repo_config(wk, monkeypatch):
+    monkeypatch.setenv("WK_ISSUE_PREFIXES", "ZZZ")
+    monkeypatch.setattr(wk, "repo_config", lambda: {"issue_prefixes": "LPE"})
+    assert wk.issue_prefixes() == ("ZZZ",)
+
+
+def test_issue_prefixes_accepts_space_separated(wk, monkeypatch):
+    monkeypatch.setenv("WK_ISSUE_PREFIXES", "LPE ENG")
+    monkeypatch.setattr(wk, "repo_config", dict)
+    assert wk.issue_prefixes() == ("LPE", "ENG")
+
+
+def test_existing_workspace_short_circuits_issue_lookup(wk, monkeypatch):
+    """`open_issue` names its branch `key.lower()`, so with prefixes configured
+    that branch classifies as an issue again. Reopening must attach to what's
+    on disk, not re-resolve the ticket to a possibly-different PR."""
+    monkeypatch.setattr(wk, "find_existing_worktree",
+                        lambda b: ("lpe-1544", wk.Path("/repo/.worktrees/lpe-1544")))
+    assert wk._existing_workspace_for_issue("LPE-1544") is True
+
+
+def test_existing_workspace_check_survives_git_failure(wk, monkeypatch):
+    def boom(_):
+        raise RuntimeError("git exploded")
+    monkeypatch.setattr(wk, "find_existing_worktree", boom)
+    assert wk._existing_workspace_for_issue("LPE-1544") is False

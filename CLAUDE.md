@@ -193,6 +193,23 @@ re-read it per tick but still see edits). `repo_config_path()` swallows
 that must degrade to "no config" rather than killing a render loop. Only
 `layout` is consumed today.
 
+### Issue refs (`parse_issue_ref`)
+
+Two layers. Tracker **URLs** (Jira browse, Linear issue) match unconditionally
+— a URL is unambiguous. **Bare keys** depend on `issue_prefixes()`
+(`WK_ISSUE_PREFIXES` > repo config): unconfigured, wk falls back to a generic
+`^[A-Z][A-Z0-9]+-\d+$`, which is case-sensitive on purpose because an
+unanchored lowercase match would swallow ordinary branch names. Configured, the
+pattern is built from the real project keys, so it can safely be
+case-insensitive and tolerate a trailing `/slug` or `-slug` (Linear's two
+copy-branch-name formats).
+
+`open_issue` names its branch `key.lower()`, which means that branch re-matches
+as an issue once prefixes are configured. `_existing_workspace_for_issue()`
+short-circuits to reopening the existing worktree — otherwise `wk open lpe-1544`
+would do a gh round-trip and could land on a different PR than the one you were
+in.
+
 ### Command-name shadowing
 
 Command functions live at module scope, so a helper that takes a `task=` or

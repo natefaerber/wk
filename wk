@@ -2007,23 +2007,83 @@ def gh_pr_info(number: str, repo_slug: Optional[str] = None) -> dict:
 # An issue-tracker URL (Jira cloud) or a bare issue key. Jira keys are
 # uppercase (PROJ-123); the bare-key form requires uppercase so we don't
 # mistake a lowercase branch name like `feat-12` for an issue key.
-_JIRA_URL_RE = re.compile(r"atlassian\.net/browse/(?P<key>[A-Za-z][A-Za-z0-9]+-\d+)")
+# Issue-tracker URLs. Jira browse links and Linear issue links; both carry the
+# key in the same `TEAM-123` shape, so one capture group serves both.
+_ISSUE_URL_RES = (
+    re.compile(r"atlassian\.net/browse/(?P<key>[A-Za-z][A-Za-z0-9]*-\d+)"),
+    re.compile(r"linear\.app/[^/\s]+/issue/(?P<key>[A-Za-z][A-Za-z0-9]*-\d+)"),
+)
+
+# Fallback shape when no prefixes are configured: any uppercase token + number.
+# Deliberately strict about case — unanchored to a known project, a lowercase
+# match would swallow ordinary branch names.
 _ISSUE_KEY_RE = re.compile(r"^(?P<key>[A-Z][A-Z0-9]+-\d+)$")
+
+# Linear's "copy git branch name" gives `eng-123-fix-the-thing`; its issue
+# picker gives `ENG-123/fix-the-thing`. Both lead with the key.
+_ISSUE_KEY_PREFIXED_RE_TMPL = r"^(?P<key>(?:{alts})-\d+)(?:[/-].*)?$"
+
+
+def issue_prefixes() -> tuple[str, ...]:
+    """Configured project / team keys (`LPE`, `DEV`, `ENG`), uppercased.
+
+    `WK_ISSUE_PREFIXES` wins, else `issue_prefixes` in the repo's
+    `.wk/config` — so a repo can carry its own trackers and you don't have to
+    export anything per shell. Empty means "not configured": wk falls back to
+    the generic uppercase shape.
+
+    Configuring these makes the match *precise* rather than merely plausible.
+    It's what lets wk accept `lpe-1544` and `ENG-123/fix-the-thing` without
+    those swallowing ordinary branch names.
+    """
+    raw = os.environ.get("WK_ISSUE_PREFIXES") or repo_config().get("issue_prefixes", "")
+    return tuple(p.strip().upper() for p in raw.replace(" ", ",").split(",") if p.strip())
+
+
+def _issue_key_re() -> Optional[re.Pattern]:
+    """Bare-key matcher built from the configured prefixes, or None if unset."""
+    prefixes = issue_prefixes()
+    if not prefixes:
+        return None
+    alts = "|".join(re.escape(p) for p in prefixes)
+    return re.compile(_ISSUE_KEY_PREFIXED_RE_TMPL.format(alts=alts), re.IGNORECASE)
 
 
 def parse_issue_ref(ref: str) -> Optional[str]:
     """Return the uppercased issue key if REF is an issue link / key, else None.
 
-    Accepts a Jira browse URL
-    (``https://site.atlassian.net/browse/DEV-6266``) or a bare uppercase
-    key (``DEV-6266``). A bare PR number falls through to `parse_pr_ref`.
+    Accepts, in order:
+
+    \b
+      a Jira browse URL      https://site.atlassian.net/browse/DEV-6266
+      a Linear issue URL     https://linear.app/acme/issue/ENG-123/fix-it
+      a configured key       LPE-1544, lpe-1544, ENG-123/fix-it  (see
+                             `issue_prefixes`; case-insensitive, and a
+                             trailing `/slug` or `-slug` is tolerated so
+                             Linear's copied branch names work)
+      a bare uppercase key   DEV-6266  (fallback when nothing is configured)
+
+    A bare PR number falls through to `parse_pr_ref`.
     """
     ref = ref.strip()
-    m = _JIRA_URL_RE.search(ref)
-    if m:
-        return m.group("key").upper()
+    for pattern in _ISSUE_URL_RES:
+        m = pattern.search(ref)
+        if m:
+            return m.group("key").upper()
+    configured = _issue_key_re()
+    if configured is not None:
+        m = configured.match(ref)
+        return m.group("key").upper() if m else None
     m = _ISSUE_KEY_RE.match(ref)
     return m.group("key").upper() if m else None
+
+
+def _existing_workspace_for_issue(key: str) -> bool:
+    """Is there already a worktree for this issue's branch (`key.lower()`)?"""
+    try:
+        return find_existing_worktree(key.lower()) is not None
+    except Exception:
+        return False
 
 
 def _in_git_repo() -> bool:
@@ -2208,10 +2268,17 @@ def open_ref(ref: str, base: str, no_attach: bool, no_fetch: bool,
     PR paths need `gh`, so it's required lazily.
     """
     issue_key = parse_issue_ref(ref)
-    if issue_key:
+    if issue_key and not _existing_workspace_for_issue(issue_key):
         require("gh")
         open_issue(issue_key, base=base, no_attach=no_attach, no_fetch=no_fetch)
         return
+    if issue_key:
+        # A workspace for this issue is already on disk. Reopen it instead of
+        # re-resolving the issue: `open_issue` names its branch `key.lower()`,
+        # so once prefixes are configured `wk open lpe-1544` classifies as an
+        # issue again — and a gh round-trip that might now land on a *different*
+        # PR is not what "open the thing I was working on" should mean.
+        ref = issue_key.lower()
 
     pr_ref = parse_pr_ref(ref)
     if pr_ref is not None:

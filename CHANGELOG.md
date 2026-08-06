@@ -24,6 +24,16 @@ from the [GitHub releases](https://github.com/natefaerber/wk/releases).
   checkout; `layout = minimal` sets that repo's default. Sits below `--layout`
   and `$WK_LAYOUT` in precedence, above width auto-detection.
 - **`--layout` on `wk task`**, matching `wk open` / `wk new`.
+- **Configurable issue prefixes** for `wk open <ticket>`. Set
+  `issue_prefixes = LPE, ENG` in `<repo>/.wk/config` (or `WK_ISSUE_PREFIXES`)
+  and wk matches those projects exactly: `lpe-1544` and Linear's
+  `ENG-123/fix-it` / `eng-123-fix-it` branch forms now resolve, while
+  `API-2` — which the old generic "uppercase token + number" shape treated as
+  a ticket — correctly reads as a branch name again. Unconfigured behaviour is
+  unchanged.
+- **Linear issue URLs** (`linear.app/<workspace>/issue/ENG-123/...`) alongside
+  the existing Jira browse links. Tracker URLs match with or without
+  configured prefixes.
 
 ### Changed
 - **Generated branch names are `<type>/<slug>`** — `fix/flaky-session-test`
@@ -34,6 +44,10 @@ from the [GitHub releases](https://github.com/natefaerber/wk/releases).
   deterministic fallback still produces one.
 - **`wk task` writes a structured brief** instead of dumping the raw prompt
   into `.wk/task.md`.
+- **`wk open <issue-key>` reopens an existing workspace** for that issue rather
+  than re-resolving the ticket. `open_issue` names its branch `key.lower()`, so
+  with prefixes configured that branch classifies as an issue again — and a
+  fresh search could land on a different PR than the one you were working in.
 - **The `/wk` skill states the three workspace-setup non-negotiables** — never
   hand-roll the worktree, always pass the task, let wk name the branch — after
   agents were observed doing all three wrong.
