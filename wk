@@ -657,6 +657,10 @@ These environment variables are set on every pane of the session:
 - `WK_SESSION` — the tmux session name (slug form, no slashes)
 - `WK_BRANCH` — the canonical git branch (may contain slashes)
 - `WK_PATH` — the worktree root (typically equal to your starting cwd)
+- `WK_ISSUE_KEY` / `WK_ISSUE_URL` — set when this workspace's branch carries a
+  tracker key (Jira or Linear). If they're set, **read the ticket before you
+  start**: it's the authoritative statement of the work, and `.wk/task.md` may
+  be only a skeleton pointing at it.
 
 ## Layout
 
@@ -726,8 +730,11 @@ Inspection / housekeeping:
 
 - The `.wk/` directory in this worktree is wk-managed and gitignored. You
   can write notes here (e.g. `.wk/notes.md`) that won't pollute the repo.
-- The `.wk/task.md` file, if present, is the original task prompt that
-  `wk task` was invoked with — useful as ground-truth context.
+- **Read `.wk/task.md` first if it exists.** It's the handoff brief for this
+  workspace — Goal / Context / Acceptance — written when the workspace was
+  created. Whoever set this up saw a conversation you didn't; that file is
+  what survived of it. Treat it as ground truth over anything you infer from
+  the branch name, and say so if it contradicts what you were told.
 - If `.wk/ORCHESTRATOR.md` exists, you are an orchestrator workspace
   (not a worker). Read it for additional instructions about spawning
   and harvesting parallel tasks.
@@ -1051,6 +1058,14 @@ LAPTOP_LEFT_COL_COLS = 40  # sidebar/terminal column — agent takes the rest
 LAPTOP_SIDEBAR_PCT = 38    # sidebar's share of the left column; the terminal
                            # beneath it gets the larger remainder
 
+# MINIMAL — 2 panes, no sidebar: agent | terminal. For when the workspace list
+# isn't what you're looking at (a single focused task, a narrow split, a
+# screen-share). `wk ls` / `prefix W` still cover everything the sidebar shows,
+# on demand rather than always-on.
+MINIMAL_WINDOW_COLS = 240
+MINIMAL_WINDOW_ROWS = 60
+MINIMAL_TERMINAL_COLS = 80  # right-hand terminal; agent takes the rest
+
 # Auto-selection threshold: a client at least this wide gets WIDE, narrower
 # gets LAPTOP. Overridable via $WK_WIDE_COLS; both overridden by $WK_LAYOUT
 # / --layout. 220 sits between a typical laptop (~180-210 cols) and a docked
@@ -1071,20 +1086,11 @@ class LayoutProfile:
     window_rows: int
     build: Callable[[str, Path, str, str], None]
     rebalance: Callable[[str], None]
-
-
-# sh command that launches lazygit with wk's narrow-pane config if it exists,
-# otherwise plain lazygit. If lazygit isn't installed, falls back to a shell.
-LAZYGIT_CMD = (
-    'WK_LG_CFG="${XDG_CONFIG_HOME:-$HOME/.config}/wk/lazygit.yml"; '
-    "if command -v lazygit >/dev/null; then "
-    '  if [ -f "$WK_LG_CFG" ]; then exec lazygit -ucf "$WK_LG_CFG"; '
-    "  else exec lazygit; fi; "
-    "else "
-    '  echo "lazygit not installed — install it or use the terminal pane"; '
-    "  exec ${SHELL:-sh}; "
-    "fi"
-)
+    # False when the profile has no sidebar pane. `build_session` then starts
+    # the initial pane on the *agent* instead, and hands that pane id to
+    # `build` — so `build` always receives "the pane that already exists",
+    # whatever it happens to be running.
+    has_sidebar: bool = True
 
 
 def _build_wide(session: str, wt: Path, sidebar_id: str, agent: str) -> None:
@@ -1197,6 +1203,34 @@ def _rebalance_laptop(session: str) -> None:
     run(["tmux", "resize-pane", "-t", f"{session}:.1", "-y", f"{LAPTOP_SIDEBAR_PCT}%"], check=False)
 
 
+def _build_minimal(session: str, wt: Path, first_id: str, agent: str) -> None:
+    """Finish the 2-pane minimal layout. FIRST_ID is already the agent pane
+    (this profile has no sidebar), so there's just one split to make.
+
+        ┌──────────────────────────────┬──────────────┐
+        │            agent             │   terminal   │
+        └──────────────────────────────┴──────────────┘
+    """
+    run(
+        [
+            "tmux", "split-window", "-h",
+            "-t", first_id,
+            "-c", str(wt),
+            "-l", str(MINIMAL_TERMINAL_COLS),
+        ]
+    )
+    # Land in the agent pane on attach.
+    run(["tmux", "select-pane", "-t", first_id])
+
+
+def _rebalance_minimal(session: str) -> None:
+    """Reset the minimal geometry. Visual order: 1=agent, 2=terminal."""
+    run(
+        ["tmux", "resize-pane", "-t", f"{session}:.2", "-x", str(MINIMAL_TERMINAL_COLS)],
+        check=False,
+    )
+
+
 LAYOUTS: dict[str, LayoutProfile] = {
     "wide": LayoutProfile(
         name="wide", window_cols=WIDE_WINDOW_COLS, window_rows=WIDE_WINDOW_ROWS,
@@ -1206,9 +1240,91 @@ LAYOUTS: dict[str, LayoutProfile] = {
         name="laptop", window_cols=LAPTOP_WINDOW_COLS, window_rows=LAPTOP_WINDOW_ROWS,
         build=_build_laptop, rebalance=_rebalance_laptop,
     ),
+    "minimal": LayoutProfile(
+        name="minimal", window_cols=MINIMAL_WINDOW_COLS, window_rows=MINIMAL_WINDOW_ROWS,
+        build=_build_minimal, rebalance=_rebalance_minimal, has_sidebar=False,
+    ),
 }
 # Accepted aliases for the user-facing layout name (env / flag / @wk-layout).
-_LAYOUT_ALIASES = {"wide": "wide", "widescreen": "wide", "laptop": "laptop", "narrow": "laptop"}
+_LAYOUT_ALIASES = {
+    "wide": "wide", "widescreen": "wide",
+    "laptop": "laptop", "narrow": "laptop",
+    "minimal": "minimal", "solo": "minimal",
+}
+
+
+def repo_config_path() -> Optional[Path]:
+    """`<repo>/.wk/config` in the *main* checkout, or None outside a repo.
+
+    Per-repo defaults live in the main checkout rather than a worktree so one
+    file governs every workspace the repo spawns. Worktree `.wk/` dirs are
+    wk-managed scratch (gitignored by their own `.gitignore`); this one is
+    yours to commit if you want the default shared with the team.
+    """
+    try:
+        return repo_root() / WK_MARKER_DIR / "config"
+    except (Exception, SystemExit):
+        # SystemExit too: this is read from the always-on sidebar/dashboard
+        # render loops, and `repo_root()` exits when the cwd isn't a repo.
+        # A missing config must degrade to "no config", never kill a loop.
+        return None
+
+
+@functools.lru_cache(maxsize=8)
+def _read_repo_config(path: str, mtime: float) -> dict[str, str]:
+    """Parse `key = value` lines. Cached on (path, mtime) so the sidebar and
+    dashboard render loops don't re-read it every tick but still pick up edits.
+    """
+    out: dict[str, str] = {}
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return out
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        out[k.strip().lower()] = v.strip().strip("\"'")
+    return out
+
+
+def _config_at(path: Optional[Path]) -> dict[str, str]:
+    """Parsed config at PATH, or {} when it's missing/unreadable."""
+    if path is None:
+        return {}
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return {}
+    return _read_repo_config(str(path), mtime)
+
+
+def repo_config() -> dict[str, str]:
+    """Per-repo settings from `<repo>/.wk/config`. Empty when absent."""
+    return _config_at(repo_config_path())
+
+
+def user_config_path() -> Path:
+    """`~/.config/wk/config` (honouring XDG_CONFIG_HOME) — the same dir
+    `install.sh` writes wk's other user-level files into."""
+    base = os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")
+    return Path(base) / "wk" / "config"
+
+
+def user_config() -> dict[str, str]:
+    """User-level settings. These apply in every repo."""
+    return _config_at(user_config_path())
+
+
+def config_get(key: str, default: str = "") -> str:
+    """A setting's value: repo config first, then user config.
+
+    Repo beats user so a project can override your global default; both are
+    beaten by the matching env var, which callers check themselves (an env
+    var is a deliberate one-off, so it wins outright).
+    """
+    return repo_config().get(key) or user_config().get(key) or default
 
 
 def _client_cols() -> Optional[int]:
@@ -1230,16 +1346,21 @@ def _client_cols() -> Optional[int]:
 
 
 def resolve_profile(explicit: Optional[str] = None) -> LayoutProfile:
-    """Pick a layout: explicit name (--layout) > $WK_LAYOUT > auto by width.
+    """Pick a layout: --layout > $WK_LAYOUT > `<repo>/.wk/config` > auto by width.
 
     Auto compares the attach display's width against $WK_WIDE_COLS (default
     220): wider → `wide`, narrower → `laptop`. When the width is unknowable
     (headless), defaults to `wide` to preserve the historical layout.
     """
-    name = (explicit or os.environ.get("WK_LAYOUT", "")).strip().lower()
+    name = (
+        explicit
+        or os.environ.get("WK_LAYOUT", "")
+        or config_get("layout")
+    ).strip().lower()
     if name:
         if name not in _LAYOUT_ALIASES:
-            die(f"unknown layout {name!r}", hint="expected 'wide' or 'laptop'")
+            die(f"unknown layout {name!r}",
+                hint=f"expected one of: {', '.join(sorted(LAYOUTS))}")
         return LAYOUTS[_LAYOUT_ALIASES[name]]
 
     try:
@@ -1260,12 +1381,22 @@ def wk_env_pairs(session: str, branch: str, wt: Path) -> list[tuple[str, str]]:
     `set-environment` retroactively) can't drift apart. The contract is
     documented for agents in the embedded `.wk/AGENTS.md`.
     """
-    return [
+    pairs = [
         ("WK_IN_WORKSPACE", "1"),
         ("WK_SESSION", session),
         ("WK_BRANCH", branch),
         ("WK_PATH", str(wt)),
     ]
+    # When the branch carries a configured ticket key, hand the agent the key
+    # and (if the prefix is mapped to a tracker) a URL it can go read. wk
+    # doesn't fetch the ticket itself — the agent already has tools for that.
+    key = issue_key_in_branch(branch)
+    if key:
+        pairs.append(("WK_ISSUE_KEY", key))
+        url = issue_url(key)
+        if url:
+            pairs.append(("WK_ISSUE_URL", url))
+    return pairs
 
 
 def build_session(
@@ -1310,6 +1441,14 @@ def build_session(
     # `-P -F #{pane_id}` prints the new pane's stable `%NN` id; we use that
     # for subsequent splits instead of numeric indices, which tmux renumbers
     # via tree-traversal order whenever the layout changes.
+    # The initial pane runs the sidebar, except on profiles that don't have one
+    # (`minimal`) — there it starts the agent directly. Either way `profile.build`
+    # receives the id of the pane that already exists and splits off it.
+    first_cmd = (
+        _shell_wrap(f"WK_CURRENT={session} {wk} sidebar")
+        if profile.has_sidebar
+        else _shell_wrap(agent)
+    )
     sidebar_id = run(
         [
             "tmux", "new-session", "-d",
@@ -1319,7 +1458,7 @@ def build_session(
             "-n", "work",
             *env_flags,
             "-P", "-F", "#{pane_id}",
-            *_shell_wrap(f"WK_CURRENT={session} {wk} sidebar"),
+            *first_cmd,
         ]
     ).stdout.strip()
 
@@ -1358,7 +1497,31 @@ def build_session(
 # A valid branch name for our purposes: lowercase, hyphen-separated,
 # starts with a letter, 3–60 chars. Loose enough to accept what Claude
 # typically produces, strict enough to keep filesystem paths sane.
-_BRANCH_RE = re.compile(r"^[a-z][a-z0-9-]{2,59}$")
+# Branch-name types wk will accept (and ask Claude for) as a `<type>/` prefix.
+# Conventional-commit vocabulary, so a glance at `.worktrees/` or `wk ls`
+# groups work by kind. Extend with WK_BRANCH_TYPES (comma-separated).
+BRANCH_TYPES = ("feat", "fix", "chore", "docs", "refactor", "test", "perf", "spike")
+
+
+def branch_types() -> tuple[str, ...]:
+    extra = os.environ.get("WK_BRANCH_TYPES", "")
+    custom = tuple(t.strip() for t in extra.split(",") if t.strip())
+    return custom or BRANCH_TYPES
+
+
+def _branch_re() -> re.Pattern:
+    """Valid generated/user branch name: an optional `<type>/` prefix plus a
+    hyphenated slug. The prefix became worth having once worktree paths started
+    preserving hierarchy — `fix/flaky-session-test` is a real `.worktrees/fix/`
+    subdir, where the old flat `fix-flaky-session-test` was just a long name.
+    """
+    types = "|".join(re.escape(t) for t in branch_types())
+    return re.compile(rf"^(?:(?:{types})/)?[a-z][a-z0-9-]{{2,59}}$")
+
+
+# Module-level default (unprefixed slugs + the standard types). Call
+# `_branch_re()` directly when WK_BRANCH_TYPES may be set at runtime.
+_BRANCH_RE = _branch_re()
 
 
 def slugify(text: str, max_words: int = 5) -> str:
@@ -1385,11 +1548,12 @@ _BRANCH_PROMPT = """\
 You are naming a git branch for the following task. Reply with ONLY the
 branch name — no quotes, no explanation, no markdown. Rules:
 
-- lowercase
-- 2 to 6 words joined by hyphens
-- start with a letter
-- describe the task (not the verb): "fix-flaky-session-test", not "fix"
-- no slashes, no spaces, no underscores
+- format: <type>/<description>
+- <type> is exactly one of: {types}
+- <description> is lowercase, 2 to 6 words joined by hyphens
+- name the subject, not the verb: "fix/flaky-session-test", not "fix/fix-test"
+- specific over generic: "feat/nested-worktree-paths", not "feat/improvements"
+- no spaces, no underscores, no extra slashes
 
 Task:
 {prompt}
@@ -1407,7 +1571,8 @@ def pick_branch_name(prompt: str, timeout_seconds: int = 30) -> tuple[str, str]:
         return slugify(prompt), "slug"
     try:
         proc = subprocess.run(
-            ["claude", "-p", "--output-format", "json", _BRANCH_PROMPT.format(prompt=prompt)],
+            ["claude", "-p", "--output-format", "json",
+             _BRANCH_PROMPT.format(prompt=prompt, types=", ".join(branch_types()))],
             capture_output=True,
             text=True,
             timeout=timeout_seconds,
@@ -1429,11 +1594,163 @@ def pick_branch_name(prompt: str, timeout_seconds: int = 30) -> tuple[str, str]:
     # Take the last non-empty line, strip surrounding punctuation.
     last_line = raw.splitlines()[-1].strip() if raw.splitlines() else ""
     candidate = last_line.strip("`\"' \t.,").lower().replace(" ", "-").replace("_", "-")
-    candidate = re.sub(r"-+", "-", candidate).strip("-")
+    candidate = re.sub(r"-+", "-", candidate)
+    # Keep the `<type>/` prefix intact while trimming stray dashes on
+    # either side of the slash ("fix/-flaky-" -> "fix/flaky").
+    candidate = "/".join(seg.strip("-") for seg in candidate.split("/")).strip("/")
 
-    if _BRANCH_RE.match(candidate):
+    if _branch_re().match(candidate):
         return candidate, "claude"
     return slugify(prompt), "slug"
+
+
+_HANDOFF_PROMPT = """\
+Write a handoff brief for a coding agent that is about to start work in a
+fresh git worktree. It has NOT seen the conversation this request came from —
+this file is everything it will know.
+
+Reply with ONLY markdown, no preamble, no code fence around the whole thing.
+Use exactly these sections:
+
+# <one-line title>
+
+## Goal
+What outcome is wanted, in 1-3 sentences. State the intent, not the steps.
+
+## Context
+What the agent needs to know before touching anything: which part of the
+codebase, any constraint or decision already made, anything explicitly out of
+scope. If the request doesn't say, write "Not specified — confirm before
+assuming." rather than inventing detail.
+
+## Acceptance
+A short checklist of what "done" means, as `- [ ]` items. Be concrete and
+verifiable. If tests or docs are implied, say so.
+
+Branch: {branch}
+Request:
+{task}
+"""
+
+# Written when no task description was given, or when the AI call fails. The
+# headings match the generated form so agents (and humans) see one shape.
+_HANDOFF_TEMPLATE = """\
+# {branch}
+
+## Goal
+_Not yet written._ Describe the outcome this workspace is for.
+
+## Context
+_Not yet written._ What should an agent know before touching anything?
+
+## Acceptance
+- [ ] _Not yet written._ What does "done" mean?
+"""
+
+
+def render_handoff(branch: str, task: Optional[str], timeout_seconds: int = 60) -> tuple[str, str]:
+    """Build the `.wk/task.md` body for BRANCH. Returns (markdown, source).
+
+    `source` is "claude" when the one-shot produced it, else "template".
+    Never raises: a missing/slow/broken `claude` degrades to the skeleton, so
+    workspace creation never fails over a docs nicety.
+
+    The point of generating this is that the agent which later opens the
+    workspace did not see the conversation that spawned it. Without a handoff
+    it re-derives intent from a branch name, which is how workspaces end up
+    doing the wrong thing confidently.
+    """
+    if not task or not task.strip():
+        return _HANDOFF_TEMPLATE.format(branch=branch), "template"
+    if shutil.which("claude") is None:
+        return _handoff_fallback(branch, task), "template"
+    try:
+        proc = subprocess.run(
+            ["claude", "-p", "--output-format", "json",
+             _HANDOFF_PROMPT.format(branch=branch, task=task.strip())],
+            capture_output=True, text=True, timeout=timeout_seconds, check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return _handoff_fallback(branch, task), "template"
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return _handoff_fallback(branch, task), "template"
+    try:
+        body = str(json.loads(proc.stdout).get("result", "")).strip()
+    except (json.JSONDecodeError, AttributeError):
+        return _handoff_fallback(branch, task), "template"
+    # A reply that lost the structure is worse than the skeleton — it reads
+    # authoritative while omitting the sections the agent looks for.
+    if "## Goal" not in body or "## Acceptance" not in body:
+        return _handoff_fallback(branch, task), "template"
+    return body.rstrip() + "\n", "claude"
+
+
+def _handoff_fallback(branch: str, task: str) -> str:
+    """Skeleton with the raw request preserved verbatim under Goal. Losing the
+    user's own words because an AI call failed would be the worse outcome."""
+    return (
+        f"# {branch}\n\n"
+        f"## Goal\n{task.strip()}\n\n"
+        "## Context\n_Not specified._ Confirm anything ambiguous before assuming.\n\n"
+        "## Acceptance\n- [ ] _Not yet written._ What does \"done\" mean?\n"
+    )
+
+
+def write_handoff(
+    wt: Path,
+    branch: str,
+    task: Optional[str],
+    force: bool = False,
+) -> Optional[Path]:
+    """Write `.wk/task.md` for the workspace at WT. Returns the path, or None
+    if one already existed (an existing brief is never clobbered — it may have
+    been edited by hand, or by the agent as it worked).
+    """
+    target = wt / WK_MARKER_DIR / "task.md"
+    if target.exists() and not force:
+        return None
+    body, source = render_handoff(branch, task)
+    target.parent.mkdir(exist_ok=True)
+    target.write_text(_with_ticket_line(body, branch), encoding="utf-8")
+    return target
+
+
+def _with_ticket_line(body: str, branch: str) -> str:
+    """Prepend a `Ticket:` line when BRANCH carries a configured issue key.
+
+    This is the case the brief matters most and has least to say: `wk open
+    LPE-1234` has no `--task` text, so the generated body is a skeleton. A
+    ticket link turns that into something the agent can actually act on — go
+    read the ticket — instead of a set of empty headings.
+    """
+    key = issue_key_in_branch(branch)
+    if not key:
+        return body
+    url = issue_url(key)
+    ref = f"[{key}]({url})" if url else key
+    line = (
+        f"**Ticket:** {ref}\n"
+        f"_Read the ticket first — it's the source of truth for this work._\n"
+    )
+    # Sit under the H1 if there is one, so the title still leads.
+    lines = body.splitlines()
+    if lines and lines[0].startswith("# "):
+        return "\n".join([lines[0], "", line, *lines[1:]]).rstrip() + "\n"
+    return line + "\n" + body
+
+
+def _announce_handoff(wt: Path, branch: str, task: Optional[str]) -> None:
+    """Write the handoff brief and tell the user where it landed.
+
+    Called on every path that *creates* a workspace. Skips silently when a
+    brief already exists (reopening an existing workspace must not clobber
+    notes the agent has been keeping).
+    """
+    if task and task.strip():
+        console.print("[dim]writing handoff brief…[/dim]")
+    path = write_handoff(wt, branch, task)
+    if path is not None:
+        console.print(f"  [dim]handoff:   {path}[/dim]")
 
 
 @dataclass
@@ -1754,23 +2071,157 @@ def gh_pr_info(number: str, repo_slug: Optional[str] = None) -> dict:
 # An issue-tracker URL (Jira cloud) or a bare issue key. Jira keys are
 # uppercase (PROJ-123); the bare-key form requires uppercase so we don't
 # mistake a lowercase branch name like `feat-12` for an issue key.
-_JIRA_URL_RE = re.compile(r"atlassian\.net/browse/(?P<key>[A-Za-z][A-Za-z0-9]+-\d+)")
+# Issue-tracker URLs. Jira browse links and Linear issue links; both carry the
+# key in the same `TEAM-123` shape, so one capture group serves both.
+_ISSUE_URL_RES = (
+    re.compile(r"atlassian\.net/browse/(?P<key>[A-Za-z][A-Za-z0-9]*-\d+)"),
+    re.compile(r"linear\.app/[^/\s]+/issue/(?P<key>[A-Za-z][A-Za-z0-9]*-\d+)"),
+)
+
+# Fallback shape when no prefixes are configured: any uppercase token + number.
+# Deliberately strict about case — unanchored to a known project, a lowercase
+# match would swallow ordinary branch names.
 _ISSUE_KEY_RE = re.compile(r"^(?P<key>[A-Z][A-Z0-9]+-\d+)$")
+
+# Linear's "copy git branch name" gives `eng-123-fix-the-thing`; its issue
+# picker gives `ENG-123/fix-the-thing`. Both lead with the key.
+_ISSUE_KEY_PREFIXED_RE_TMPL = r"^(?P<key>(?:{alts})-\d+)(?:[/-].*)?$"
+
+
+def issue_prefixes() -> tuple[str, ...]:
+    """Configured project / team keys (`LPE`, `DEV`, `ENG`), uppercased.
+
+    `WK_ISSUE_PREFIXES` wins, then `issue_prefixes` in the repo's `.wk/config`,
+    then `~/.config/wk/config`. Your trackers usually follow *you* rather than
+    one repo, so the user-level file is the normal home for these; the repo
+    file is there for a project with its own keys. Empty means "not
+    configured": wk falls back to the generic uppercase shape.
+
+    Configuring these makes the match *precise* rather than merely plausible.
+    It's what lets wk accept `lpe-1544` and `ENG-123/fix-the-thing` without
+    those swallowing ordinary branch names.
+    """
+    return tuple(_issue_prefix_map())
+
+
+# Trackers wk can build a canonical issue URL for.
+ISSUE_TRACKERS = ("jira", "linear")
+
+
+def _issue_prefix_map() -> dict[str, Optional[str]]:
+    """`{"LPE": "linear", "DEV": "jira", "OPS": None}` from the config string.
+
+    Entries are `KEY` or `KEY:tracker`. The tracker is optional because it only
+    affects URL building — matching a key never needed it. Unknown trackers are
+    ignored rather than fatal: a typo shouldn't stop `wk open` from resolving a
+    ticket it otherwise understands perfectly.
+    """
+    raw = os.environ.get("WK_ISSUE_PREFIXES") or config_get("issue_prefixes")
+    out: dict[str, Optional[str]] = {}
+    for entry in raw.replace(" ", ",").split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        key, _, tracker = entry.partition(":")
+        key = key.strip().upper()
+        if not key:
+            continue
+        tracker = tracker.strip().lower()
+        out[key] = tracker if tracker in ISSUE_TRACKERS else None
+    return out
+
+
+def issue_tracker(key: str) -> Optional[str]:
+    """Which tracker owns KEY's project — "jira", "linear", or None."""
+    prefix = key.split("-", 1)[0].upper()
+    return _issue_prefix_map().get(prefix)
+
+
+def issue_url(key: str) -> Optional[str]:
+    """Canonical URL for issue KEY, or None if it isn't derivable.
+
+    Needs the prefix mapped to a tracker (`issue_prefixes = LPE:linear`) plus
+    that tracker's host setting (`jira_site` / `linear_workspace`). wk builds
+    the URL rather than calling either API — no auth, no network, nothing to
+    fail — and hands it to the agent, which already knows how to read a ticket.
+    """
+    tracker = issue_tracker(key)
+    if tracker == "jira":
+        site = config_get("jira_site").strip().rstrip("/")
+        if not site:
+            return None
+        if not site.startswith(("http://", "https://")):
+            site = f"https://{site}"
+        return f"{site}/browse/{key.upper()}"
+    if tracker == "linear":
+        workspace = config_get("linear_workspace").strip().strip("/")
+        if not workspace:
+            return None
+        return f"https://linear.app/{workspace}/issue/{key.upper()}"
+    return None
+
+
+def _issue_key_re() -> Optional[re.Pattern]:
+    """Bare-key matcher built from the configured prefixes, or None if unset."""
+    prefixes = issue_prefixes()
+    if not prefixes:
+        return None
+    alts = "|".join(re.escape(p) for p in prefixes)
+    return re.compile(_ISSUE_KEY_PREFIXED_RE_TMPL.format(alts=alts), re.IGNORECASE)
 
 
 def parse_issue_ref(ref: str) -> Optional[str]:
     """Return the uppercased issue key if REF is an issue link / key, else None.
 
-    Accepts a Jira browse URL
-    (``https://site.atlassian.net/browse/DEV-6266``) or a bare uppercase
-    key (``DEV-6266``). A bare PR number falls through to `parse_pr_ref`.
+    Accepts, in order:
+
+    \b
+      a Jira browse URL      https://site.atlassian.net/browse/DEV-6266
+      a Linear issue URL     https://linear.app/acme/issue/ENG-123/fix-it
+      a configured key       LPE-1544, lpe-1544, ENG-123/fix-it  (see
+                             `issue_prefixes`; case-insensitive, and a
+                             trailing `/slug` or `-slug` is tolerated so
+                             Linear's copied branch names work)
+      a bare uppercase key   DEV-6266  (fallback when nothing is configured)
+
+    A bare PR number falls through to `parse_pr_ref`.
     """
     ref = ref.strip()
-    m = _JIRA_URL_RE.search(ref)
-    if m:
-        return m.group("key").upper()
+    for pattern in _ISSUE_URL_RES:
+        m = pattern.search(ref)
+        if m:
+            return m.group("key").upper()
+    configured = _issue_key_re()
+    if configured is not None:
+        m = configured.match(ref)
+        return m.group("key").upper() if m else None
     m = _ISSUE_KEY_RE.match(ref)
     return m.group("key").upper() if m else None
+
+
+def issue_key_in_branch(branch: str) -> Optional[str]:
+    """The configured issue key carried by BRANCH, if any.
+
+    Searches anywhere in the name, so it catches both what `open_issue`
+    generates (`lpe-1544`) and what a human writes (`fix/LPE-1544-tenant-500s`).
+    Requires configured prefixes — guessing from an unanchored generic shape
+    would tag ordinary branches with bogus tickets.
+    """
+    prefixes = issue_prefixes()
+    if not prefixes:
+        return None
+    alts = "|".join(re.escape(p) for p in prefixes)
+    m = re.search(rf"(?<![A-Za-z0-9])(?P<key>(?:{alts})-\d+)(?![0-9])",
+                  branch, re.IGNORECASE)
+    return m.group("key").upper() if m else None
+
+
+def _existing_workspace_for_issue(key: str) -> bool:
+    """Is there already a worktree for this issue's branch (`key.lower()`)?"""
+    try:
+        return find_existing_worktree(key.lower()) is not None
+    except Exception:
+        return False
 
 
 def _in_git_repo() -> bool:
@@ -1945,7 +2396,7 @@ def open_pr_ref(
 
 
 def open_ref(ref: str, base: str, no_attach: bool, no_fetch: bool,
-             layout: Optional[str] = None) -> None:
+             layout: Optional[str] = None, task: Optional[str] = None) -> None:
     """Open whatever REF points at — an issue, a pull request, or a branch.
 
     Classification, in order: an issue reference (Jira link or uppercase
@@ -1955,10 +2406,17 @@ def open_ref(ref: str, base: str, no_attach: bool, no_fetch: bool,
     PR paths need `gh`, so it's required lazily.
     """
     issue_key = parse_issue_ref(ref)
-    if issue_key:
+    if issue_key and not _existing_workspace_for_issue(issue_key):
         require("gh")
         open_issue(issue_key, base=base, no_attach=no_attach, no_fetch=no_fetch)
         return
+    if issue_key:
+        # A workspace for this issue is already on disk. Reopen it instead of
+        # re-resolving the issue: `open_issue` names its branch `key.lower()`,
+        # so once prefixes are configured `wk open lpe-1544` classifies as an
+        # issue again — and a gh round-trip that might now land on a *different*
+        # PR is not what "open the thing I was working on" should mean.
+        ref = issue_key.lower()
 
     pr_ref = parse_pr_ref(ref)
     if pr_ref is not None:
@@ -1968,22 +2426,25 @@ def open_ref(ref: str, base: str, no_attach: bool, no_fetch: bool,
         return
 
     state = resolve_workspace(ref, base, fetch=not no_fetch, strict_new=False)
-    _build_and_attach(state, no_attach, layout=layout)
+    _build_and_attach(state, no_attach, layout=layout, task=task)
 
 
 def _build_and_attach(state: WorkspaceState, no_attach: bool,
-                      layout: Optional[str] = None) -> None:
+                      layout: Optional[str] = None,
+                      task: Optional[str] = None) -> None:
     """Build (or reuse) the tmux session for a resolved workspace, then attach.
 
     Shared by `wk open` and `wk pr`: attach if the session is already
     running, otherwise build the layout first (LAYOUT picks the profile;
-    None auto-detects).
+    None auto-detects). TASK, when the workspace is newly created, becomes its
+    `.wk/task.md` handoff brief.
     """
     if state.session in tmux_sessions():
         console.print("[dim]session running; attaching[/dim]")
     else:
         build_session(state.session, state.wt, agent_cmd(), branch=state.branch, layout=layout)
         if state.created:
+            _announce_handoff(state.wt, state.branch, task)
             console.print(f"[green]✓[/green] workspace [bold]{state.branch}[/bold] ready at {state.wt}")
         else:
             console.print(f"[green]✓[/green] rebuilt session for [bold]{state.branch}[/bold]")
@@ -2059,9 +2520,14 @@ def new(
     ),
     no_attach: bool = typer.Option(False, "--no-attach", help="Don't attach."),
     no_fetch: bool = typer.Option(False, "--no-fetch", help="Skip `git fetch`."),
+    task: Optional[str] = typer.Option(
+        None, "--task", "-t",
+        help="What this workspace is for. Generates a .wk/task.md handoff brief "
+             "so the agent that opens it knows the intent, not just the branch name.",
+    ),
     layout: Optional[str] = typer.Option(
         None, "--layout", "-l",
-        help="Layout: 'wide' or 'laptop'. Default auto-detects from display width.",
+        help="Layout: 'wide', 'laptop', or 'minimal'. Default: repo config, else display width.",
     ),
 ) -> None:
     """Create a [bold]new[/bold] worktree + tmux session for BRANCH and attach.
@@ -2080,6 +2546,7 @@ def new(
     state = resolve_workspace(branch, base, fetch=not no_fetch, strict_new=True)
 
     build_session(state.session, state.wt, agent_cmd(), branch=state.branch, layout=layout)
+    _announce_handoff(state.wt, state.branch, task)
     console.print(f"[green]✓[/green] workspace [bold]{state.branch}[/bold] ready at {state.wt}")
 
     if not no_attach:
@@ -2101,9 +2568,14 @@ def open_cmd(
     ),
     no_attach: bool = typer.Option(False, "--no-attach", help="Don't attach."),
     no_fetch: bool = typer.Option(False, "--no-fetch", help="Skip `git fetch`."),
+    task: Optional[str] = typer.Option(
+        None, "--task", "-t",
+        help="What this workspace is for. Generates a .wk/task.md handoff brief "
+             "so the agent that opens it knows the intent, not just the branch name.",
+    ),
     layout: Optional[str] = typer.Option(
         None, "--layout", "-l",
-        help="Layout: 'wide' or 'laptop'. Default auto-detects from display width. "
+        help="Layout: 'wide', 'laptop', or 'minimal'. Default: repo config, else display width. "
              "Applies only when building a session (ignored if one's already running).",
     ),
 ) -> None:
@@ -2149,7 +2621,7 @@ def open_cmd(
     if not branch:
         die("missing BRANCH (or pass --pick)")
 
-    open_ref(branch, base, no_attach, no_fetch, layout=layout)
+    open_ref(branch, base, no_attach, no_fetch, layout=layout, task=task)
 
 
 @app.command("pr")
@@ -2224,7 +2696,7 @@ def adopt(
 
     # Anchor at the work tree's toplevel, not the (possibly nested) dir the
     # user pointed at — wk workspaces are whole checkouts, and the .wk/ marker
-    # and lazygit pane belong at the root.
+    # belongs at the root.
     r = run(
         ["git", "-C", str(start), "rev-parse", "--show-toplevel"],
         check=False,
@@ -2302,6 +2774,10 @@ def task(
         False, "--no-attach",
         help="Don't attach the tmux session (still creates it).",
     ),
+    layout: Optional[str] = typer.Option(
+        None, "--layout", "-l",
+        help="Layout: 'wide', 'laptop', or 'minimal'. Default: repo config, else display width.",
+    ),
 ) -> None:
     """Create a workspace and kick off Claude Code with [bold]PROMPT[/bold].
 
@@ -2321,8 +2797,9 @@ def task(
     # Pick a branch name. Use the explicit one if given, otherwise ask Claude,
     # falling back to a deterministic slug.
     if branch is not None:
-        if not _BRANCH_RE.match(branch):
-            die(f"invalid branch name {branch!r}; want [a-z][a-z0-9-]{{2,59}}")
+        if not _branch_re().match(branch):
+            die(f"invalid branch name {branch!r}",
+                hint=f"want [<type>/]<slug>, type one of: {', '.join(branch_types())}")
         source = "user"
     else:
         console.print("[dim]picking a branch name…[/dim]")
@@ -2339,8 +2816,9 @@ def task(
             show_default=False,
         ).strip() or branch
         if chosen != branch:
-            if not _BRANCH_RE.match(chosen):
-                die(f"invalid branch name {chosen!r}; want [a-z][a-z0-9-]{{2,59}}")
+            if not _branch_re().match(chosen):
+                die(f"invalid branch name {chosen!r}",
+                    hint=f"want [<type>/]<slug>, type one of: {', '.join(branch_types())}")
             branch = chosen
 
     session = session_name(branch)
@@ -2353,22 +2831,28 @@ def task(
     wt = state.wt
 
     # Write the task file. This is the durable record of what the workspace
-    # is for, surfaced in the sidebar and readable by `claude` later.
+    # is for, surfaced in the sidebar and readable by `claude` later. It's a
+    # structured brief rather than the raw prompt: the agent that reads it
+    # later never saw the conversation this came from, so "Goal / Context /
+    # Acceptance" is worth the one extra call.
     # `mark_wk_workspace` creates the .wk/ dir and its .gitignore.
     mark_wk_workspace(wt, branch=branch)
+    console.print("[dim]writing handoff brief…[/dim]")
     task_file = wt / WK_MARKER_DIR / "task.md"
-    task_file.write_text(prompt.strip() + "\n", encoding="utf-8")
+    body, _source = render_handoff(branch, prompt)
+    task_file.write_text(body, encoding="utf-8")
 
     # Build the session. Agent command depends on --auto.
     if auto:
-        build_session(session, wt, " ".join(_shell_wrap(_AUTO_TASK_CMD)), branch=branch)
+        build_session(session, wt, " ".join(_shell_wrap(_AUTO_TASK_CMD)), branch=branch,
+                      layout=layout)
     else:
         # Interactive: launch claude with the prompt as a positional arg so
         # it's pre-filled in the input buffer. Claude handles the launch
         # timing itself — no send-keys race condition.
         # We use shell-quoting via shlex for safety against unusual chars.
         agent = f"claude {shlex.quote(prompt.strip())}"
-        build_session(session, wt, agent, branch=branch)
+        build_session(session, wt, agent, branch=branch, layout=layout)
 
     # Tag the session as a task workspace so the sidebar can mark it.
     run(["tmux", "set-option", "-t", session, "@wk-task", "1"])
@@ -2943,7 +3427,7 @@ def relayout(
     ),
     layout: Optional[str] = typer.Option(
         None, "--layout", "-l",
-        help="Layout profile: 'wide' or 'laptop'. Default auto-detects from "
+        help="Layout profile: 'wide', 'laptop', or 'minimal'. Default auto-detects from "
              "the display width (see CHEATSHEET).",
     ),
 ) -> None:
@@ -3078,18 +3562,22 @@ def _relayout_detached(
         # Match build_session's window naming.
         run(["tmux", "rename-window", "-t", window, "work"], check=False)
 
-        # Respawn the surviving pane as the sidebar. -k force-kills the existing
+        # Respawn the surviving pane as whatever this profile's first pane runs
+        # — the sidebar, or the agent on sidebar-less profiles like `minimal`.
+        # Mirrors build_session's `first_cmd`. -k force-kills the existing
         # process (our parent shell, plus its now-exited wk caller).
+        agent = agent_cmd()
         run(
             [
                 "tmux", "respawn-pane", "-k",
                 "-t", pane,
                 "-c", str(wt_path),
-                *_shell_wrap(f"WK_CURRENT={session} {wk} sidebar"),
+                *(_shell_wrap(f"WK_CURRENT={session} {wk} sidebar")
+                  if profile.has_sidebar else _shell_wrap(agent)),
             ]
         )
 
-        profile.build(session, wt_path, pane, agent_cmd())
+        profile.build(session, wt_path, pane, agent)
     except Exception:
         try:
             logdir = repo_root() / ".git"

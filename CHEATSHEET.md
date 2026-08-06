@@ -131,9 +131,9 @@ wk rm release/v35 --keep-branch   # remove worktree but keep the branch ref
 
 ## Pane layout
 
-wk has two layout profiles. The **widescreen** layout (3 columns, 4 panes) is
+wk has three layout profiles. The **widescreen** layout (3 columns, 4 panes) is
 the default on wide displays; the **laptop** layout (2 columns) kicks in on
-narrow ones.
+narrow ones; **minimal** (2 panes, no sidebar) is opt-in.
 Either way, lazygit is summoned on demand with `prefix M-g` (full-screen popup),
 not an always-on pane.
 
@@ -170,14 +170,32 @@ not an always-on pane.
 Two columns: the left stacks the **sidebar** over a **terminal**; the right is
 a full-height **agent**. Same as `wide` minus the dedicated terminal column.
 
+### Minimal (`minimal`)
+
+```
+┌──────────────────────────────────────┬──────────────────┐
+│        agent (Claude Code)           │   terminal       │
+│        pane.1                        │   pane.2         │
+└──────────────────────────────────────┴──────────────────┘
+```
+
+Two panes, no sidebar — for a single focused task, a narrow split, or a
+screen-share where a live workspace list is noise. `wk ls` and `prefix W` still
+show everything the sidebar would, on demand instead of always-on. Aliased as
+`solo`.
+
 ### Choosing a layout
 
-By default wk **auto-detects** from the display width when it builds a session:
-a client at least `WK_WIDE_COLS` (default 220) columns wide gets `wide`, narrower
-gets `laptop`. Override per-invocation with `--layout wide|laptop` on `wk new` /
-`wk open` / `wk relayout`, or globally with `WK_LAYOUT=wide|laptop` (e.g. set it
-in your laptop's shell profile). Docked and undocked the same machine? Just
-`wk relayout` after switching displays — it re-detects.
+Precedence, highest first:
+
+1. `--layout wide|laptop|minimal` on `wk new` / `wk open` / `wk task` / `wk relayout`
+2. `WK_LAYOUT=wide|laptop|minimal` (e.g. set in your laptop's shell profile)
+3. `layout = minimal` in [`<repo>/.wk/config` or `~/.config/wk/config`](#config-files)
+4. **auto-detect** from display width — a client at least `WK_WIDE_COLS`
+   (default 220) columns wide gets `wide`, narrower gets `laptop`
+
+Docked and undocked the same machine? Just `wk relayout` after switching
+displays — it re-detects.
 
 `prefix M-w` (`wk rebalance`) resets pane sizes to the current layout's defaults.
 
@@ -238,6 +256,8 @@ Every pane in a wk session has these env vars set:
 | `WK_SESSION` | `credo-backend-release-v35` (repo-prefixed slug, no slashes) |
 | `WK_BRANCH` | `release/v35` (canonical ref) |
 | `WK_PATH` | `/Users/nate/_Work/credo-backend/.worktrees/release/v35` |
+| `WK_ISSUE_KEY` | `LPE-1234` (only when the branch carries a configured key) |
+| `WK_ISSUE_URL` | `https://linear.app/acme/issue/LPE-1234` (only when the prefix is mapped to a tracker) |
 
 And `.wk/AGENTS.md` in the worktree root documents the layout + commands for
 the agent. Reference it from your project `CLAUDE.md` to give Claude
@@ -251,6 +271,12 @@ auto-context:
 
 ## Branch naming gotchas
 
+- **Generated names use `<type>/<slug>`.** When wk names a branch for you
+  (`wk task`, or `wk open` without an explicit name), it asks Claude for
+  `fix/flaky-session-test` — one of `feat`, `fix`, `chore`, `docs`, `refactor`,
+  `test`, `perf`, `spike`, then a 2-6 word hyphenated slug. Override the type
+  vocabulary with `WK_BRANCH_TYPES`. Unprefixed names stay valid; the
+  deterministic fallback (used when `claude` is unavailable) produces one.
 - wk accepts both slash form (`release/v35`) and slug form (`release-v35`)
   for `open`. It resolves slug → canonical (with slashes) before doing any
   git ops, so you won't accidentally create a duplicate hyphen-named branch.
@@ -268,6 +294,125 @@ auto-context:
   matches a hand-rolled `git worktree add`. Only session names flatten to a
   slug — tmux rejects `/`. Worktrees created before 0.10 keep their flat
   paths and keep working; wk reads the real path from git.
+
+---
+
+## Issue refs (Jira / Linear)
+
+`wk open` accepts a ticket instead of a branch. It finds the PR for that issue
+(current repo, then org-wide) and opens its workspace; with no PR it starts a
+branch named after the key off `--base`.
+
+```sh
+wk open https://acme.atlassian.net/browse/DEV-6266   # Jira URL
+wk open https://linear.app/acme/issue/ENG-123/fix-it # Linear URL
+wk open DEV-6266                                     # bare key
+```
+
+Tracker **URLs** always work. **Bare keys** are ambiguous — `API-2` could be a
+ticket or a branch — so tell wk which projects are real. Your trackers follow
+*you*, not one repo, so set this once globally:
+
+```ini
+# ~/.config/wk/config
+issue_prefixes   = LPE:linear, DEV:jira
+linear_workspace = acme                 # linear.app/<workspace>
+jira_site        = acme.atlassian.net
+```
+
+The `:tracker` suffix is optional and only affects **URL building** — matching
+never needs it. Tag it and wk hands the agent a link it can go read (see
+below); leave it off (`issue_prefixes = LPE, DEV`) and matching still works.
+
+A repo with its own keys can override it in `<repo>/.wk/config`, and
+`WK_ISSUE_PREFIXES` beats both. With prefixes configured, matching
+gets both stricter and more forgiving:
+
+| ref | unconfigured | `issue_prefixes = LPE, ENG` |
+|---|---|---|
+| `LPE-1544` | ticket | ticket |
+| `lpe-1544` | branch name | ticket |
+| `ENG-123/fix-it` (Linear picker) | branch name | ticket |
+| `eng-123-fix-it` (Linear "copy git branch name") | branch name | ticket |
+| `API-2` (not a real project) | **ticket** ← false positive | branch name |
+
+If a workspace already exists for the issue's branch, `wk open <key>` reopens it
+rather than re-resolving the ticket — so you land back where you were working,
+not on whatever PR the search turns up today.
+
+### Handing the ticket to the agent
+
+wk resolves keys against **GitHub, not the tracker** — it never reads a ticket
+body, and needs no Jira/Linear credentials. What it does instead is tell the
+agent where the ticket lives. Any workspace whose branch carries a configured
+key (`lpe-1234`, or `fix/LPE-1234-tenant-500s`) gets:
+
+| var | example |
+|---|---|
+| `WK_ISSUE_KEY` | `LPE-1234` |
+| `WK_ISSUE_URL` | `https://linear.app/acme/issue/LPE-1234` |
+
+and its `.wk/task.md` opens with a **Ticket:** link. That's what makes
+"spin up a workspace for LPE-1234" work end-to-end: the agent can see from the
+URL that LPE is Linear and DEV is Jira, and go read the right one. `WK_ISSUE_URL`
+is omitted when the prefix has no `:tracker` — the agent is told to ask rather
+than guess.
+
+---
+
+## Handoff briefs (`.wk/task.md`)
+
+A workspace outlives the conversation that created it. The agent that opens it
+later never saw that conversation — so wk writes the intent down.
+
+Pass `--task` when you create one:
+
+```sh
+wk open fix/tenant-500s --task "500s on the tenant endpoint since the caching \
+  change; reproduce first, don't touch the schema"
+wk new  feat/bulk-export --task "..."
+wk task "investigate the tenant 500s"     # task always writes one
+```
+
+wk one-shots `claude -p` to turn that into `.wk/task.md` — **Goal**, **Context**,
+**Acceptance** — and the agent in the workspace is told to read it first. If
+`claude` is missing, slow, or returns something unstructured, you get a skeleton
+with your own words preserved verbatim under Goal; workspace creation never
+fails over this.
+
+Existing briefs are never overwritten, so reopening a workspace won't wipe notes
+the agent has been keeping. Without `--task` you get the empty skeleton to fill
+in yourself.
+
+## Config files
+
+Two layers, same format — plain `key = value` with `#` comments:
+
+| file | scope | use it for |
+|---|---|---|
+| `~/.config/wk/config` | every repo | your trackers, your preferred layout |
+| `<repo>/.wk/config` | one repo (**main checkout**) | a project that differs from your default |
+
+```ini
+# ~/.config/wk/config
+issue_prefixes = LPE, ENG
+layout = minimal
+```
+
+Precedence per key: **env var → repo → user**. Repo beats user so a project can
+override your global default; an env var is a deliberate one-off, so it wins
+outright. (Honours `XDG_CONFIG_HOME`.)
+
+The repo file lives in the main checkout, not a worktree — worktree `.wk/` dirs
+are wk-managed scratch, gitignored by their own `.gitignore`. The repo one is
+yours to commit if you want the default shared with your team.
+
+| key | values | env override |
+|---|---|---|
+| `layout` | `wide` \| `laptop` \| `minimal` | `WK_LAYOUT` |
+| `issue_prefixes` | e.g. `LPE:linear, DEV:jira` | `WK_ISSUE_PREFIXES` |
+| `linear_workspace` | e.g. `acme` | — |
+| `jira_site` | e.g. `acme.atlassian.net` | — |
 
 ---
 
@@ -322,7 +467,8 @@ or to the orchestrator instead.
 
 ```
 wk new <branch>                  # create + attach (errors if branch exists)
-wk new <branch> --layout laptop  # force a layout (wide|laptop); default auto-detects
+wk new <branch> --layout laptop  # force a layout (wide|laptop|minimal); default auto-detects
+wk new <branch> --task "..."     # write a .wk/task.md handoff brief for the agent
 wk open <branch>                 # create-or-attach a branch workspace (forgiving)
 wk open <number|pr-url>          # open a pull request (same as `wk pr`)
 wk open <issue-url|KEY>          # resolve an issue (e.g. DEV-6266) to its PR, else start a branch
@@ -340,7 +486,7 @@ wk restore [branch]              # rebuild tmux session(s) for existing worktree
 wk restore --list                # show which worktrees would be restored (dry-run)
 wk restore                       # on a TTY: fzf multi-select picker (tab to mark)
 wk restore --all                 # rebuild every missing session, skip the picker
-wk relayout [--layout wide|laptop] # rebuild the layout in the current session (re-detects)
+wk relayout [--layout wide|laptop|minimal] # rebuild the layout in the current session (re-detects)
 wk rebalance                     # reset pane sizes to the current layout's defaults (prefix M-w)
 wk refresh-agents [branch|--all] # regenerate .wk/AGENTS.md and ORCHESTRATOR.md
 wk cd [branch]                   # print worktree path (for shell cd integration)
@@ -360,7 +506,9 @@ wk doctor                        # check deps + whether the tmux bindings are in
 | var | default | what |
 |---|---|---|
 | `WK_AGENT_CMD` | `claude -c \|\| claude` | command run in the agent pane |
-| `WK_LAYOUT` | _(auto)_ | force a layout profile: `wide` or `laptop` (overrides auto-detect) |
+| `WK_LAYOUT` | _(auto)_ | force a layout profile: `wide`, `laptop`, or `minimal` (overrides auto-detect) |
+| `WK_BRANCH_TYPES` | `feat,fix,chore,docs,refactor,test,perf,spike` | allowed `<type>/` branch prefixes |
+| `WK_ISSUE_PREFIXES` | _(none)_ | project/team keys (`LPE,ENG`) that make issue-ref matching exact; usually set in `~/.config/wk/config` instead |
 | `WK_WIDE_COLS` | `220` | auto-detect threshold: clients ≥ this many cols get `wide`, else `laptop` |
 | `WK_WORKTREE_ROOT` | `<repo>/.worktrees/` | where to put worktrees |
 | `WK_PR_REPO_ROOT` | `~/_Work` | where `wk open`/`wk pr` look for a PR-by-URL's local clone |
@@ -372,7 +520,7 @@ wk doctor                        # check deps + whether the tmux bindings are in
 
 ## Install / update
 
-### From source (full setup — installs tmux config, fish helper, lazygit config)
+### From source (full setup — installs tmux config and the fish `cd` helper)
 
 ```fish
 cd ~/path/to/wk

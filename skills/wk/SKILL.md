@@ -48,7 +48,9 @@ is the fastest). Don't flail on `command not found`.
 | user says… | run |
 |---|---|
 | "open / switch to `<branch>`" | `wk open <branch>` — forgiving: create or attach |
-| "new branch off `<base>`" | `wk new <branch> --base <base>` |
+| "set up a workspace to do X" | `wk open <branch> --task "<what and why>"` |
+| "spin up a workspace for LPE-1234 / DEV-5678" | `wk open <KEY>` — read the ticket first, then pass what you learn as `--task` |
+| "new branch off `<base>`" | `wk new <branch> --base <base> --task "<what and why>"` |
 | "spawn a task to do X" (from an orchestrator branch) | `wk task "<prompt>" --base main` (add `--auto` for headless) |
 | "switch workspaces" / "what's running" | `wk switch` (fzf) or `wk list` |
 | "kill / clean up this workspace" | `wk close` (keep worktree) or `wk rm` (full destroy) |
@@ -60,6 +62,63 @@ is the fastest). Don't flail on `command not found`.
 adds the worktree, builds the session, or just attaches, depending on what
 already exists. Reach for `wk new` only when you specifically want it to error
 on collision.
+
+## Non-negotiables when setting up a workspace
+
+These are the three ways workspace setup actually goes wrong. Follow them even
+when the user's request is short.
+
+1. **Never create the worktree yourself.** No `git worktree add`, no
+   `tmux new-session`. wk owns the worktree/session/marker triple; a
+   hand-rolled worktree has no `.wk/` marker, so it's invisible to `wk ls`,
+   the sidebar, and every cleanup command. If a wk command seems not to fit,
+   say so rather than working around it.
+
+2. **Always pass the task.** `wk open <branch> --task "..."` / `wk task "..."`
+   generate `.wk/task.md` — a Goal / Context / Acceptance brief. This is the
+   *only* thing the agent that later opens that workspace will know: it did
+   not see your conversation. A workspace with no brief is one that re-derives
+   intent from a branch name and confidently does the wrong thing. Pass the
+   user's actual intent and constraints, not a restatement of the branch name.
+
+3. **Let wk name the branch when the user hasn't.** `wk task` names it from
+   the prompt (`<type>/<slug>`, e.g. `fix/flaky-session-test`) and asks you to
+   confirm. Don't invent `feature-1` or `my-changes`. If you're using
+   `wk open`, pick a name in that same `<type>/<slug>` shape — types are
+   `feat`, `fix`, `chore`, `docs`, `refactor`, `test`, `perf`, `spike`.
+   The `<type>/` becomes a real `.worktrees/<type>/` subdir.
+
+## Working from a ticket
+
+`wk open LPE-1234` resolves the key to its PR (or starts a branch named after
+it). Two things to do around that:
+
+1. **Read the ticket before creating the workspace**, then pass what you learned
+   as `--task`. wk resolves the key against GitHub, not the tracker — it never
+   reads the ticket body, so a workspace opened from a bare key gets a brief
+   with nothing in it unless you supply the substance.
+2. **Inside a workspace**, `WK_ISSUE_KEY` and `WK_ISSUE_URL` are set when the
+   branch carries a configured key. `WK_ISSUE_URL` tells you which tracker it
+   is — `linear.app/...` vs `...atlassian.net/browse/...` — so you know which
+   tool to reach for. If it's set and you haven't read the ticket, read it.
+
+Key → tracker mapping comes from the user's config
+(`issue_prefixes = LPE:linear, DEV:jira`). If `WK_ISSUE_URL` is absent but
+`WK_ISSUE_KEY` is set, the prefix isn't mapped to a tracker — ask rather than
+guessing which one it is.
+
+## Choosing a layout
+
+Panes are a per-workspace choice — `--layout wide|laptop|minimal` on `open`,
+`new`, and `task`:
+
+- `wide` — sidebar + shell | agent | terminal (a docked widescreen)
+- `laptop` — sidebar/terminal | agent (a narrow display)
+- `minimal` — agent | terminal, no sidebar (one focused task, or a screen-share)
+
+Default is the repo's `.wk/config` (`layout = minimal`), else auto by display
+width. Only pass `--layout` when the user asks for a specific shape; don't
+guess at it.
 
 ## Detecting context
 

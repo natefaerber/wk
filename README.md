@@ -42,7 +42,7 @@ That drops the single portable `wk` script on your PATH. Requires `tmux`, `git`,
 > copies now, so the bare form auto-detects on current mise.)
 
 **Full keystroke experience (clone + install):** to also get the tmux bindings,
-the narrow-pane lazygit config, and the fish `cd` helper:
+and the fish `cd` helper:
 ```sh
 git clone https://github.com/natefaerber/wk && cd wk
 ./install.sh            # copy files + wire up tmux.conf  (--link to symlink instead)

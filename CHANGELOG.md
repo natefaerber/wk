@@ -7,7 +7,63 @@ from the [GitHub releases](https://github.com/natefaerber/wk/releases).
 
 ## [Unreleased]
 
+### Added
+- **Handoff briefs.** `wk open` / `wk new` take `--task "<what and why>"`, and
+  `wk task` always writes one: wk one-shots `claude -p` to turn it into a
+  `.wk/task.md` with **Goal**, **Context**, and **Acceptance** sections, and
+  the workspace's `.wk/AGENTS.md` now tells the agent to read it first. A
+  workspace outlives the conversation that made it — without this, the agent
+  that opens it later re-derives intent from a branch name. Existing briefs
+  are never overwritten. Every failure path (no `claude`, timeout, malformed
+  or unstructured reply) falls back to a skeleton that preserves your own
+  words verbatim; workspace creation never fails over it.
+- **`minimal` layout** (`--layout minimal`, alias `solo`): two panes, agent |
+  terminal, no sidebar — for a single focused task, a narrow split, or a
+  screen-share. `wk ls` / `prefix W` still show everything the sidebar would.
+- **Config files, user and per-repo.** `key = value` lines in
+  `~/.config/wk/config` (every repo; honours `XDG_CONFIG_HOME`) and
+  `<repo>/.wk/config` (the main checkout). Precedence per key is env → repo →
+  user, so a project can override your global default and an env var wins
+  outright. Consumed keys: `layout`, `issue_prefixes`,
+  `linear_workspace`, `jira_site`.
+- **`--layout` on `wk task`**, matching `wk open` / `wk new`.
+- **Configurable issue prefixes** for `wk open <ticket>`. Set
+  `issue_prefixes = LPE, ENG` in `~/.config/wk/config` (or per-repo, or
+  `WK_ISSUE_PREFIXES`) and wk matches those projects exactly: `lpe-1544` and
+  Linear's `ENG-123/fix-it` / `eng-123-fix-it` branch forms now resolve, while
+  `API-2` — which the old generic "uppercase token + number" shape treated as
+  a ticket — correctly reads as a branch name again. Unconfigured behaviour is
+  unchanged.
+- **Linear issue URLs** (`linear.app/<workspace>/issue/ENG-123/...`) alongside
+  the existing Jira browse links. Tracker URLs match with or without
+  configured prefixes.
+- **Per-prefix tracker mapping** — `issue_prefixes = LPE:linear, DEV:jira`,
+  plus `linear_workspace` / `jira_site`. Any workspace whose branch carries a
+  configured key (`lpe-1234`, `fix/LPE-1234-tenant-500s`) now exposes
+  `WK_ISSUE_KEY` and `WK_ISSUE_URL` to every pane, and its `.wk/task.md` opens
+  with a **Ticket:** link. wk resolves keys against GitHub and never reads a
+  ticket body, so "spin up a workspace for LPE-1234" previously left the agent
+  unable to tell which tracker to consult; now the URL says so. No Jira/Linear
+  credentials involved — wk builds the URL and the agent does the reading. The
+  `:tracker` suffix is optional; without it, matching is unchanged and
+  `WK_ISSUE_URL` is simply omitted.
+
 ### Changed
+- **Generated branch names are `<type>/<slug>`** — `fix/flaky-session-test`
+  rather than `fix-flaky-session-test`. Now that worktree paths preserve
+  hierarchy, the `<type>/` is a real `.worktrees/fix/` subdir. Types are
+  `feat`, `fix`, `chore`, `docs`, `refactor`, `test`, `perf`, `spike`,
+  overridable with `WK_BRANCH_TYPES`. Unprefixed names remain valid, and the
+  deterministic fallback still produces one.
+- **`wk task` writes a structured brief** instead of dumping the raw prompt
+  into `.wk/task.md`.
+- **`wk open <issue-key>` reopens an existing workspace** for that issue rather
+  than re-resolving the ticket. `open_issue` names its branch `key.lower()`, so
+  with prefixes configured that branch classifies as an issue again — and a
+  fresh search could land on a different PR than the one you were working in.
+- **The `/wk` skill states the three workspace-setup non-negotiables** — never
+  hand-roll the worktree, always pass the task, let wk name the branch — after
+  agents were observed doing all three wrong.
 - **Worktree paths preserve the branch hierarchy.** `fix/LPE-1544` now lands at
   `.worktrees/fix/LPE-1544` instead of `.worktrees/fix-LPE-1544`. Branch
   prefixes (`feat/`, `fix/`, `chore/`) stay browsable subdirs rather than
@@ -28,6 +84,11 @@ from the [GitHub releases](https://github.com/natefaerber/wk/releases).
 - A failed `wk open` / `wk pr` no longer strands an empty prefix directory.
   wk now pre-creates only `.worktrees/` itself and lets `git worktree add`
   create the branch's prefix dirs, which it only does on success.
+
+### Removed
+- **`lazygit.yml`** and its install step. It tuned lazygit for the narrow side
+  pane that 0.8.0 removed, and the `prefix M-g` popup never actually loaded it
+  (`LAZYGIT_CMD` was dead code). The popup now uses your normal lazygit config.
 
 ## [0.9.0] - 2026-06-20
 
