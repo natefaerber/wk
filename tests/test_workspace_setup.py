@@ -173,6 +173,7 @@ def _repo_with_config(wk, monkeypatch, tmp_path, text: str):
     (tmp_path / wk.WK_MARKER_DIR).mkdir(exist_ok=True)
     (tmp_path / wk.WK_MARKER_DIR / "config").write_text(text, encoding="utf-8")
     monkeypatch.setattr(wk, "repo_root", lambda: tmp_path)
+    monkeypatch.setattr(wk, "user_config", dict)  # ignore the real ~/.config
     wk._read_repo_config.cache_clear()
 
 
@@ -242,14 +243,18 @@ def test_layout_aliases(wk, monkeypatch, alias, expected):
 
 @pytest.fixture
 def no_prefixes(wk, monkeypatch):
+    """No config from any layer — including the developer's real
+    ~/.config/wk/config, which would otherwise leak into these assertions."""
     monkeypatch.delenv("WK_ISSUE_PREFIXES", raising=False)
     monkeypatch.setattr(wk, "repo_config", dict)
+    monkeypatch.setattr(wk, "user_config", dict)
 
 
 @pytest.fixture
 def prefixes(wk, monkeypatch):
     monkeypatch.setenv("WK_ISSUE_PREFIXES", "LPE,ENG")
     monkeypatch.setattr(wk, "repo_config", dict)
+    monkeypatch.setattr(wk, "user_config", dict)
 
 
 @pytest.mark.parametrize("url,key", [
@@ -299,20 +304,56 @@ def test_configured_prefixes_reject_everything_else(wk, prefixes, ref):
 
 def test_issue_prefixes_from_repo_config(wk, monkeypatch):
     monkeypatch.delenv("WK_ISSUE_PREFIXES", raising=False)
+    monkeypatch.setattr(wk, "user_config", dict)
     monkeypatch.setattr(wk, "repo_config", lambda: {"issue_prefixes": "lpe, eng"})
     assert wk.issue_prefixes() == ("LPE", "ENG")
     assert wk.parse_issue_ref("lpe-1544") == "LPE-1544"
 
 
-def test_env_beats_repo_config(wk, monkeypatch):
+def test_issue_prefixes_from_user_config(wk, monkeypatch):
+    """The normal home: trackers follow you, not one repo."""
+    monkeypatch.delenv("WK_ISSUE_PREFIXES", raising=False)
+    monkeypatch.setattr(wk, "repo_config", dict)
+    monkeypatch.setattr(wk, "user_config", lambda: {"issue_prefixes": "LPE, ENG"})
+    assert wk.issue_prefixes() == ("LPE", "ENG")
+    assert wk.parse_issue_ref("lpe-1544") == "LPE-1544"
+
+
+def test_repo_config_beats_user_config(wk, monkeypatch):
+    monkeypatch.delenv("WK_ISSUE_PREFIXES", raising=False)
+    monkeypatch.setattr(wk, "user_config", lambda: {"issue_prefixes": "GLOBAL"})
+    monkeypatch.setattr(wk, "repo_config", lambda: {"issue_prefixes": "REPO"})
+    assert wk.issue_prefixes() == ("REPO",)
+
+
+def test_env_beats_both_config_files(wk, monkeypatch):
     monkeypatch.setenv("WK_ISSUE_PREFIXES", "ZZZ")
+    monkeypatch.setattr(wk, "user_config", lambda: {"issue_prefixes": "GLOBAL"})
     monkeypatch.setattr(wk, "repo_config", lambda: {"issue_prefixes": "LPE"})
     assert wk.issue_prefixes() == ("ZZZ",)
+
+
+def test_layout_falls_back_to_user_config(wk, monkeypatch):
+    monkeypatch.delenv("WK_LAYOUT", raising=False)
+    monkeypatch.setattr(wk, "repo_config", dict)
+    monkeypatch.setattr(wk, "user_config", lambda: {"layout": "minimal"})
+    assert wk.resolve_profile().name == "minimal"
+
+
+def test_user_config_path_honours_xdg(wk, monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    assert wk.user_config_path() == tmp_path / "wk" / "config"
+
+
+def test_user_config_missing_file_is_empty(wk, monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    assert wk.user_config() == {}
 
 
 def test_issue_prefixes_accepts_space_separated(wk, monkeypatch):
     monkeypatch.setenv("WK_ISSUE_PREFIXES", "LPE ENG")
     monkeypatch.setattr(wk, "repo_config", dict)
+    monkeypatch.setattr(wk, "user_config", dict)
     assert wk.issue_prefixes() == ("LPE", "ENG")
 
 

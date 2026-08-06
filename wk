@@ -1285,9 +1285,8 @@ def _read_repo_config(path: str, mtime: float) -> dict[str, str]:
     return out
 
 
-def repo_config() -> dict[str, str]:
-    """Per-repo settings from `<repo>/.wk/config`. Empty when absent."""
-    path = repo_config_path()
+def _config_at(path: Optional[Path]) -> dict[str, str]:
+    """Parsed config at PATH, or {} when it's missing/unreadable."""
     if path is None:
         return {}
     try:
@@ -1295,6 +1294,33 @@ def repo_config() -> dict[str, str]:
     except OSError:
         return {}
     return _read_repo_config(str(path), mtime)
+
+
+def repo_config() -> dict[str, str]:
+    """Per-repo settings from `<repo>/.wk/config`. Empty when absent."""
+    return _config_at(repo_config_path())
+
+
+def user_config_path() -> Path:
+    """`~/.config/wk/config` (honouring XDG_CONFIG_HOME) — the same dir
+    `install.sh` writes wk's other user-level files into."""
+    base = os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")
+    return Path(base) / "wk" / "config"
+
+
+def user_config() -> dict[str, str]:
+    """User-level settings. These apply in every repo."""
+    return _config_at(user_config_path())
+
+
+def config_get(key: str, default: str = "") -> str:
+    """A setting's value: repo config first, then user config.
+
+    Repo beats user so a project can override your global default; both are
+    beaten by the matching env var, which callers check themselves (an env
+    var is a deliberate one-off, so it wins outright).
+    """
+    return repo_config().get(key) or user_config().get(key) or default
 
 
 def _client_cols() -> Optional[int]:
@@ -1325,7 +1351,7 @@ def resolve_profile(explicit: Optional[str] = None) -> LayoutProfile:
     name = (
         explicit
         or os.environ.get("WK_LAYOUT", "")
-        or repo_config().get("layout", "")
+        or config_get("layout")
     ).strip().lower()
     if name:
         if name not in _LAYOUT_ALIASES:
@@ -2027,16 +2053,17 @@ _ISSUE_KEY_PREFIXED_RE_TMPL = r"^(?P<key>(?:{alts})-\d+)(?:[/-].*)?$"
 def issue_prefixes() -> tuple[str, ...]:
     """Configured project / team keys (`LPE`, `DEV`, `ENG`), uppercased.
 
-    `WK_ISSUE_PREFIXES` wins, else `issue_prefixes` in the repo's
-    `.wk/config` — so a repo can carry its own trackers and you don't have to
-    export anything per shell. Empty means "not configured": wk falls back to
-    the generic uppercase shape.
+    `WK_ISSUE_PREFIXES` wins, then `issue_prefixes` in the repo's `.wk/config`,
+    then `~/.config/wk/config`. Your trackers usually follow *you* rather than
+    one repo, so the user-level file is the normal home for these; the repo
+    file is there for a project with its own keys. Empty means "not
+    configured": wk falls back to the generic uppercase shape.
 
     Configuring these makes the match *precise* rather than merely plausible.
     It's what lets wk accept `lpe-1544` and `ENG-123/fix-the-thing` without
     those swallowing ordinary branch names.
     """
-    raw = os.environ.get("WK_ISSUE_PREFIXES") or repo_config().get("issue_prefixes", "")
+    raw = os.environ.get("WK_ISSUE_PREFIXES") or config_get("issue_prefixes")
     return tuple(p.strip().upper() for p in raw.replace(" ", ",").split(",") if p.strip())
 
 

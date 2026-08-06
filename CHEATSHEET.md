@@ -190,7 +190,7 @@ Precedence, highest first:
 
 1. `--layout wide|laptop|minimal` on `wk new` / `wk open` / `wk task` / `wk relayout`
 2. `WK_LAYOUT=wide|laptop|minimal` (e.g. set in your laptop's shell profile)
-3. `layout = minimal` in the repo's [`.wk/config`](#per-repo-config)
+3. `layout = minimal` in [`<repo>/.wk/config` or `~/.config/wk/config`](#config-files)
 4. **auto-detect** from display width — a client at least `WK_WIDE_COLS`
    (default 220) columns wide gets `wide`, narrower gets `laptop`
 
@@ -308,14 +308,16 @@ wk open DEV-6266                                     # bare key
 ```
 
 Tracker **URLs** always work. **Bare keys** are ambiguous — `API-2` could be a
-ticket or a branch — so tell wk which projects are real:
+ticket or a branch — so tell wk which projects are real. Your trackers follow
+*you*, not one repo, so set this once globally:
 
 ```ini
-# .wk/config
+# ~/.config/wk/config
 issue_prefixes = LPE, ENG
 ```
 
-or `WK_ISSUE_PREFIXES=LPE,ENG` (env wins). With prefixes configured, matching
+A repo with its own keys can override it in `<repo>/.wk/config`, and
+`WK_ISSUE_PREFIXES=LPE,ENG` beats both. With prefixes configured, matching
 gets both stricter and more forgiving:
 
 | ref | unconfigured | `issue_prefixes = LPE, ENG` |
@@ -356,24 +358,33 @@ Existing briefs are never overwritten, so reopening a workspace won't wipe notes
 the agent has been keeping. Without `--task` you get the empty skeleton to fill
 in yourself.
 
-## Per-repo config
+## Config files
 
-`<repo>/.wk/config` in the **main checkout** sets defaults for every workspace
-that repo spawns. Plain `key = value`, `#` comments:
+Two layers, same format — plain `key = value` with `#` comments:
+
+| file | scope | use it for |
+|---|---|---|
+| `~/.config/wk/config` | every repo | your trackers, your preferred layout |
+| `<repo>/.wk/config` | one repo (**main checkout**) | a project that differs from your default |
 
 ```ini
-# .wk/config
+# ~/.config/wk/config
+issue_prefixes = LPE, ENG
 layout = minimal
 ```
 
-Worktree `.wk/` dirs are wk-managed scratch (gitignored by their own
-`.gitignore`); this one is in the main checkout and is yours to commit if you
-want the default shared with your team.
+Precedence per key: **env var → repo → user**. Repo beats user so a project can
+override your global default; an env var is a deliberate one-off, so it wins
+outright. (Honours `XDG_CONFIG_HOME`.)
 
-| key | values | effect |
+The repo file lives in the main checkout, not a worktree — worktree `.wk/` dirs
+are wk-managed scratch, gitignored by their own `.gitignore`. The repo one is
+yours to commit if you want the default shared with your team.
+
+| key | values | env override |
 |---|---|---|
-| `layout` | `wide` \| `laptop` \| `minimal` | default layout profile (below `--layout` and `WK_LAYOUT`) |
-| `issue_prefixes` | e.g. `LPE, ENG` | project/team keys that mark a ref as a ticket (below `WK_ISSUE_PREFIXES`) |
+| `layout` | `wide` \| `laptop` \| `minimal` | `WK_LAYOUT` |
+| `issue_prefixes` | e.g. `LPE, ENG` | `WK_ISSUE_PREFIXES` |
 
 ---
 
@@ -469,7 +480,7 @@ wk doctor                        # check deps + whether the tmux bindings are in
 | `WK_AGENT_CMD` | `claude -c \|\| claude` | command run in the agent pane |
 | `WK_LAYOUT` | _(auto)_ | force a layout profile: `wide`, `laptop`, or `minimal` (overrides auto-detect) |
 | `WK_BRANCH_TYPES` | `feat,fix,chore,docs,refactor,test,perf,spike` | allowed `<type>/` branch prefixes |
-| `WK_ISSUE_PREFIXES` | _(none)_ | project/team keys (`LPE,ENG`) that make issue-ref matching exact |
+| `WK_ISSUE_PREFIXES` | _(none)_ | project/team keys (`LPE,ENG`) that make issue-ref matching exact; usually set in `~/.config/wk/config` instead |
 | `WK_WIDE_COLS` | `220` | auto-detect threshold: clients ≥ this many cols get `wide`, else `laptop` |
 | `WK_WORKTREE_ROOT` | `<repo>/.worktrees/` | where to put worktrees |
 | `WK_PR_REPO_ROOT` | `~/_Work` | where `wk open`/`wk pr` look for a PR-by-URL's local clone |

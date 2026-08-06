@@ -184,20 +184,31 @@ failure, because it reads authoritative while omitting what agents look for.
 Creation paths that write one: `wk new`, `wk open` (only when
 `state.created`), and `wk task`. Reopening never regenerates.
 
-### Per-repo config (`<repo>/.wk/config`)
+### Config files (user + repo)
 
-`key = value` lines in the **main checkout's** `.wk/`, read by
-`repo_config()` (cached on path+mtime so the always-on render loops don't
-re-read it per tick but still see edits). `repo_config_path()` swallows
-`SystemExit` as well as `Exception` — `repo_root()` exits outside a repo, and
-that must degrade to "no config" rather than killing a render loop. Only
-`layout` is consumed today.
+`key = value` lines, two layers, both parsed by `_read_repo_config()` (cached
+on path+mtime so the always-on render loops don't re-read per tick but still
+see edits):
+
+- `user_config()` — `~/.config/wk/config` (honours `XDG_CONFIG_HOME`, same dir
+  `install.sh` uses). The normal home for settings that follow the *user*.
+- `repo_config()` — `<repo>/.wk/config` in the **main checkout**, for a project
+  that differs from the user default.
+
+`config_get(key)` resolves repo → user. Callers check their env var first, so
+the full precedence is env → repo → user → built-in default. Consumed keys:
+`layout`, `issue_prefixes`.
+
+`repo_config_path()` swallows `SystemExit` as well as `Exception` —
+`repo_root()` exits outside a repo, and that must degrade to "no config"
+rather than killing a render loop.
 
 ### Issue refs (`parse_issue_ref`)
 
 Two layers. Tracker **URLs** (Jira browse, Linear issue) match unconditionally
 — a URL is unambiguous. **Bare keys** depend on `issue_prefixes()`
-(`WK_ISSUE_PREFIXES` > repo config): unconfigured, wk falls back to a generic
+(`WK_ISSUE_PREFIXES` > repo config > user config): unconfigured, wk falls back
+to a generic
 `^[A-Z][A-Z0-9]+-\d+$`, which is case-sensitive on purpose because an
 unanchored lowercase match would swallow ordinary branch names. Configured, the
 pattern is built from the real project keys, so it can safely be

@@ -20,13 +20,15 @@ from the [GitHub releases](https://github.com/natefaerber/wk/releases).
 - **`minimal` layout** (`--layout minimal`, alias `solo`): two panes, agent |
   terminal, no sidebar — for a single focused task, a narrow split, or a
   screen-share. `wk ls` / `prefix W` still show everything the sidebar would.
-- **Per-repo config at `<repo>/.wk/config`.** `key = value` lines in the main
-  checkout; `layout = minimal` sets that repo's default. Sits below `--layout`
-  and `$WK_LAYOUT` in precedence, above width auto-detection.
+- **Config files, user and per-repo.** `key = value` lines in
+  `~/.config/wk/config` (every repo; honours `XDG_CONFIG_HOME`) and
+  `<repo>/.wk/config` (the main checkout). Precedence per key is env → repo →
+  user, so a project can override your global default and an env var wins
+  outright. Consumed keys: `layout`, `issue_prefixes`.
 - **`--layout` on `wk task`**, matching `wk open` / `wk new`.
 - **Configurable issue prefixes** for `wk open <ticket>`. Set
-  `issue_prefixes = LPE, ENG` in `<repo>/.wk/config` (or `WK_ISSUE_PREFIXES`)
-  and wk matches those projects exactly: `lpe-1544` and Linear's
+  `issue_prefixes = LPE, ENG` in `~/.config/wk/config` (or per-repo, or
+  `WK_ISSUE_PREFIXES`) and wk matches those projects exactly: `lpe-1544` and Linear's
   `ENG-123/fix-it` / `eng-123-fix-it` branch forms now resolve, while
   `API-2` — which the old generic "uppercase token + number" shape treated as
   a ticket — correctly reads as a branch name again. Unconfigured behaviour is
@@ -51,7 +53,6 @@ from the [GitHub releases](https://github.com/natefaerber/wk/releases).
 - **The `/wk` skill states the three workspace-setup non-negotiables** — never
   hand-roll the worktree, always pass the task, let wk name the branch — after
   agents were observed doing all three wrong.
-
 - **Worktree paths preserve the branch hierarchy.** `fix/LPE-1544` now lands at
   `.worktrees/fix/LPE-1544` instead of `.worktrees/fix-LPE-1544`. Branch
   prefixes (`feat/`, `fix/`, `chore/`) stay browsable subdirs rather than
