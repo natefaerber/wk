@@ -24,18 +24,29 @@ from the [GitHub releases](https://github.com/natefaerber/wk/releases).
   `~/.config/wk/config` (every repo; honours `XDG_CONFIG_HOME`) and
   `<repo>/.wk/config` (the main checkout). Precedence per key is env → repo →
   user, so a project can override your global default and an env var wins
-  outright. Consumed keys: `layout`, `issue_prefixes`.
+  outright. Consumed keys: `layout`, `issue_prefixes`,
+  `linear_workspace`, `jira_site`.
 - **`--layout` on `wk task`**, matching `wk open` / `wk new`.
 - **Configurable issue prefixes** for `wk open <ticket>`. Set
   `issue_prefixes = LPE, ENG` in `~/.config/wk/config` (or per-repo, or
-  `WK_ISSUE_PREFIXES`) and wk matches those projects exactly: `lpe-1544` and Linear's
-  `ENG-123/fix-it` / `eng-123-fix-it` branch forms now resolve, while
+  `WK_ISSUE_PREFIXES`) and wk matches those projects exactly: `lpe-1544` and
+  Linear's `ENG-123/fix-it` / `eng-123-fix-it` branch forms now resolve, while
   `API-2` — which the old generic "uppercase token + number" shape treated as
   a ticket — correctly reads as a branch name again. Unconfigured behaviour is
   unchanged.
 - **Linear issue URLs** (`linear.app/<workspace>/issue/ENG-123/...`) alongside
   the existing Jira browse links. Tracker URLs match with or without
   configured prefixes.
+- **Per-prefix tracker mapping** — `issue_prefixes = LPE:linear, DEV:jira`,
+  plus `linear_workspace` / `jira_site`. Any workspace whose branch carries a
+  configured key (`lpe-1234`, `fix/LPE-1234-tenant-500s`) now exposes
+  `WK_ISSUE_KEY` and `WK_ISSUE_URL` to every pane, and its `.wk/task.md` opens
+  with a **Ticket:** link. wk resolves keys against GitHub and never reads a
+  ticket body, so "spin up a workspace for LPE-1234" previously left the agent
+  unable to tell which tracker to consult; now the URL says so. No Jira/Linear
+  credentials involved — wk builds the URL and the agent does the reading. The
+  `:tracker` suffix is optional; without it, matching is unchanged and
+  `WK_ISSUE_URL` is simply omitted.
 
 ### Changed
 - **Generated branch names are `<type>/<slug>`** — `fix/flaky-session-test`

@@ -371,3 +371,114 @@ def test_existing_workspace_check_survives_git_failure(wk, monkeypatch):
         raise RuntimeError("git exploded")
     monkeypatch.setattr(wk, "find_existing_worktree", boom)
     assert wk._existing_workspace_for_issue("LPE-1544") is False
+
+
+# --------------------------------------------------------------------------- #
+# Tracker mapping — which prefix is Linear, which is Jira. Only affects URL
+# building; matching a key never needed it.
+# --------------------------------------------------------------------------- #
+
+@pytest.fixture
+def trackers(wk, monkeypatch):
+    monkeypatch.delenv("WK_ISSUE_PREFIXES", raising=False)
+    monkeypatch.setattr(wk, "repo_config", dict)
+    monkeypatch.setattr(wk, "user_config", lambda: {
+        "issue_prefixes": "LPE:linear, DEV:jira, OPS",
+        "linear_workspace": "acme",
+        "jira_site": "acme.atlassian.net",
+    })
+
+
+def test_prefix_map_parses_trackers(wk, trackers):
+    assert wk.issue_tracker("LPE-1234") == "linear"
+    assert wk.issue_tracker("DEV-5678") == "jira"
+    assert wk.issue_tracker("OPS-1") is None     # listed, no tracker
+    assert wk.issue_tracker("XXX-1") is None     # not listed
+
+
+def test_prefixes_still_match_with_tracker_suffix(wk, trackers):
+    """The `:tracker` suffix must not leak into the matching regex."""
+    assert wk.parse_issue_ref("lpe-1234") == "LPE-1234"
+    assert wk.parse_issue_ref("DEV-5678") == "DEV-5678"
+    assert wk.issue_prefixes() == ("LPE", "DEV", "OPS")
+
+
+def test_issue_urls(wk, trackers):
+    assert wk.issue_url("LPE-1234") == "https://linear.app/acme/issue/LPE-1234"
+    assert wk.issue_url("DEV-5678") == "https://acme.atlassian.net/browse/DEV-5678"
+    assert wk.issue_url("OPS-1") is None     # no tracker mapped
+    assert wk.issue_url("XXX-1") is None
+
+
+def test_issue_url_none_without_host_config(wk, monkeypatch):
+    monkeypatch.delenv("WK_ISSUE_PREFIXES", raising=False)
+    monkeypatch.setattr(wk, "repo_config", dict)
+    monkeypatch.setattr(wk, "user_config",
+                        lambda: {"issue_prefixes": "LPE:linear"})
+    assert wk.issue_tracker("LPE-1") == "linear"
+    assert wk.issue_url("LPE-1") is None   # workspace unknown → no guess
+
+
+def test_unknown_tracker_is_ignored_not_fatal(wk, monkeypatch):
+    """A typo shouldn't stop wk resolving a ticket it otherwise understands."""
+    monkeypatch.delenv("WK_ISSUE_PREFIXES", raising=False)
+    monkeypatch.setattr(wk, "repo_config", dict)
+    monkeypatch.setattr(wk, "user_config",
+                        lambda: {"issue_prefixes": "LPE:lineaar"})
+    assert wk.issue_prefixes() == ("LPE",)
+    assert wk.parse_issue_ref("LPE-1") == "LPE-1"
+    assert wk.issue_tracker("LPE-1") is None
+
+
+@pytest.mark.parametrize("branch,key", [
+    ("lpe-1234", "LPE-1234"),                       # what open_issue generates
+    ("fix/LPE-1234-tenant-500s", "LPE-1234"),       # what a human writes
+    ("feat/dev-5678", "DEV-5678"),
+    ("fix/tenant-500s", None),                      # no key at all
+    ("fix/xxx-1", None),                            # unconfigured prefix
+])
+def test_issue_key_in_branch(wk, trackers, branch, key):
+    assert wk.issue_key_in_branch(branch) == key
+
+
+def test_issue_key_in_branch_needs_configured_prefixes(wk, no_prefixes):
+    """Unanchored guessing would tag ordinary branches with bogus tickets."""
+    assert wk.issue_key_in_branch("fix/API-2-thing") is None
+
+
+def test_env_pairs_expose_ticket(wk, trackers, tmp_path):
+    env = dict(wk.wk_env_pairs("demo-lpe-1234", "lpe-1234", tmp_path))
+    assert env["WK_ISSUE_KEY"] == "LPE-1234"
+    assert env["WK_ISSUE_URL"] == "https://linear.app/acme/issue/LPE-1234"
+
+
+def test_env_pairs_omit_url_when_tracker_unmapped(wk, trackers, tmp_path):
+    env = dict(wk.wk_env_pairs("demo-ops-1", "ops-1", tmp_path))
+    assert env["WK_ISSUE_KEY"] == "OPS-1"
+    assert "WK_ISSUE_URL" not in env
+
+
+def test_env_pairs_unchanged_without_ticket(wk, trackers, tmp_path):
+    env = dict(wk.wk_env_pairs("demo-feat-x", "feat/x", tmp_path))
+    assert "WK_ISSUE_KEY" not in env and "WK_ISSUE_URL" not in env
+
+
+def test_handoff_gets_ticket_link(wk, trackers, tmp_path, monkeypatch):
+    monkeypatch.setattr(wk.shutil, "which", lambda _: None)
+    path = wk.write_handoff(tmp_path, "lpe-1234", None)
+    body = path.read_text()
+    assert "[LPE-1234](https://linear.app/acme/issue/LPE-1234)" in body
+    assert body.startswith("# ")          # title still leads
+    assert "## Goal" in body
+
+
+def test_handoff_ticket_line_bare_key_without_url(wk, trackers, tmp_path, monkeypatch):
+    monkeypatch.setattr(wk.shutil, "which", lambda _: None)
+    body = wk.write_handoff(tmp_path, "ops-1", None).read_text()
+    assert "**Ticket:** OPS-1" in body
+
+
+def test_handoff_unchanged_without_ticket(wk, trackers, tmp_path, monkeypatch):
+    monkeypatch.setattr(wk.shutil, "which", lambda _: None)
+    body = wk.write_handoff(tmp_path, "feat/x", "do the thing").read_text()
+    assert "Ticket:" not in body

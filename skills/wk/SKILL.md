@@ -49,6 +49,7 @@ is the fastest). Don't flail on `command not found`.
 |---|---|
 | "open / switch to `<branch>`" | `wk open <branch>` — forgiving: create or attach |
 | "set up a workspace to do X" | `wk open <branch> --task "<what and why>"` |
+| "spin up a workspace for LPE-1234 / DEV-5678" | `wk open <KEY>` — read the ticket first, then pass what you learn as `--task` |
 | "new branch off `<base>`" | `wk new <branch> --base <base> --task "<what and why>"` |
 | "spawn a task to do X" (from an orchestrator branch) | `wk task "<prompt>" --base main` (add `--auto` for headless) |
 | "switch workspaces" / "what's running" | `wk switch` (fzf) or `wk list` |
@@ -86,6 +87,25 @@ when the user's request is short.
    `wk open`, pick a name in that same `<type>/<slug>` shape — types are
    `feat`, `fix`, `chore`, `docs`, `refactor`, `test`, `perf`, `spike`.
    The `<type>/` becomes a real `.worktrees/<type>/` subdir.
+
+## Working from a ticket
+
+`wk open LPE-1234` resolves the key to its PR (or starts a branch named after
+it). Two things to do around that:
+
+1. **Read the ticket before creating the workspace**, then pass what you learned
+   as `--task`. wk resolves the key against GitHub, not the tracker — it never
+   reads the ticket body, so a workspace opened from a bare key gets a brief
+   with nothing in it unless you supply the substance.
+2. **Inside a workspace**, `WK_ISSUE_KEY` and `WK_ISSUE_URL` are set when the
+   branch carries a configured key. `WK_ISSUE_URL` tells you which tracker it
+   is — `linear.app/...` vs `...atlassian.net/browse/...` — so you know which
+   tool to reach for. If it's set and you haven't read the ticket, read it.
+
+Key → tracker mapping comes from the user's config
+(`issue_prefixes = LPE:linear, DEV:jira`). If `WK_ISSUE_URL` is absent but
+`WK_ISSUE_KEY` is set, the prefix isn't mapped to a tracker — ask rather than
+guessing which one it is.
 
 ## Choosing a layout
 

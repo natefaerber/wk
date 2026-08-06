@@ -256,6 +256,8 @@ Every pane in a wk session has these env vars set:
 | `WK_SESSION` | `credo-backend-release-v35` (repo-prefixed slug, no slashes) |
 | `WK_BRANCH` | `release/v35` (canonical ref) |
 | `WK_PATH` | `/Users/nate/_Work/credo-backend/.worktrees/release/v35` |
+| `WK_ISSUE_KEY` | `LPE-1234` (only when the branch carries a configured key) |
+| `WK_ISSUE_URL` | `https://linear.app/acme/issue/LPE-1234` (only when the prefix is mapped to a tracker) |
 
 And `.wk/AGENTS.md` in the worktree root documents the layout + commands for
 the agent. Reference it from your project `CLAUDE.md` to give Claude
@@ -313,11 +315,17 @@ ticket or a branch — so tell wk which projects are real. Your trackers follow
 
 ```ini
 # ~/.config/wk/config
-issue_prefixes = LPE, ENG
+issue_prefixes   = LPE:linear, DEV:jira
+linear_workspace = acme                 # linear.app/<workspace>
+jira_site        = acme.atlassian.net
 ```
 
+The `:tracker` suffix is optional and only affects **URL building** — matching
+never needs it. Tag it and wk hands the agent a link it can go read (see
+below); leave it off (`issue_prefixes = LPE, DEV`) and matching still works.
+
 A repo with its own keys can override it in `<repo>/.wk/config`, and
-`WK_ISSUE_PREFIXES=LPE,ENG` beats both. With prefixes configured, matching
+`WK_ISSUE_PREFIXES` beats both. With prefixes configured, matching
 gets both stricter and more forgiving:
 
 | ref | unconfigured | `issue_prefixes = LPE, ENG` |
@@ -331,6 +339,24 @@ gets both stricter and more forgiving:
 If a workspace already exists for the issue's branch, `wk open <key>` reopens it
 rather than re-resolving the ticket — so you land back where you were working,
 not on whatever PR the search turns up today.
+
+### Handing the ticket to the agent
+
+wk resolves keys against **GitHub, not the tracker** — it never reads a ticket
+body, and needs no Jira/Linear credentials. What it does instead is tell the
+agent where the ticket lives. Any workspace whose branch carries a configured
+key (`lpe-1234`, or `fix/LPE-1234-tenant-500s`) gets:
+
+| var | example |
+|---|---|
+| `WK_ISSUE_KEY` | `LPE-1234` |
+| `WK_ISSUE_URL` | `https://linear.app/acme/issue/LPE-1234` |
+
+and its `.wk/task.md` opens with a **Ticket:** link. That's what makes
+"spin up a workspace for LPE-1234" work end-to-end: the agent can see from the
+URL that LPE is Linear and DEV is Jira, and go read the right one. `WK_ISSUE_URL`
+is omitted when the prefix has no `:tracker` — the agent is told to ask rather
+than guess.
 
 ---
 
@@ -384,7 +410,9 @@ yours to commit if you want the default shared with your team.
 | key | values | env override |
 |---|---|---|
 | `layout` | `wide` \| `laptop` \| `minimal` | `WK_LAYOUT` |
-| `issue_prefixes` | e.g. `LPE, ENG` | `WK_ISSUE_PREFIXES` |
+| `issue_prefixes` | e.g. `LPE:linear, DEV:jira` | `WK_ISSUE_PREFIXES` |
+| `linear_workspace` | e.g. `acme` | — |
+| `jira_site` | e.g. `acme.atlassian.net` | — |
 
 ---
 

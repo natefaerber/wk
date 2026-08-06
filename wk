@@ -657,6 +657,10 @@ These environment variables are set on every pane of the session:
 - `WK_SESSION` — the tmux session name (slug form, no slashes)
 - `WK_BRANCH` — the canonical git branch (may contain slashes)
 - `WK_PATH` — the worktree root (typically equal to your starting cwd)
+- `WK_ISSUE_KEY` / `WK_ISSUE_URL` — set when this workspace's branch carries a
+  tracker key (Jira or Linear). If they're set, **read the ticket before you
+  start**: it's the authoritative statement of the work, and `.wk/task.md` may
+  be only a skeleton pointing at it.
 
 ## Layout
 
@@ -1377,12 +1381,22 @@ def wk_env_pairs(session: str, branch: str, wt: Path) -> list[tuple[str, str]]:
     `set-environment` retroactively) can't drift apart. The contract is
     documented for agents in the embedded `.wk/AGENTS.md`.
     """
-    return [
+    pairs = [
         ("WK_IN_WORKSPACE", "1"),
         ("WK_SESSION", session),
         ("WK_BRANCH", branch),
         ("WK_PATH", str(wt)),
     ]
+    # When the branch carries a configured ticket key, hand the agent the key
+    # and (if the prefix is mapped to a tracker) a URL it can go read. wk
+    # doesn't fetch the ticket itself — the agent already has tools for that.
+    key = issue_key_in_branch(branch)
+    if key:
+        pairs.append(("WK_ISSUE_KEY", key))
+        url = issue_url(key)
+        if url:
+            pairs.append(("WK_ISSUE_URL", url))
+    return pairs
 
 
 def build_session(
@@ -1697,8 +1711,32 @@ def write_handoff(
         return None
     body, source = render_handoff(branch, task)
     target.parent.mkdir(exist_ok=True)
-    target.write_text(body, encoding="utf-8")
+    target.write_text(_with_ticket_line(body, branch), encoding="utf-8")
     return target
+
+
+def _with_ticket_line(body: str, branch: str) -> str:
+    """Prepend a `Ticket:` line when BRANCH carries a configured issue key.
+
+    This is the case the brief matters most and has least to say: `wk open
+    LPE-1234` has no `--task` text, so the generated body is a skeleton. A
+    ticket link turns that into something the agent can actually act on — go
+    read the ticket — instead of a set of empty headings.
+    """
+    key = issue_key_in_branch(branch)
+    if not key:
+        return body
+    url = issue_url(key)
+    ref = f"[{key}]({url})" if url else key
+    line = (
+        f"**Ticket:** {ref}\n"
+        f"_Read the ticket first — it's the source of truth for this work._\n"
+    )
+    # Sit under the H1 if there is one, so the title still leads.
+    lines = body.splitlines()
+    if lines and lines[0].startswith("# "):
+        return "\n".join([lines[0], "", line, *lines[1:]]).rstrip() + "\n"
+    return line + "\n" + body
 
 
 def _announce_handoff(wt: Path, branch: str, task: Optional[str]) -> None:
@@ -2063,8 +2101,64 @@ def issue_prefixes() -> tuple[str, ...]:
     It's what lets wk accept `lpe-1544` and `ENG-123/fix-the-thing` without
     those swallowing ordinary branch names.
     """
+    return tuple(_issue_prefix_map())
+
+
+# Trackers wk can build a canonical issue URL for.
+ISSUE_TRACKERS = ("jira", "linear")
+
+
+def _issue_prefix_map() -> dict[str, Optional[str]]:
+    """`{"LPE": "linear", "DEV": "jira", "OPS": None}` from the config string.
+
+    Entries are `KEY` or `KEY:tracker`. The tracker is optional because it only
+    affects URL building — matching a key never needed it. Unknown trackers are
+    ignored rather than fatal: a typo shouldn't stop `wk open` from resolving a
+    ticket it otherwise understands perfectly.
+    """
     raw = os.environ.get("WK_ISSUE_PREFIXES") or config_get("issue_prefixes")
-    return tuple(p.strip().upper() for p in raw.replace(" ", ",").split(",") if p.strip())
+    out: dict[str, Optional[str]] = {}
+    for entry in raw.replace(" ", ",").split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        key, _, tracker = entry.partition(":")
+        key = key.strip().upper()
+        if not key:
+            continue
+        tracker = tracker.strip().lower()
+        out[key] = tracker if tracker in ISSUE_TRACKERS else None
+    return out
+
+
+def issue_tracker(key: str) -> Optional[str]:
+    """Which tracker owns KEY's project — "jira", "linear", or None."""
+    prefix = key.split("-", 1)[0].upper()
+    return _issue_prefix_map().get(prefix)
+
+
+def issue_url(key: str) -> Optional[str]:
+    """Canonical URL for issue KEY, or None if it isn't derivable.
+
+    Needs the prefix mapped to a tracker (`issue_prefixes = LPE:linear`) plus
+    that tracker's host setting (`jira_site` / `linear_workspace`). wk builds
+    the URL rather than calling either API — no auth, no network, nothing to
+    fail — and hands it to the agent, which already knows how to read a ticket.
+    """
+    tracker = issue_tracker(key)
+    if tracker == "jira":
+        site = config_get("jira_site").strip().rstrip("/")
+        if not site:
+            return None
+        if not site.startswith(("http://", "https://")):
+            site = f"https://{site}"
+        return f"{site}/browse/{key.upper()}"
+    if tracker == "linear":
+        workspace = config_get("linear_workspace").strip().strip("/")
+        if not workspace:
+            return None
+        return f"https://linear.app/{workspace}/issue/{key.upper()}"
+    return None
 
 
 def _issue_key_re() -> Optional[re.Pattern]:
@@ -2102,6 +2196,23 @@ def parse_issue_ref(ref: str) -> Optional[str]:
         m = configured.match(ref)
         return m.group("key").upper() if m else None
     m = _ISSUE_KEY_RE.match(ref)
+    return m.group("key").upper() if m else None
+
+
+def issue_key_in_branch(branch: str) -> Optional[str]:
+    """The configured issue key carried by BRANCH, if any.
+
+    Searches anywhere in the name, so it catches both what `open_issue`
+    generates (`lpe-1544`) and what a human writes (`fix/LPE-1544-tenant-500s`).
+    Requires configured prefixes — guessing from an unanchored generic shape
+    would tag ordinary branches with bogus tickets.
+    """
+    prefixes = issue_prefixes()
+    if not prefixes:
+        return None
+    alts = "|".join(re.escape(p) for p in prefixes)
+    m = re.search(rf"(?<![A-Za-z0-9])(?P<key>(?:{alts})-\d+)(?![0-9])",
+                  branch, re.IGNORECASE)
     return m.group("key").upper() if m else None
 
 

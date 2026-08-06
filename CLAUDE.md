@@ -208,12 +208,23 @@ rather than killing a render loop.
 Two layers. Tracker **URLs** (Jira browse, Linear issue) match unconditionally
 — a URL is unambiguous. **Bare keys** depend on `issue_prefixes()`
 (`WK_ISSUE_PREFIXES` > repo config > user config): unconfigured, wk falls back
-to a generic
-`^[A-Z][A-Z0-9]+-\d+$`, which is case-sensitive on purpose because an
+to a generic `^[A-Z][A-Z0-9]+-\d+$`, which is case-sensitive on purpose because an
 unanchored lowercase match would swallow ordinary branch names. Configured, the
 pattern is built from the real project keys, so it can safely be
 case-insensitive and tolerate a trailing `/slug` or `-slug` (Linear's two
 copy-branch-name formats).
+
+A prefix may carry a tracker (`issue_prefixes = LPE:linear, DEV:jira`). That
+suffix affects **URL building only** — matching never needed it, and an unknown
+tracker is ignored rather than fatal so a typo can't stop `wk open` resolving a
+ticket it otherwise understands. `issue_url()` *builds* the URL from
+`jira_site` / `linear_workspace`; wk deliberately never calls either tracker's
+API, so there's no auth and no network failure mode. `issue_key_in_branch()`
+then surfaces `WK_ISSUE_KEY` / `WK_ISSUE_URL` to every pane and puts a
+`Ticket:` link atop `.wk/task.md` — the agent has tools for reading tickets,
+wk just has to tell it *which* tracker and *where*. This is the whole answer to
+"spin up a workspace for LPE-1234": wk resolves keys against GitHub, so without
+that link the agent can't tell Linear from Jira.
 
 `open_issue` names its branch `key.lower()`, which means that branch re-matches
 as an issue once prefixes are configured. `_existing_workspace_for_issue()`
