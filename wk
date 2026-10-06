@@ -98,13 +98,30 @@ def doctor() -> None:
         suffix = f" [dim]— {note}[/dim]" if (note and not ok) else ""
         console.print(f"  {glyph} {name}{tag}{suffix}")
 
+    host = backend()
+    console.print(f"[dim]backend[/dim]  {host}")
     console.print("[dim]tools[/dim]")
     _tool("git", True)
-    _tool("tmux", True)
+    _tool("tmux", host == "tmux")
+    _tool("herdr", host == "herdr", "the herdr backend (https://herdr.dev)")
     _tool("fzf", True)
     _tool("lazygit", False, "the `prefix M-g` git popup")
     _tool("fish", False)
     _tool("uv", True)
+
+    if shutil.which("herdr"):
+        console.print("[dim]herdr[/dim]")
+        if _herdr_socket() and herdr_snapshot():
+            console.print("  [green]✓[/green] server running")
+        else:
+            console.print("  [yellow]○[/yellow] no herdr server — run `herdr` to start one")
+        status = run(["herdr", "integration", "status"], check=False).stdout
+        claude_line = next((ln for ln in status.splitlines() if ln.startswith("claude:")), "")
+        if "not installed" in claude_line or not claude_line:
+            console.print("  [yellow]○[/yellow] Claude integration missing — agent states "
+                          "won't update\n    [dim]→ herdr integration install claude[/dim]")
+        else:
+            console.print("  [green]✓[/green] Claude integration installed")
 
     console.print("[dim]tmux config[/dim]")
     loaded = ""
@@ -183,14 +200,23 @@ def run(
     capture: bool = True,
     cwd: Optional[Path] = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Run a command, returning the completed process."""
-    return subprocess.run(
-        cmd,
-        check=check,
-        capture_output=capture,
-        text=True,
-        cwd=cwd,
-    )
+    """Run a command, returning the completed process.
+
+    With check=False a missing executable reads as exit 127 rather than
+    raising: probes like `tmux ls` must degrade on a herdr-only machine.
+    """
+    try:
+        return subprocess.run(
+            cmd,
+            check=check,
+            capture_output=capture,
+            text=True,
+            cwd=cwd,
+        )
+    except FileNotFoundError as e:
+        if check:
+            raise
+        return subprocess.CompletedProcess(cmd, 127, "", str(e))
 
 
 def die(msg: str, code: int = 1, *, hint: Optional[str] = None) -> NoReturn:
@@ -419,11 +445,7 @@ def current_session() -> str:
     same value); falls back to asking tmux directly when we're attached
     but it wasn't exported. Empty string when not in tmux at all.
     """
-    current = os.environ.get("WK_CURRENT", "")
-    if not current and in_tmux():
-        r = run(["tmux", "display-message", "-p", "#S"], check=False)
-        current = r.stdout.strip()
-    return current
+    return os.environ.get("WK_CURRENT", "") or host_session()
 
 
 def session_marker(w: "Workspace", current: str = "", *, rich: bool = True) -> str:
@@ -578,10 +600,10 @@ def is_wk_workspace(
 
 def list_wk_worktrees() -> list[tuple[str, Path]]:
     """Like `list_worktrees`, but only worktrees wk owns (marker or wk session)."""
-    wk_sessions = wk_tmux_sessions()
+    sessions = wk_sessions()
     return [
         (b, p) for b, p in list_worktrees()
-        if is_wk_workspace(b, p, wk_sessions)
+        if is_wk_workspace(b, p, sessions)
     ]
 
 
@@ -645,16 +667,20 @@ def mark_wk_workspace(path: Path, branch: Optional[str] = None) -> None:
 _AGENTS_MD = """\
 # wk workspace context
 
-This worktree is managed by `wk` (a tmux + git-worktree workspace manager).
-When you read this file you can assume you're running inside the agent pane
-of a wk tmux session.
+This worktree is managed by `wk` (a git-worktree workspace manager whose
+terminals run on tmux or on herdr). When you read this file you can assume
+you're running inside the agent pane of a wk session. On herdr
+(`HERDR_ENV=1`) the session is a herdr workspace and you are a named herdr
+agent; `herdr agent list` shows your siblings.
 
 ## Runtime signals
 
-These environment variables are set on every pane of the session:
+These environment variables are set on every pane wk builds (on herdr, a
+pane you split yourself won't have them; `git rev-parse --show-toplevel`
+and `.wk/` still identify the workspace):
 
 - `WK_IN_WORKSPACE=1` — fast check that wk is active
-- `WK_SESSION` — the tmux session name (slug form, no slashes)
+- `WK_SESSION` — the session name (tmux session / herdr workspace label)
 - `WK_BRANCH` — the canonical git branch (may contain slashes)
 - `WK_PATH` — the worktree root (typically equal to your starting cwd)
 - `WK_ISSUE_KEY` / `WK_ISSUE_URL` — set when this workspace's branch carries a
@@ -765,6 +791,13 @@ directions), you should:
    Each `--auto` task spawns a sibling wk workspace + tmux session,
    runs `claude -p` headlessly with the prompt, and streams output
    to that workspace's `.wk/output.md`.
+
+   **On herdr** (`$HERDR_ENV` is `1`) there is no `--auto`: drop it and
+   add `--no-attach`. Each task is an interactive Claude, registered as a
+   herdr agent named after its session. Follow it with
+   `herdr agent wait <name>` / `herdr agent read <name>`, and send a
+   follow-up with `herdr agent prompt <name> "..."` instead of re-spawning.
+   `herdr agent list` shows the names.
 3. **Poll** — periodically check status:
    ```
    wk task-status                 # one-line summary of all tasks
@@ -892,7 +925,7 @@ def workspace_status(branch: str, path: Path, sessions: set[str]) -> Workspace:
 def all_workspaces() -> list[Workspace]:
     # Use wk-only sessions so `has_session` reflects "wk session is running",
     # not "any tmux session with this name exists".
-    sessions = wk_tmux_sessions()
+    sessions = wk_sessions()
     return [workspace_status(b, p, sessions) for b, p in list_wk_worktrees()]
 
 
@@ -929,9 +962,9 @@ def external_wk_sessions(local_paths: set[Path]) -> list[Workspace]:
          "#{session_name}\t#{@wk}\t#{@wk-branch}\t#{@wk-path}"],
         check=False,
     )
+    out: list[Workspace] = _external_herdr_sessions(local_paths)
     if r.returncode != 0:
-        return []
-    out: list[Workspace] = []
+        return out
     for line in r.stdout.splitlines():
         parts = line.split("\t")
         if len(parts) < 4:
@@ -949,6 +982,32 @@ def external_wk_sessions(local_paths: set[Path]) -> list[Workspace]:
         dirty, ahead, behind = _git_dirty_ahead_behind(p)
         out.append(Workspace(
             branch=branch, path=p, session=name, has_session=True,
+            dirty=dirty, ahead=ahead, behind=behind,
+        ))
+    return out
+
+
+def _external_herdr_sessions(local_paths: set[Path]) -> list[Workspace]:
+    """herdr's half of `external_wk_sessions`: its workspaces carry no branch
+    or path tags, so both come from the worktree the panes were started in."""
+    out: list[Workspace] = []
+    for label, hw in herdr_wk_workspaces().items():
+        root = next((p for p in hw.paths if (p / WK_MARKER_DIR).is_dir()), None)
+        if root is None:
+            continue
+        try:
+            resolved = root.resolve()
+        except OSError:
+            resolved = root
+        if resolved in local_paths:
+            continue
+        head = run(["git", "-C", str(root), "rev-parse", "--abbrev-ref", "HEAD"], check=False)
+        branch = head.stdout.strip() if head.returncode == 0 else ""
+        if not branch or branch == "HEAD":
+            continue
+        dirty, ahead, behind = _git_dirty_ahead_behind(root)
+        out.append(Workspace(
+            branch=branch, path=root, session=label, has_session=True,
             dirty=dirty, ahead=ahead, behind=behind,
         ))
     return out
@@ -1005,11 +1064,392 @@ def in_git_repo() -> bool:
 
 
 def attach_or_switch(session: str) -> None:
-    """Attach if outside tmux, switch-client if inside."""
+    """Bring SESSION to the front on whichever host runs it.
+
+    tmux: attach from outside, switch-client from inside. herdr: focus the
+    workspace, then attach the herdr TUI if we aren't already inside it.
+    """
+    ws = herdr_workspaces().get(session)
+    if ws is not None:
+        herdr_call("workspace.focus", {"workspace_id": ws.id})
+        if os.environ.get("HERDR_ENV") != "1":
+            os.execvp("herdr", ["herdr"])
+        return
     if in_tmux():
         os.execvp("tmux", ["tmux", "switch-client", "-t", session])
     else:
         os.execvp("tmux", ["tmux", "attach", "-t", session])
+
+
+# ---------------------------------------------------------------------------
+# hosts: tmux or herdr
+# ---------------------------------------------------------------------------
+# A workspace's terminals live on one of two hosts. tmux is the original;
+# herdr (https://herdr.dev) is a terminal workspace manager for coding agents
+# with its own sidebar, agent lifecycle states and session persistence. wk
+# keeps everything git-shaped either way — worktrees, branches, issue refs,
+# handoff briefs — and only asks the host for terminals. Design notes and the
+# feature mapping: docs/herdr-backend.md.
+#
+# Session identity on herdr: a workspace whose label is the wk session name
+# AND whose panes were started in a worktree carrying a `.wk/` marker. herdr
+# has no tmux-style user options to tag it with, and its display metadata
+# expires (24h TTL), so the marker on disk is the durable half of the check.
+
+BACKEND_ENV = "WK_BACKEND"
+BACKENDS = ("tmux", "herdr")
+
+
+class HerdrError(RuntimeError):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(f"{code}: {message}")
+        self.code = code
+
+
+@dataclass
+class HerdrWorkspace:
+    id: str
+    label: str
+    paths: list[Path]  # spawn cwds of the workspace's panes
+
+
+def herdr_current_workspace() -> str:
+    """The herdr workspace this process belongs to, or "". Panes get
+    HERDR_WORKSPACE_ID; key-bound commands herdr runs on its server get the
+    focused one as HERDR_ACTIVE_WORKSPACE_ID instead."""
+    if os.environ.get("HERDR_ENV") != "1" and not os.environ.get("HERDR_ACTIVE_WORKSPACE_ID"):
+        return ""
+    return os.environ.get("HERDR_WORKSPACE_ID") or os.environ.get("HERDR_ACTIVE_WORKSPACE_ID", "")
+
+
+def in_herdr() -> bool:
+    """True when this process runs inside a herdr-managed pane (or a command
+    herdr launched for one)."""
+    return bool(herdr_current_workspace())
+
+
+def in_host() -> bool:
+    """True inside any session host wk can drive (tmux or herdr)."""
+    return in_tmux() or in_herdr()
+
+
+@functools.lru_cache(maxsize=1)
+def _herdr_socket() -> Optional[str]:
+    """The herdr server socket: the pane's own when inside herdr, else the
+    default session's, else None (herdr absent or no server running)."""
+    path = os.environ.get("HERDR_SOCKET_PATH")
+    if path:
+        return path
+    if shutil.which("herdr") is None:
+        return None
+    r = run(["herdr", "status", "server"], check=False)
+    for line in r.stdout.splitlines():
+        key, _, val = line.strip().partition(":")
+        if key == "socket" and val.strip():
+            return val.strip()
+    return None
+
+
+def herdr_call(method: str, params: Optional[dict] = None, timeout: float = 60.0) -> dict:
+    """One request on herdr's socket API. Returns `result`; raises HerdrError.
+
+    The socket protocol (newline-delimited JSON, one request per connection)
+    is what `herdr` itself speaks; using it directly saves a process per call
+    on the render loops that poll it.
+    """
+    import socket as _socket
+    path = _herdr_socket()
+    if not path:
+        raise HerdrError("no_server", "no running herdr server")
+    req = {"id": f"wk:{method}", "method": method, "params": params or {}}
+    try:
+        with _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            sock.connect(path)
+            sock.sendall((json.dumps(req) + "\n").encode())
+            buf = b""
+            while not buf.endswith(b"\n"):
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+    except OSError as e:
+        raise HerdrError("socket", str(e)) from e
+    try:
+        reply = json.loads(buf)
+    except ValueError as e:
+        raise HerdrError("bad_reply", buf[:200].decode(errors="replace")) from e
+    if "error" in reply:
+        err = reply["error"] or {}
+        raise HerdrError(err.get("code", "error"), err.get("message", ""))
+    return reply.get("result", {})
+
+
+def herdr_snapshot() -> dict:
+    """The live herdr session snapshot, or {} when herdr isn't reachable.
+    Never raises: list/status surfaces must degrade, not crash."""
+    try:
+        return herdr_call("session.snapshot", timeout=5.0).get("snapshot", {})
+    except HerdrError:
+        return {}
+
+
+def herdr_workspaces(snap: Optional[dict] = None) -> dict[str, HerdrWorkspace]:
+    """Every herdr workspace, keyed by label."""
+    snap = herdr_snapshot() if snap is None else snap
+    paths: dict[str, list[Path]] = {}
+    for pane in snap.get("panes", []):
+        cwd = pane.get("cwd")
+        if cwd:
+            paths.setdefault(pane.get("workspace_id", ""), []).append(Path(cwd))
+    out: dict[str, HerdrWorkspace] = {}
+    for w in snap.get("workspaces", []):
+        label = w.get("label") or ""
+        if label:
+            out[label] = HerdrWorkspace(w["workspace_id"], label, paths.get(w["workspace_id"], []))
+    return out
+
+
+def herdr_wk_workspaces(snap: Optional[dict] = None) -> dict[str, HerdrWorkspace]:
+    """herdr workspaces that are wk sessions (see the identity note above)."""
+    return {
+        label: w for label, w in herdr_workspaces(snap).items()
+        if any((p / WK_MARKER_DIR).is_dir() for p in w.paths)
+    }
+
+
+def backend() -> str:
+    """The host new sessions are built on: $WK_BACKEND > config `backend` >
+    herdr when running inside it > tmux. Existing sessions are always driven
+    on whichever host already has them, whatever this returns."""
+    name = (os.environ.get(BACKEND_ENV) or config_get("backend") or "").strip().lower()
+    if name:
+        if name not in BACKENDS:
+            die(f"unknown backend {name!r}", hint=f"expected one of: {', '.join(BACKENDS)}")
+        return name
+    return "herdr" if in_herdr() else "tmux"
+
+
+def require_host() -> None:
+    """`require` for whichever host this invocation needs."""
+    require("herdr" if backend() == "herdr" else "tmux")
+
+
+def live_sessions() -> set[str]:
+    """Names taken on either host — for "already exists" checks."""
+    return tmux_sessions() | set(herdr_workspaces())
+
+
+def wk_sessions() -> set[str]:
+    """Running wk sessions on either host."""
+    return wk_tmux_sessions() | set(herdr_wk_workspaces())
+
+
+def is_wk_session_name(session: str) -> bool:
+    """True if SESSION is a running wk session on either host."""
+    r = run(["tmux", "show-options", "-v", "-t", session, "@wk"], check=False)
+    if r.returncode == 0 and r.stdout.strip() == "1":
+        return True
+    return session in herdr_wk_workspaces()
+
+
+def host_session() -> str:
+    """The session this process runs in, on either host; "" outside both."""
+    if in_tmux():
+        r = run(["tmux", "display-message", "-p", "#S"], check=False)
+        return r.stdout.strip()
+    if in_herdr():
+        wid = herdr_current_workspace()
+        for label, w in herdr_workspaces().items():
+            if w.id == wid:
+                return label
+    return ""
+
+
+def kill_session(session: str) -> None:
+    """Stop SESSION's terminals (and the agent in them) on whichever host has
+    it. The worktree is untouched. Best-effort, like `tmux kill-session`."""
+    ws = herdr_workspaces().get(session)
+    if ws is not None:
+        try:
+            herdr_call("workspace.close", {"workspace_id": ws.id})
+        except HerdrError:
+            pass
+        return
+    run(["tmux", "kill-session", "-t", session], check=False)
+
+
+def _herdr_layout_cols() -> Optional[int]:
+    """Width herdr lays panes out in (the attached client minus its sidebar)."""
+    widths = [
+        (lay.get("area") or {}).get("width") or 0
+        for lay in herdr_snapshot().get("layouts", [])
+    ]
+    return max(widths) if any(widths) else None
+
+
+# ── herdr layouts ─────────────────────────────────────────────────
+# herdr draws its own workspace sidebar, so no profile carries a sidebar pane
+# here. Ratios are the first child's share of the split.
+HERDR_WIDE_AGENT_RATIO = 0.62     # agent | (terminal over shell)
+HERDR_LAPTOP_AGENT_RATIO = 0.7    # agent over terminal — narrow screens stack
+HERDR_MINIMAL_AGENT_RATIO = 0.68  # agent | terminal
+
+
+def _herdr_leaf(label: str, wt: Path, env: dict[str, str]) -> dict:
+    return {"type": "pane", "label": label, "cwd": str(wt), "env": env}
+
+
+def herdr_layout_tree(profile: str, wt: Path, env: dict[str, str]) -> dict:
+    """The `layout.apply` tree for PROFILE. Every leaf carries the WK_* env:
+    herdr gives a workspace's env to its first pane only, not to later
+    splits, so each pane has to be handed it directly."""
+    agent = _herdr_leaf("agent", wt, env)
+    term = _herdr_leaf("terminal", wt, env)
+    if profile == "wide":
+        right = {"type": "split", "direction": "down", "ratio": 0.5,
+                 "first": term, "second": _herdr_leaf("shell", wt, env)}
+        return {"type": "split", "direction": "right", "ratio": HERDR_WIDE_AGENT_RATIO,
+                "first": agent, "second": right}
+    if profile == "laptop":
+        return {"type": "split", "direction": "down", "ratio": HERDR_LAPTOP_AGENT_RATIO,
+                "first": agent, "second": term}
+    return {"type": "split", "direction": "right", "ratio": HERDR_MINIMAL_AGENT_RATIO,
+            "first": agent, "second": term}
+
+
+def _find_leaf(node: dict, label: str) -> Optional[str]:
+    """Pane id of the leaf labelled LABEL in a `layout.apply` result tree."""
+    if node.get("type") == "pane":
+        return node.get("pane_id") if node.get("label") == label else None
+    return _find_leaf(node.get("first", {}), label) or _find_leaf(node.get("second", {}), label)
+
+
+# ── Claude in a herdr pane ────────────────────────────────────────
+# herdr names agents and tracks their lifecycle when they're launched through
+# `agent.start`. wk pins each workspace to one Claude conversation by id
+# (`.wk/session-id`), so reopening resumes *that* conversation rather than
+# whichever ran last in the directory (`claude -c`).
+HERDR_AGENT_NAME_MAX = 32
+SESSION_ID_FILE = "session-id"
+
+
+def herdr_agent_name(session: str) -> str:
+    """A herdr agent name for SESSION: `[a-z][a-z0-9_-]{0,31}`. Long names
+    keep a hash suffix so two truncated names can't collide."""
+    import hashlib
+    name = re.sub(r"[^a-z0-9_-]+", "-", session.lower()).strip("-") or "wk"
+    if not name[0].isalpha():
+        name = "w" + name
+    if len(name) > HERDR_AGENT_NAME_MAX:
+        digest = hashlib.sha1(session.encode()).hexdigest()[:6]
+        name = name[: HERDR_AGENT_NAME_MAX - 7].rstrip("-") + "-" + digest
+    return name
+
+
+def _claude_transcript(wt: Path, sid: str) -> Path:
+    """Where Claude Code keeps the transcript for conversation SID run in WT."""
+    base = Path(os.environ.get("CLAUDE_CONFIG_DIR") or (Path.home() / ".claude"))
+    try:
+        cwd = str(wt.resolve())
+    except OSError:
+        cwd = str(wt)
+    return base / "projects" / re.sub(r"[^A-Za-z0-9]", "-", cwd) / f"{sid}.jsonl"
+
+
+def claude_session_args(wt: Path, name: str, fresh: bool = False) -> list[str]:
+    """Claude CLI args that bind WT to one conversation.
+
+    Resumes the recorded conversation when its transcript still exists;
+    otherwise (first launch, FRESH, or a transcript Claude has since pruned)
+    records a new id and starts it. Never resumes an id that can't load —
+    that would fail the launch instead of degrading to a fresh session.
+    """
+    import uuid
+    sid_file = wt / WK_MARKER_DIR / SESSION_ID_FILE
+    sid = "" if fresh else (sid_file.read_text().strip() if sid_file.exists() else "")
+    if sid and _claude_transcript(wt, sid).exists():
+        return ["--resume", sid, "-n", name]
+    sid = str(uuid.uuid4())
+    sid_file.parent.mkdir(exist_ok=True)
+    sid_file.write_text(sid + "\n", encoding="utf-8")
+    return ["--session-id", sid, "-n", name]
+
+
+HERDR_AGENT_START_DEADLINE = 20.0  # a fresh pane's login shell may still be starting
+
+
+def _herdr_start_claude(session: str, wt: Path, branch: str, pane_id: str,
+                        prompt: Optional[str], fresh: bool) -> None:
+    """Launch Claude in PANE_ID as a named herdr agent. Warns rather than
+    dies: the workspace is usable without the agent, and tearing it down over
+    a slow shell would lose more than it saves."""
+    name = herdr_agent_name(session)
+    args = claude_session_args(wt, branch, fresh=fresh)
+    if prompt and prompt.strip():
+        args.append(prompt.strip())
+    deadline = _time.monotonic() + HERDR_AGENT_START_DEADLINE
+    while True:
+        try:
+            herdr_call("agent.start", {"name": name, "kind": "claude",
+                                       "pane_id": pane_id, "args": args})
+            return
+        except HerdrError as e:
+            if e.code == "agent_not_ready":
+                # Claude is up but showing a dialog (folder trust, login…).
+                warn(f"claude in {session} is waiting for input — answer it in the agent pane")
+                return
+            if _time.monotonic() > deadline:
+                warn(f"could not start claude in {session}: {e}")
+                return
+            _time.sleep(0.5)
+
+
+def build_herdr_session(
+    session: str,
+    wt: Path,
+    agent: str,
+    branch: str,
+    profile: "LayoutProfile",
+    prompt: Optional[str] = None,
+    fresh: bool = False,
+) -> None:
+    """Create SESSION as a herdr workspace with PROFILE's layout and an agent.
+
+    The default agent command runs Claude through herdr's `agent.start`
+    (named, lifecycle-tracked, pinned to `.wk/session-id`); a custom
+    $WK_AGENT_CMD runs as the agent pane's command instead.
+    """
+    env = dict(wk_env_pairs(session, branch, wt))
+    try:
+        created = herdr_call("workspace.create", {
+            "cwd": str(wt), "label": session, "env": env, "focus": False,
+        })
+    except HerdrError as e:
+        die(f"failed to create herdr workspace {session!r}: {e}")
+    ws_id = created["workspace"]["workspace_id"]
+    tree = herdr_layout_tree(profile.name, wt, env)
+    custom = agent != DEFAULT_AGENT_CMD
+    if custom:
+        tree_agent = tree["first"]
+        tree_agent["command"] = _shell_wrap(f'{agent}; exec "${{SHELL:-/bin/sh}}" -l')
+    try:
+        # Applying to the workspace's first tab replaces it, so the throwaway
+        # root shell `workspace.create` started goes away with it.
+        applied = herdr_call("layout.apply", {
+            "tab_id": created["tab"]["tab_id"], "tab_label": "wk", "root": tree, "focus": False,
+        })
+    except HerdrError as e:
+        kill_session(session)
+        die(f"failed to lay out herdr workspace {session!r}: {e}; cleaned it up")
+    agent_pane = _find_leaf(applied["layout"]["root"], "agent")
+    if agent_pane:
+        if not custom:
+            _herdr_start_claude(session, wt, branch, agent_pane, prompt, fresh)
+        try:
+            herdr_call("pane.focus", {"pane_id": agent_pane})
+        except HerdrError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -1334,6 +1774,8 @@ def _client_cols() -> Optional[int]:
     else the controlling terminal's size. None when neither is knowable
     (e.g. a headless/cron invocation with no tty).
     """
+    if in_herdr():
+        return _herdr_layout_cols()
     if in_tmux():
         r = run(["tmux", "display-message", "-p", "#{client_width}"], check=False)
         w = r.stdout.strip()
@@ -1405,8 +1847,14 @@ def build_session(
     agent: str,
     branch: Optional[str] = None,
     layout: Optional[str] = None,
+    prompt: Optional[str] = None,
+    fresh: bool = False,
 ) -> None:
     """Create a detached session with the wk pane layout.
+
+    On the herdr backend this builds a herdr workspace instead (see
+    `build_herdr_session`); PROMPT and FRESH only apply there, since the tmux
+    path receives its prompt already baked into AGENT.
 
     LAYOUT picks the profile ("wide" / "laptop"); None auto-selects by the
     attach display's width (see `resolve_profile`). Both build the sidebar
@@ -1429,6 +1877,10 @@ def build_session(
     # Mark this worktree as a wk workspace before we touch tmux — the sidebar
     # filters on this, and `wk task` may also write its own files under .wk/.
     mark_wk_workspace(wt, branch=real_branch)
+
+    if backend() == "herdr":
+        build_herdr_session(session, wt, agent, real_branch, profile, prompt=prompt, fresh=fresh)
+        return
 
     # Environment exposed to every pane in the session. Lets agents (claude,
     # etc.) detect they're inside wk and find the workspace context. tmux's
@@ -2439,7 +2891,7 @@ def _build_and_attach(state: WorkspaceState, no_attach: bool,
     None auto-detects). TASK, when the workspace is newly created, becomes its
     `.wk/task.md` handoff brief.
     """
-    if state.session in tmux_sessions():
+    if state.session in live_sessions():
         console.print("[dim]session running; attaching[/dim]")
     else:
         # The brief must exist before the agent starts: it's what the agent
@@ -2540,10 +2992,10 @@ def new(
     there, or make it if not" command, use `wk open` instead.
     """
     require("git")
-    require("tmux")
+    require_host()
 
     session = session_name(branch)
-    if session in tmux_sessions():
+    if session in live_sessions():
         die(f"tmux session already exists: {session}",
             hint=f"`wk switch {branch}` to attach to it")
 
@@ -2614,7 +3066,7 @@ def open_cmd(
     a hand-made worktree)? Use `wk adopt` to wrap it in place instead.
     """
     require("git")
-    require("tmux")
+    require_host()
 
     if pick:
         if branch:
@@ -2657,7 +3109,7 @@ def pr(
     command for everything.
     """
     require("git")
-    require("tmux")
+    require_host()
     require("gh")
 
     pr_ref = parse_pr_ref(ref)
@@ -2693,7 +3145,7 @@ def adopt(
     session of that name is already running, we just attach to it.
     """
     require("git")
-    require("tmux")
+    require_host()
 
     start = Path(directory).expanduser().resolve() if directory else Path.cwd().resolve()
     if not start.is_dir():
@@ -2723,7 +3175,7 @@ def adopt(
         )
 
     session = session_name(branch)
-    if session in tmux_sessions():
+    if session in live_sessions():
         console.print(f"[dim]session running; attaching[/dim]")
     else:
         build_session(session, wt, agent_cmd(), branch=branch)
@@ -2768,7 +3220,8 @@ def task(
     ),
     auto: bool = typer.Option(
         False, "--auto",
-        help="Non-interactive: run `claude -p`, stream output to .wk/output.md, exit when done.",
+        help="Non-interactive: run `claude -p`, stream output to .wk/output.md, exit when done. "
+             "tmux backend only.",
     ),
     yes: bool = typer.Option(
         False, "--yes", "-y",
@@ -2796,8 +3249,16 @@ def task(
     (main/master/…), never from inside a task workspace — that's recursion.
     """
     require("git")
-    require("tmux")
+    require_host()
     require("claude")
+    on_herdr = backend() == "herdr"
+    if auto and on_herdr:
+        # Headless one-shot runs are retired on herdr: the agent stays
+        # interactive so an orchestrator (or you) can follow up, and herdr's
+        # agent states replace the `.wk/done` sentinel.
+        die("`--auto` isn't available on the herdr backend",
+            hint="drop --auto; follow the agent with `herdr agent wait` / `wk task-status`, "
+                 "or set WK_BACKEND=tmux for a headless run")
 
     # Pick a branch name. Use the explicit one if given, otherwise ask Claude,
     # falling back to a deterministic slug.
@@ -2827,7 +3288,7 @@ def task(
             branch = chosen
 
     session = session_name(branch)
-    if session in tmux_sessions():
+    if session in live_sessions():
         die(f"tmux session already exists: {session}",
             hint=f"`wk switch {branch}` to attach to it")
 
@@ -2847,8 +3308,12 @@ def task(
     body, _source = render_handoff(branch, prompt)
     task_file.write_text(body, encoding="utf-8")
 
+    _write_task_meta(wt, prompt, current_session())
+
     # Build the session. Agent command depends on --auto.
-    if auto:
+    if on_herdr:
+        build_session(session, wt, agent_cmd(), branch=branch, layout=layout, prompt=prompt)
+    elif auto:
         build_session(session, wt, " ".join(_shell_wrap(_AUTO_TASK_CMD)), branch=branch,
                       layout=layout)
     else:
@@ -2859,15 +3324,17 @@ def task(
         agent = f"claude {shlex.quote(prompt.strip())}"
         build_session(session, wt, agent, branch=branch, layout=layout)
 
-    # Tag the session as a task workspace so the sidebar can mark it.
-    run(["tmux", "set-option", "-t", session, "@wk-task", "1"])
-    run(["tmux", "set-option", "-t", session, "@wk-task-prompt", prompt.strip()[:200]])
-    # Record who spawned us so the auto-task command can report completion back.
-    # Captured from the current session (the orchestrator); empty when `wk task`
-    # is run outside a wk session, in which case the child stays silent.
-    orch_session = current_session()
-    if orch_session:
-        run(["tmux", "set-option", "-t", session, "@wk-task-orch", orch_session])
+    if not on_herdr:
+        # Tag the session as a task workspace so the sidebar can mark it.
+        run(["tmux", "set-option", "-t", session, "@wk-task", "1"])
+        run(["tmux", "set-option", "-t", session, "@wk-task-prompt", prompt.strip()[:200]])
+        # Record who spawned us so the auto-task command can report completion
+        # back. Captured from the current session (the orchestrator); empty when
+        # `wk task` is run outside a wk session, in which case the child stays
+        # silent.
+        orch_session = current_session()
+        if orch_session:
+            run(["tmux", "set-option", "-t", session, "@wk-task-orch", orch_session])
 
     console.print(f"[green]✓[/green] task workspace [bold]{branch}[/bold] ready")
     console.print(f"  [dim]task file: {task_file}[/dim]")
@@ -2897,6 +3364,36 @@ def _is_task_workspace_session(session: str) -> bool:
     return r.returncode == 0 and r.stdout.strip() == "1"
 
 
+# `.wk/task.json` records that `wk task` made a workspace, its prompt, and the
+# orchestrator that spawned it. It's on disk rather than in tmux options so it
+# holds on herdr (which has none) and survives the session being closed.
+TASK_META_FILE = "task.json"
+
+
+def _write_task_meta(wt: Path, prompt: str, orchestrator: str) -> None:
+    meta = {"prompt": prompt.strip()[:200], "orchestrator": orchestrator or None}
+    (wt / WK_MARKER_DIR / TASK_META_FILE).write_text(json.dumps(meta) + "\n", encoding="utf-8")
+
+
+def _read_task_meta(wt: Path) -> Optional[dict]:
+    try:
+        return json.loads((wt / WK_MARKER_DIR / TASK_META_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def _herdr_agent_status(session: str) -> Optional[str]:
+    """herdr's lifecycle state for SESSION's agent (idle / working / blocked /
+    done / unknown), or None when it isn't a herdr agent. A hint, not a
+    verdict: `done` means "finished a turn nobody has looked at yet", not
+    "the task is complete"."""
+    try:
+        return herdr_call("agent.get", {"target": herdr_agent_name(session)}, timeout=5.0) \
+            .get("agent", {}).get("agent_status")
+    except HerdrError:
+        return None
+
+
 def _tail_text(path: Path, max_bytes: int = 8192) -> str:
     """Read the last ~max_bytes of a file; useful for status snapshots
     without slurping multi-MB logs."""
@@ -2924,11 +3421,13 @@ class TaskStatus:
     output_size: int
     last_line: Optional[str]
     prompt_excerpt: Optional[str]
+    agent_status: Optional[str] = None
 
 
 def _task_status(w: Workspace) -> TaskStatus:
     """Build a status snapshot for one workspace."""
-    is_task = w.has_session and _is_task_workspace_session(w.session)
+    meta = _read_task_meta(w.path)
+    is_task = meta is not None or (w.has_session and _is_task_workspace_session(w.session))
     output_path = w.path / WK_MARKER_DIR / "output.md"
     output_size = output_path.stat().st_size if output_path.exists() else 0
     done = (w.path / WK_MARKER_DIR / _TASK_DONE_MARKER).exists()
@@ -2953,13 +3452,18 @@ def _task_status(w: Workspace) -> TaskStatus:
     elif is_task and not w.has_session:
         state = "idle"  # task workspace whose session got killed pre-output
 
-    prompt_excerpt: Optional[str] = None
-    r = run(
-        ["tmux", "show-options", "-v", "-t", w.session, "@wk-task-prompt"],
-        check=False,
-    )
-    if r.returncode == 0 and r.stdout.strip():
-        prompt_excerpt = r.stdout.strip().strip('"')
+    agent_status = _herdr_agent_status(w.session) if w.has_session else None
+    if agent_status == "blocked":
+        state = "blocked"
+
+    prompt_excerpt: Optional[str] = (meta or {}).get("prompt")
+    if not prompt_excerpt:
+        r = run(
+            ["tmux", "show-options", "-v", "-t", w.session, "@wk-task-prompt"],
+            check=False,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            prompt_excerpt = r.stdout.strip().strip('"')
 
     return TaskStatus(
         branch=w.branch,
@@ -2974,6 +3478,7 @@ def _task_status(w: Workspace) -> TaskStatus:
         output_size=output_size,
         last_line=last_line,
         prompt_excerpt=prompt_excerpt,
+        agent_status=agent_status,
     )
 
 
@@ -2981,6 +3486,7 @@ _STATE_STYLE = {
     "running": "yellow",
     "done": "green",
     "failed": "red",
+    "blocked": "magenta",
     "idle": "dim",
 }
 
@@ -3001,7 +3507,7 @@ def task_status(
     running, which finished, which crashed, and what each one last said.
     """
     require("git")
-    require("tmux")
+    require_host()
     workspaces = all_workspaces()
     if branch:
         targets = [require_workspace(branch, workspaces)]
@@ -3021,6 +3527,8 @@ def task_status(
         style = _STATE_STYLE.get(s.state, "white")
         console.print(f"[bold]{s.branch}[/bold]  [{style}]{s.state}[/{style}]")
         console.print(f"  session:  {s.session}  [{'alive' if s.has_session else 'gone'}]")
+        if s.agent_status:
+            console.print(f"  agent:    {s.agent_status} [dim](herdr)[/dim]")
         console.print(f"  +{s.ahead}/-{s.behind}   {'dirty' if s.dirty else 'clean'}")
         if s.prompt_excerpt:
             console.print(f"  prompt:   [dim]{s.prompt_excerpt}[/dim]")
@@ -3130,13 +3638,13 @@ def task_merge(
     if into:
         orch = require_workspace(into, workspaces)
     else:
-        if not in_tmux():
+        if not in_host():
             die("run from inside a wk session (the orchestrator workspace)",
                 hint="or pass `--into <orchestrator>` to target one explicitly")
-        orch_session = run(["tmux", "display-message", "-p", "#S"]).stdout.strip()
+        orch_session = host_session()
         orch = next((w for w in workspaces if w.session == orch_session), None)
         if orch is None:
-            die("current tmux session isn't a wk workspace",
+            die("current session isn't a wk workspace",
                 hint="`wk relayout` converts the current session into one, "
                      "or pass `--into <orchestrator>`")
     if rm and (squash or no_commit):
@@ -3221,10 +3729,10 @@ def task_cancel(
     work, and you can inspect the result or re-run it with `wk task-retry`.
     """
     require("git")
-    require("tmux")
+    require_host()
     target = require_workspace(branch)
     if target.has_session:
-        run(["tmux", "kill-session", "-t", target.session], check=False)
+        kill_session(target.session)
         console.print(
             f"[green]✓[/green] cancelled [bold]{target.branch}[/bold] "
             f"[dim](worktree kept; `wk task-retry {target.branch}` to re-run, "
@@ -3252,7 +3760,7 @@ def task_retry(
     agent, it does not reset your code.
     """
     require("git")
-    require("tmux")
+    require_host()
     require("claude")
     target = require_workspace(branch)
     task_file = target.path / WK_MARKER_DIR / "task.md"
@@ -3266,21 +3774,28 @@ def task_retry(
     # Kill any running session and clear the prior run's markers so task-status
     # reflects the fresh run rather than the stale "done"/output.
     if target.has_session:
-        run(["tmux", "kill-session", "-t", target.session], check=False)
+        kill_session(target.session)
     for marker in ("output.md", _TASK_DONE_MARKER):
         p = target.path / WK_MARKER_DIR / marker
         if p.exists():
             p.unlink()
 
     session = session_name(target.branch)
-    build_session(
-        session, target.path, " ".join(_shell_wrap(_AUTO_TASK_CMD)),
-        branch=target.branch,
-    )
-    run(["tmux", "set-option", "-t", session, "@wk-task", "1"])
-    run(["tmux", "set-option", "-t", session, "@wk-task-prompt", prompt[:200]])
-    console.print(f"[green]✓[/green] re-running [bold]{target.branch}[/bold]")
-    console.print(f"  [dim]output: {target.path}/.wk/output.md[/dim]")
+    if backend() == "herdr":
+        # A fresh conversation, primed with the brief: retrying inside the old
+        # one would carry its wrong turns forward.
+        build_session(session, target.path, agent_cmd(), branch=target.branch,
+                      prompt=prompt, fresh=True)
+        console.print(f"[green]✓[/green] re-running [bold]{target.branch}[/bold]")
+    else:
+        build_session(
+            session, target.path, " ".join(_shell_wrap(_AUTO_TASK_CMD)),
+            branch=target.branch,
+        )
+        run(["tmux", "set-option", "-t", session, "@wk-task", "1"])
+        run(["tmux", "set-option", "-t", session, "@wk-task-prompt", prompt[:200]])
+        console.print(f"[green]✓[/green] re-running [bold]{target.branch}[/bold]")
+        console.print(f"  [dim]output: {target.path}/.wk/output.md[/dim]")
     if not no_attach:
         attach_or_switch(session)
 
@@ -3360,9 +3875,9 @@ def restore(
     picker, or `--list` to just see what would be restored.
     """
     require("git")
-    require("tmux")
+    require_host()
 
-    sessions = tmux_sessions()
+    sessions = live_sessions()
     worktrees = list_worktrees()
     if not worktrees:
         die("no worktrees to restore")
@@ -3451,6 +3966,9 @@ def relayout(
     for self-removal — because respawning the pane that's running this command
     would otherwise kill it mid-execution.
     """
+    if in_herdr():
+        _relayout_herdr(force, layout)
+        return
     require("tmux")
     require("git")
     if not in_tmux():
@@ -3523,17 +4041,84 @@ def relayout(
     # No success message — this pane is about to be respawned.
 
 
+def _relayout_herdr(force: bool, layout: Optional[str]) -> None:
+    """`wk relayout` inside herdr: rebuild the current tab with the profile's
+    layout and restart Claude on the workspace's recorded conversation."""
+    require("git")
+    ws_id = herdr_current_workspace()
+    tab_id = os.environ.get("HERDR_TAB_ID", "")
+    if not tab_id:
+        tab_id = next((w.get("active_tab_id", "") for w in herdr_snapshot().get("workspaces", [])
+                       if w.get("workspace_id") == ws_id), "")
+    session = host_session()
+    match = next((w for w in all_workspaces() if w.session == session), None)
+    if match is not None:
+        wt, branch = match.path, match.branch
+    else:
+        top = run(["git", "rev-parse", "--show-toplevel"], check=False).stdout.strip()
+        head = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], check=False).stdout.strip()
+        if not top or not head or head == "HEAD":
+            die("could not determine the worktree and branch for this pane")
+        wt, branch = Path(top), head
+        if not force:
+            console.print(f"[yellow]warning:[/yellow] workspace [bold]{session or ws_id}[/bold] "
+                          "is not a wk workspace")
+            console.print(f"  will convert: branch=[bold]{branch}[/bold]  path=[dim]{wt}[/dim]")
+            if not typer.confirm("Proceed?", default=True):
+                raise typer.Exit(0)
+    profile = resolve_profile(layout)
+    subprocess.Popen(
+        [_wk_bin(), "_relayout-detached", "--host", "herdr",
+         "--session", session_name(branch), "--workspace", ws_id, "--tab", tab_id,
+         "--wt", str(wt), "--branch", branch, "--layout", profile.name],
+        start_new_session=True,  # layout.apply replaces this pane's tab
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _relayout_herdr_detached(session: str, ws_id: str, tab_id: str, wt: Path,
+                             branch: str, profile: LayoutProfile) -> None:
+    mark_wk_workspace(wt, branch=branch)
+    # The label is what makes a herdr workspace a wk session; converting a
+    # plain workspace means taking it on.
+    herdr_call("workspace.rename", {"workspace_id": ws_id, "label": session})
+    tree = herdr_layout_tree(profile.name, wt, dict(wk_env_pairs(session, branch, wt)))
+    agent = agent_cmd()
+    custom = agent != DEFAULT_AGENT_CMD
+    if custom:
+        tree["first"]["command"] = _shell_wrap(f'{agent}; exec "${{SHELL:-/bin/sh}}" -l')
+    applied = herdr_call("layout.apply", {
+        "tab_id": tab_id, "tab_label": "wk", "root": tree, "focus": True,
+    })
+    agent_pane = _find_leaf(applied["layout"]["root"], "agent")
+    if agent_pane and not custom:
+        _herdr_start_claude(session, wt, branch, agent_pane, None, fresh=False)
+
+
 @app.command("_relayout-detached", hidden=True)
 def _relayout_detached(
     session: str = typer.Option(...),
-    pane: str = typer.Option(..., help="Pane id (%NN) to keep and respawn as sidebar."),
-    window: str = typer.Option(..., help="Window id (@NN) to relayout."),
+    pane: str = typer.Option("", help="Pane id (%NN) to keep and respawn as sidebar."),
+    window: str = typer.Option("", help="Window id (@NN) to relayout."),
     wt: str = typer.Option(..., help="Worktree path."),
     branch: str = typer.Option(..., help="Branch name."),
     layout: str = typer.Option("wide", help="Resolved layout name ('wide'/'laptop')."),
+    host: str = typer.Option("tmux", help="Session host: 'tmux' or 'herdr'."),
+    workspace: str = typer.Option("", help="herdr workspace id."),
+    tab: str = typer.Option("", help="herdr tab id."),
 ) -> None:
     """Internal: do the destructive layout rebuild for `wk relayout` from a
     process detached from the pane being respawned."""
+    if host == "herdr":
+        try:
+            _relayout_herdr_detached(session, workspace, tab, Path(wt), branch,
+                                     resolve_profile(layout))
+        except Exception:
+            _log_detached_failure(Path(wt) / WK_MARKER_DIR, f"_relayout-detached herdr {session}")
+            raise
+        return
     require("tmux")
     wt_path = Path(wt)
     wk = _wk_bin()
@@ -3600,6 +4185,9 @@ def rebalance() -> None:
     the session's @wk-layout tag to apply the right geometry (the widescreen
     and laptop layouts have different target sizes). Bound to `prefix M-w`.
     """
+    if in_herdr():
+        die("rebalance is tmux-only",
+            hint="on herdr, `wk relayout` rebuilds the layout at its default sizes")
     require("tmux")
     if not in_tmux():
         die("not inside tmux; run `wk rebalance` from within a wk session")
@@ -3637,7 +4225,7 @@ def refresh_agents(
     workspace this repo knows about.
     """
     require("git")
-    require("tmux")
+    require_host()
     workspaces = all_workspaces()
     if all_workspaces_flag:
         targets = workspaces
@@ -3649,10 +4237,9 @@ def refresh_agents(
         if not targets:
             die(f"no workspace matching {branch!r}", hint="`wk list` shows every workspace")
     else:
-        if not in_tmux():
-            die("not inside tmux; pass a branch name or --all")
-        r = run(["tmux", "display-message", "-p", "#S"], check=False)
-        sess = r.stdout.strip()
+        if not in_host():
+            die("not inside a wk session; pass a branch name or --all")
+        sess = host_session()
         targets = [w for w in workspaces if w.session == sess]
         if not targets:
             die(f"current session {sess!r} isn't a wk workspace")
@@ -3688,14 +4275,7 @@ def is_wk_session(
 
     For use in tmux-resurrect post-save hooks and shell scripts.
     """
-    require("tmux")
-    r = run(
-        ["tmux", "show-options", "-v", "-t", session, "@wk"],
-        check=False,
-    )
-    if r.returncode == 0 and r.stdout.strip() == "1":
-        raise typer.Exit(0)
-    raise typer.Exit(1)
+    raise typer.Exit(0 if is_wk_session_name(session) else 1)
 
 
 @app.command("list")
@@ -3750,7 +4330,7 @@ def switch(
     or the `--rm` flag. Auto-refresh is the passive sidebar's job; the hub
     refreshes on demand (ctrl-r) to stay free of a background timer.
     """
-    require("tmux")
+    require_host()
     # The hub is global: this repo's workspaces first, then every running wk
     # session in other repos — so `prefix W` works from anywhere, even outside
     # a repo, and lets you jump to any agent.
@@ -3823,7 +4403,7 @@ def switch(
                 # branch. `wk rm` refuses on a dirty tree, and only force-deletes
                 # the branch ref under --force — so a clean-but-unmerged branch
                 # is preserved here too.
-                f"--bind=ctrl-n:execute(tmux command-prompt -p 'new branch:' 'run-shell \"{wk} new %%\"')+abort",
+                _picker_new_binding(wk),
                 f"--bind=ctrl-d:execute({wk} rm {{1}})+reload({wk} _list-once)",
                 # ctrl-x cancels a task (kills its session, keeps the worktree +
                 # output — non-destructive, recoverable via task-retry). ctrl-r
@@ -3850,11 +4430,30 @@ def switch(
     attach_or_switch(target.session)
 
 
+def _last_session_file() -> Path:
+    base = os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state")
+    return Path(base) / "wk" / "last-session"
+
+
+def _picker_new_binding(wk: str) -> str:
+    """The hub's ctrl-n: prompt for a branch and `wk new` it. tmux has a
+    native prompt; elsewhere the prompt runs inside the picker's terminal."""
+    if in_tmux():
+        return f"--bind=ctrl-n:execute(tmux command-prompt -p 'new branch:' 'run-shell \"{wk} new %%\"')+abort"
+    return ("--bind=ctrl-n:execute(sh -c 'printf \"new branch: \"; read b; "
+            f"[ -n \"$b\" ] && {wk} new \"$b\"')+abort")
+
+
 def _set_last_wk_session(session: str) -> None:
     """Remember SESSION as the most recently visited wk session, so
     `wk cycle last` can toggle back to it. Stored as a server-wide tmux
     user option so it survives detach/re-attach but resets when tmux
-    server exits."""
+    server exits; herdr has no such option, so there it's a state file."""
+    if in_herdr():
+        f = _last_session_file()
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(session + "\n", encoding="utf-8")
+        return
     run(
         ["tmux", "set-option", "-s", "@wk-last-session", session],
         check=False,
@@ -3862,6 +4461,11 @@ def _set_last_wk_session(session: str) -> None:
 
 
 def _get_last_wk_session() -> Optional[str]:
+    if in_herdr():
+        try:
+            return _last_session_file().read_text(encoding="utf-8").strip() or None
+        except OSError:
+            return None
     r = run(
         ["tmux", "show-options", "-s", "-v", "@wk-last-session"],
         check=False,
@@ -3898,7 +4502,7 @@ def cycle(
         bind-key -n M-[  run-shell "wk cycle prev"
         bind-key -n M-m  run-shell "wk cycle last"
     """
-    require("tmux")
+    require_host()
     if direction in ("n", "next"):
         delta: Optional[int] = 1
     elif direction in ("p", "prev"):
@@ -3907,14 +4511,13 @@ def cycle(
         delta = None  # special: toggle to last visited
     else:
         die(f"direction must be next / prev / last; got {direction!r}")
-    if not in_tmux():
-        die("not inside tmux; cycle needs a current session to step from")
+    if not in_host():
+        die("not inside a wk session; cycle needs a current session to step from")
 
-    sessions = sorted(wk_tmux_sessions())
+    sessions = sorted(wk_sessions())
     if not sessions:
         return
-    r = run(["tmux", "display-message", "-p", "#S"], check=False)
-    current = r.stdout.strip()
+    current = host_session()
 
     if delta is None:
         # last: toggle to the previously-recorded wk session.
@@ -3935,7 +4538,7 @@ def cycle(
     # toggles back here. Done for next/prev/last alike, which makes
     # last-toggling between two workspaces feel like alt-tab.
     _set_last_wk_session(current)
-    run(["tmux", "switch-client", "-t", target], check=False)
+    attach_or_switch(target)
 
 
 # --- teardown: close (keep worktree) / rm (destroy) ---
@@ -3954,17 +4557,16 @@ def close(
 
     Refuses to kill non-wk tmux sessions (those without the @wk option).
     """
-    require("tmux")
+    require_host()
 
     if branch:
         target = require_workspace(branch)
         session = target.session
         label = target.branch
     else:
-        if not in_tmux():
-            die("not inside tmux; pass a branch / workspace name")
-        r = run(["tmux", "display-message", "-p", "#S"], check=False)
-        session = r.stdout.strip()
+        if not in_host():
+            die("not inside a wk session; pass a branch / workspace name")
+        session = host_session()
         # Find the branch for nicer output, falling back to the session name.
         match = next(
             (w for w in all_workspaces() if w.session == session),
@@ -3974,14 +4576,10 @@ def close(
 
     # Refuse to kill sessions wk doesn't own — protects plain tmux sessions
     # that happen to share a name with a branch.
-    r = run(
-        ["tmux", "show-options", "-v", "-t", session, "@wk"],
-        check=False,
-    )
-    if r.returncode != 0 or r.stdout.strip() != "1":
+    if not is_wk_session_name(session):
         die(f"session {session!r} isn't a wk session; refusing to kill")
 
-    run(["tmux", "kill-session", "-t", session], check=False)
+    kill_session(session)
     console.print(
         f"[green]✓[/green] closed [bold]{label}[/bold] "
         f"[dim](worktree preserved; `wk open {label}` to resume)[/dim]"
@@ -4017,7 +4615,7 @@ def _do_rm(w: Workspace, main: Path, force: bool, keep_branch: bool) -> None:
     because we've already passed pre-flight checks and partial cleanup is
     better than a half-done abort."""
     if w.has_session:
-        run(["tmux", "kill-session", "-t", w.session], check=False)
+        kill_session(w.session)
     # Capture the root *before* the removal: worktree_root() resolves from the
     # cwd's repo, and in the detached-rm case the cwd is the worktree we're
     # about to delete out from under ourselves.
@@ -4069,15 +4667,14 @@ def rm(
     session (or detaches) when the kill lands.
     """
     require("git")
-    require("tmux")
+    require_host()
     main = repo_root()
     workspaces = {w.branch: w for w in all_workspaces()}
 
     if branch is None:
-        if not in_tmux():
-            die("not inside tmux; pass a branch name")
-        r = run(["tmux", "display-message", "-p", "#S"], check=False)
-        current_session = r.stdout.strip()
+        if not in_host():
+            die("not inside a wk session; pass a branch name")
+        current_session = host_session()
         match = next(
             (w for w in workspaces.values() if w.session == current_session),
             None,
@@ -4096,10 +4693,8 @@ def rm(
     # Python process is doomed too. Re-spawn the rm in a detached child
     # so it survives the session kill.
     self_remove = False
-    if in_tmux() and w.has_session:
-        r = run(["tmux", "display-message", "-p", "#S"], check=False)
-        if r.stdout.strip() == w.session:
-            self_remove = True
+    if in_host() and w.has_session and host_session() == w.session:
+        self_remove = True
 
     if self_remove:
         wk_bin = _wk_bin()
@@ -4132,7 +4727,7 @@ def _rm_detached(
     detached from the doomed tmux session. Spawned by `wk rm` when the
     current session is the one being removed."""
     require("git")
-    require("tmux")
+    require_host()
     main = repo_root()
     try:
         workspaces = {w.branch: w for w in all_workspaces()}
@@ -4160,15 +4755,11 @@ def cd(
     Usage in fish:  cd (wk cd feature-x)
     """
     require("git")
-    require("tmux")
+    require_host()
     if branch is None:
-        # Infer from the current tmux session. Use in_tmux() like every other
-        # command (checks $TMUX) — the old $TMUX_PANE check was an inconsistent
-        # proxy and the value was discarded anyway.
-        if not in_tmux():
-            die("not inside tmux; pass a branch name")
-        r = run(["tmux", "display-message", "-p", "#S"], check=False)
-        session = r.stdout.strip()
+        if not in_host():
+            die("not inside a wk session; pass a branch name")
+        session = host_session()
         if not session:
             die("could not determine current tmux session; pass a branch name")
         for w in all_workspaces():

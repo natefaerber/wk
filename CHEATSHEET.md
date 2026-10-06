@@ -409,10 +409,51 @@ yours to commit if you want the default shared with your team.
 
 | key | values | env override |
 |---|---|---|
+| `backend` | `tmux` \| `herdr` | `WK_BACKEND` |
 | `layout` | `wide` \| `laptop` \| `minimal` | `WK_LAYOUT` |
 | `issue_prefixes` | e.g. `LPE:linear, DEV:jira` | `WK_ISSUE_PREFIXES` |
 | `linear_workspace` | e.g. `acme` | — |
 | `jira_site` | e.g. `acme.atlassian.net` | — |
+
+---
+
+## herdr backend
+
+[herdr](https://herdr.dev) can host wk's terminals instead of tmux. wk still owns
+everything git-shaped (worktrees, branches, PR/issue refs, handoff briefs); a
+workspace becomes a herdr workspace labelled with the wk session name.
+
+| | tmux | herdr |
+|---|---|---|
+| picked when | default | inside a herdr pane, or `backend = herdr` / `WK_BACKEND=herdr` |
+| sidebar | `wk sidebar` pane | herdr's own sidebar (agent states, branches) |
+| agent | `claude -c \|\| claude` | named herdr agent, pinned to `.wk/session-id` (`--resume` on reopen) |
+| `wk task --auto` | headless `claude -p` | not available: tasks stay interactive |
+| task state | `.wk/done`, `.wk/output.md` | `.wk/task.json` + herdr's agent state (`wk task-status` shows `agent:`) |
+| `wk rebalance` | resets sizes | not available; `wk relayout` rebuilds at default sizes |
+
+Layouts on herdr (no sidebar pane): **wide** = agent \| terminal over shell,
+**laptop** = agent over terminal, **minimal** = agent \| terminal.
+
+Existing sessions are always driven on the host that has them, so tmux and
+herdr workspaces can coexist. `wk doctor` reports the backend and whether
+herdr's Claude integration (which feeds agent states) is installed.
+
+herdr has no wk.conf. Bind wk in `~/.config/herdr/config.toml`:
+
+```toml
+[[keys.command]]
+key = "prefix+alt+w"   # prefix+shift+w is herdr's rename_workspace
+type = "popup"
+command = "wk switch"
+width = "80%"
+height = "80%"
+
+[[keys.command]]
+key = "prefix+alt+e"
+type = "pane"
+command = "wk relayout --force"
+```
 
 ---
 
@@ -478,7 +519,7 @@ wk adopt [dir]                   # wrap an existing checkout (default: cwd) in a
 wk close [branch]                # kill session, keep worktree (default: current)
 wk rm [branch]                   # destroy session + worktree + branch (default: current)
 wk task <prompt>                 # Claude names a branch, launches with prompt
-wk task --auto <prompt>          # headless task (claude -p, output to .wk/output.md)
+wk task --auto <prompt>          # headless task (claude -p, output to .wk/output.md; tmux only)
 wk switch [branch]               # switch to existing workspace; fzf if no arg
 wk list                          # show all workspaces with status
 wk rm <branch>                   # destroy session + worktree
@@ -487,7 +528,7 @@ wk restore --list                # show which worktrees would be restored (dry-r
 wk restore                       # on a TTY: fzf multi-select picker (tab to mark)
 wk restore --all                 # rebuild every missing session, skip the picker
 wk relayout [--layout wide|laptop|minimal] # rebuild the layout in the current session (re-detects)
-wk rebalance                     # reset pane sizes to the current layout's defaults (prefix M-w)
+wk rebalance                     # reset pane sizes to the current layout's defaults (prefix M-w; tmux only)
 wk refresh-agents [branch|--all] # regenerate .wk/AGENTS.md and ORCHESTRATOR.md
 wk cd [branch]                   # print worktree path (for shell cd integration)
 wk task-status [branch]          # status table / detail of task workspaces
@@ -505,7 +546,8 @@ wk doctor                        # check deps + whether the tmux bindings are in
 
 | var | default | what |
 |---|---|---|
-| `WK_AGENT_CMD` | `claude -c \|\| claude` | command run in the agent pane |
+| `WK_BACKEND` | _(herdr inside herdr, else tmux)_ | session host for new workspaces: `tmux` or `herdr` ([herdr backend](#herdr-backend)) |
+| `WK_AGENT_CMD` | `claude -c \|\| claude` | command run in the agent pane (herdr: the default runs Claude as a named herdr agent) |
 | `WK_LAYOUT` | _(auto)_ | force a layout profile: `wide`, `laptop`, or `minimal` (overrides auto-detect) |
 | `WK_BRANCH_TYPES` | `feat,fix,chore,docs,refactor,test,perf,spike` | allowed `<type>/` branch prefixes |
 | `WK_ISSUE_PREFIXES` | _(none)_ | project/team keys (`LPE,ENG`) that make issue-ref matching exact; usually set in `~/.config/wk/config` instead |

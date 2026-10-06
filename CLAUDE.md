@@ -197,7 +197,7 @@ see edits):
 
 `config_get(key)` resolves repo → user. Callers check their env var first, so
 the full precedence is env → repo → user → built-in default. Consumed keys:
-`layout`, `issue_prefixes`.
+`backend`, `layout`, `issue_prefixes`.
 
 `repo_config_path()` swallows `SystemExit` as well as `Exception` —
 `repo_root()` exits outside a repo, and that must degrade to "no config"
@@ -240,6 +240,23 @@ Command functions live at module scope, so a helper that takes a `task=` or
 (`open_ref` missing `task`), surfacing as
 `AttributeError: 'function' object has no attribute 'strip'`. When threading a
 new option through a helper chain, add the parameter at every hop.
+
+### Hosts: tmux or herdr
+
+A session's terminals live on tmux or on [herdr](https://herdr.dev). `backend()`
+picks the host for *new* sessions (`WK_BACKEND` > config `backend` > herdr when
+`in_herdr()` > tmux); existing sessions are always driven on whichever host has
+them, so the primitives — `live_sessions()`, `wk_sessions()`, `host_session()`,
+`kill_session()`, `is_wk_session_name()`, `attach_or_switch()` — consult both.
+Route new session-level code through them rather than calling tmux directly.
+Rationale and the feature mapping: `docs/herdr-backend.md`.
+
+herdr has no user options, so a herdr workspace is a wk session iff its label
+is the session name AND one of its panes was started in a worktree carrying
+`.wk/` (`herdr_wk_workspaces()`). wk talks to herdr over its socket API
+(`herdr_call`), one JSON request per connection. On herdr the default agent is
+launched through `agent.start` as a named agent pinned to `.wk/session-id`
+(`claude_session_args`); `wk task --auto` and `wk rebalance` are tmux-only.
 
 ### Orchestrator detection
 Branches in `{main, master, develop, trunk}` (override via
@@ -319,6 +336,9 @@ trigger an immediate redraw.
 | `wk rm` kills its own Python process before finishing | killing the tmux session your process runs in → SIGHUP | `Popen` with `start_new_session=True` to detach |
 | Sidebar/dashboard never refreshes after a state change | the render loop is asleep | SIGUSR1 wakes `time.sleep()` early; bound to `prefix M-r` |
 | `AttributeError: 'function' object has no attribute 'strip'` | a helper took `task=`/`layout=` without declaring the parameter, so the name bound the module-level *command* | add the parameter at every hop of the helper chain |
+| herdr `invalid_target: use either tab_id or workspace_id` | `layout.apply` takes one target | pass only `tab_id` (it replaces that tab) |
+| `WK_*` missing in a herdr pane | herdr gives a workspace's env to its first pane only | put `env` on every `layout.apply` leaf (`herdr_layout_tree`) |
+| A detached `_*-detached` worker runs old code | `_wk_bin()` prefers the `wk` on PATH | test with the branch's `wk` first on PATH |
 | Two branches with similar paths got confused | `.worktrees/feat/admin-phase-1` was on a *different* branch than its path suggested | always trust `git worktree list --porcelain`'s `branch refs/heads/X` line, not the path |
 
 ## Testing approach

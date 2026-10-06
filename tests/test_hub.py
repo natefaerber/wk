@@ -36,9 +36,8 @@ def test_picker_and_listonce_share_one_formatter(wk):
 def test_hub_binds_have_no_blocking_commands(wk):
     # The hub does non-blocking verbs only. tail -f never returns; task-merge is
     # interactive and resolves #S wrong inside a popup — neither may be bound.
-    binds = "\n".join(
-        l for l in inspect.getsource(wk.switch).splitlines() if "--bind=" in l
-    )
+    source = inspect.getsource(wk.switch) + inspect.getsource(wk._picker_new_binding)
+    binds = "\n".join(l for l in source.splitlines() if "--bind=" in l)
     for bad in ("tail", "--follow", "task-output", "task-merge"):
         assert bad not in binds, f"hub bind must not include blocking `{bad}`"
     # the non-blocking verbs we DO expect on the hub
