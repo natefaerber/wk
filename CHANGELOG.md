@@ -7,6 +7,8 @@ from the [GitHub releases](https://github.com/natefaerber/wk/releases).
 
 ## [Unreleased]
 
+## [0.10.2] - 2026-10-06
+
 ### Changed
 - **herdr layouts are the agent plus one `work` shell.** `wide` dropped its
   second, identical shell (herdr's sidebar already fills tmux's left column),
@@ -210,7 +212,8 @@ The "polish round" — easier to use, more agent-drivable.
 ## [0.4.0] - 2026-06-03
 - See the [v0.4.0 release](https://github.com/natefaerber/wk/releases/tag/v0.4.0).
 
-[Unreleased]: https://github.com/natefaerber/wk/compare/v0.10.1...HEAD
+[Unreleased]: https://github.com/natefaerber/wk/compare/v0.10.2...HEAD
+[0.10.2]: https://github.com/natefaerber/wk/compare/v0.10.1...v0.10.2
 [0.10.1]: https://github.com/natefaerber/wk/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/natefaerber/wk/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/natefaerber/wk/compare/v0.8.0...v0.9.0
