@@ -1702,6 +1702,10 @@ def repo_config_path() -> Optional[Path]:
     wk-managed scratch (gitignored by their own `.gitignore`); this one is
     yours to commit if you want the default shared with the team.
     """
+    # repo_root() would die() here, printing an error the caller never sees
+    # coming; backend() reads config on every invocation, even outside a repo.
+    if not in_git_repo():
+        return None
     try:
         return repo_root() / WK_MARKER_DIR / "config"
     except (Exception, SystemExit):

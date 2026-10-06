@@ -163,3 +163,13 @@ def test_list_in_repo_with_no_workspaces_does_not_raise(wk, monkeypatch):
     monkeypatch.setattr(wk, "in_git_repo", lambda: True)
     monkeypatch.setattr(wk, "all_workspaces", lambda: [])
     wk.list_cmd()  # prints "no workspaces", returns cleanly
+
+
+def test_config_outside_repo_is_silent(wk, tmp_path, monkeypatch, capsys):
+    # backend() reads config on every command; outside a repo that must not
+    # print repo_root()'s "not inside a git repository" error.
+    monkeypatch.chdir(tmp_path)
+    assert wk.repo_config_path() is None
+    assert wk.backend() == "tmux"
+    captured = capsys.readouterr()
+    assert "not inside a git repository" not in captured.out + captured.err
