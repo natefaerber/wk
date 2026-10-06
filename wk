@@ -2442,9 +2442,13 @@ def _build_and_attach(state: WorkspaceState, no_attach: bool,
     if state.session in tmux_sessions():
         console.print("[dim]session running; attaching[/dim]")
     else:
+        # The brief must exist before the agent starts: it's what the agent
+        # orients from, and a hook reading it at session start would miss it.
+        if state.created:
+            mark_wk_workspace(state.wt, branch=state.branch)
+            _announce_handoff(state.wt, state.branch, task)
         build_session(state.session, state.wt, agent_cmd(), branch=state.branch, layout=layout)
         if state.created:
-            _announce_handoff(state.wt, state.branch, task)
             console.print(f"[green]✓[/green] workspace [bold]{state.branch}[/bold] ready at {state.wt}")
         else:
             console.print(f"[green]✓[/green] rebuilt session for [bold]{state.branch}[/bold]")
@@ -2545,8 +2549,9 @@ def new(
 
     state = resolve_workspace(branch, base, fetch=not no_fetch, strict_new=True)
 
-    build_session(state.session, state.wt, agent_cmd(), branch=state.branch, layout=layout)
+    mark_wk_workspace(state.wt, branch=state.branch)
     _announce_handoff(state.wt, state.branch, task)
+    build_session(state.session, state.wt, agent_cmd(), branch=state.branch, layout=layout)
     console.print(f"[green]✓[/green] workspace [bold]{state.branch}[/bold] ready at {state.wt}")
 
     if not no_attach:

@@ -482,3 +482,22 @@ def test_handoff_unchanged_without_ticket(wk, trackers, tmp_path, monkeypatch):
     monkeypatch.setattr(wk.shutil, "which", lambda _: None)
     body = wk.write_handoff(tmp_path, "feat/x", "do the thing").read_text()
     assert "Ticket:" not in body
+
+
+# --------------------------------------------------------------------------- #
+# The brief has to exist before the agent does: the agent orients from it.
+# --------------------------------------------------------------------------- #
+
+def test_handoff_written_before_agent_starts(wk, tmp_path, monkeypatch):
+    monkeypatch.setattr(wk, "render_handoff", lambda b, t: ("## Goal\nx\n## Acceptance\ny\n", "template"))
+    monkeypatch.setattr(wk, "tmux_sessions", lambda: set())
+    seen = {}
+
+    def fake_build(session, wt, agent, branch=None, layout=None):
+        seen["brief"] = (wt / ".wk" / "task.md").exists()
+
+    monkeypatch.setattr(wk, "build_session", fake_build)
+    state = wk.WorkspaceState(branch="fix/x", wt=tmp_path, session="r-fix-x",
+                              created=True, branch_created=True)
+    wk._build_and_attach(state, no_attach=True, task="do it")
+    assert seen["brief"] is True
