@@ -432,8 +432,10 @@ workspace becomes a herdr workspace labelled with the wk session name.
 | task state | `.wk/done`, `.wk/output.md` | `.wk/task.json` + herdr's agent state (`wk task-status` shows `agent:`) |
 | `wk rebalance` | resets sizes | not available; `wk relayout` rebuilds at default sizes |
 
-Layouts on herdr (no sidebar pane): **wide** = agent \| terminal over shell,
-**laptop** = agent over terminal, **minimal** = agent \| terminal.
+Layouts on herdr are the agent plus one `work` shell (herdr's sidebar
+replaces wk's): **wide** = agent \| work, **laptop** = agent over work,
+**minimal** = agent \| work with a narrower shell. The agent pane is labelled
+with its program (`claude`, or your `WK_AGENT_CMD`'s).
 
 Existing sessions are always driven on the host that has them, so tmux and
 herdr workspaces can coexist. `wk doctor` reports the backend and whether

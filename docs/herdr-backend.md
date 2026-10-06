@@ -82,8 +82,9 @@ Where the shipped code differs from the plan above, and what the spikes found.
   `.wk/` marker. herdr has no user options and its display metadata expires
   (24h TTL), so the marker is the durable half. Existing sessions are driven on
   whichever host has them; `backend()` only picks the host for new ones.
-- **Layouts.** No sidebar pane on herdr. wide = agent | (terminal over shell);
-  laptop = agent over terminal; minimal = agent | terminal. `relayout` works
+- **Layouts.** No sidebar pane on herdr, and no spare shell either: every
+  profile is the agent (labelled `claude`, or the custom agent's program) plus
+  one `work` shell — wide and minimal side by side, laptop stacked. `relayout` works
   on herdr (detached `layout.apply` on the current tab); `rebalance` is tmux-only.
 - **Task records.** `.wk/task.json` (prompt excerpt, orchestrator) replaces the
   `@wk-task*` tmux options on herdr and is written on both hosts.
