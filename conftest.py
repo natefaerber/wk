@@ -42,3 +42,13 @@ def _load_wk():
 def wk():
     """The imported `wk` module."""
     return _load_wk()
+
+
+@pytest.fixture(autouse=True)
+def _no_live_host(monkeypatch, wk):
+    """Keep the developer's own terminal host out of the tests: run inside
+    herdr, HERDR_* would flip wk onto the herdr backend and its live socket."""
+    for var in ("HERDR_ENV", "HERDR_WORKSPACE_ID", "HERDR_TAB_ID", "HERDR_PANE_ID",
+                "HERDR_SOCKET_PATH", "HERDR_ACTIVE_WORKSPACE_ID", "WK_BACKEND"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(wk, "_herdr_socket", lambda: None)
