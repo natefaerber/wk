@@ -7,7 +7,24 @@ from the [GitHub releases](https://github.com/natefaerber/wk/releases).
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-10-06
+
 ### Added
+- **herdr backend.** Inside [herdr](https://herdr.dev) (or with
+  `WK_BACKEND=herdr` / `backend = herdr`), wk builds each workspace as a herdr
+  workspace instead of a tmux session: herdr's own sidebar shows agent states,
+  and sessions survive restarts. wk still owns git (worktrees, branches,
+  PR/issue refs, briefs). Claude starts as a named herdr agent pinned to
+  `.wk/session-id`, so reopening resumes *that* conversation. `wk task` stays
+  interactive there (`--auto` and `wk rebalance` are tmux-only); `relayout`,
+  `cycle`, `close`, `rm`, `cd` and the hub work on both hosts, which can
+  coexist. `wk doctor` reports the backend and herdr's Claude integration.
+  Design and feature mapping: `docs/herdr-backend.md`.
+- **Claude Code hooks in the plugin.** Inside a wk worktree only, the plugin
+  now hands the agent its `.wk/task.md` brief at session start and records the
+  agent's lifecycle in `.wk/status`. `wk task-status` reads it, so an
+  interactive task shows `running`, `waiting` (finished its turn), `blocked`
+  (needs an answer) or `ended`. Outside wk the hook does nothing.
 - **Handoff briefs.** `wk open` / `wk new` take `--task "<what and why>"`, and
   `wk task` always writes one: wk one-shots `claude -p` to turn it into a
   `.wk/task.md` with **Goal**, **Context**, and **Acceptance** sections, and
@@ -78,6 +95,10 @@ from the [GitHub releases](https://github.com/natefaerber/wk/releases).
   it again.
 
 ### Fixed
+- `wk new` / `wk open` write the handoff brief *before* starting the agent;
+  previously the agent could start before `.wk/task.md` existed.
+- Session probes (`tmux ls` and friends) no longer crash on a machine without
+  tmux.
 - `wk rm` prunes the empty prefix dirs a nested worktree leaves behind, so
   `.worktrees/` doesn't accumulate hollow `fix/` and `feat/` directories. Stops
   at the first prefix that still holds a sibling worktree.
@@ -176,7 +197,8 @@ The "polish round" — easier to use, more agent-drivable.
 ## [0.4.0] - 2026-06-03
 - See the [v0.4.0 release](https://github.com/natefaerber/wk/releases/tag/v0.4.0).
 
-[Unreleased]: https://github.com/natefaerber/wk/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/natefaerber/wk/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/natefaerber/wk/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/natefaerber/wk/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/natefaerber/wk/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/natefaerber/wk/compare/v0.6.0...v0.7.0
