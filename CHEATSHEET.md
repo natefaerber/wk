@@ -498,6 +498,21 @@ wk task-merge fix-tenant-500s --into main  # target an orchestrator explicitly
 Claude inside an orchestrator workspace can drive all of the above via
 its Bash tool: `wk task`, `wk task-status`, `wk task-output`, `wk task-merge`.
 
+With the [plugin](README.md) installed, interactive task agents report their
+own state through Claude Code hooks (`.wk/status`), so `wk task-status` can
+tell a task that's working from one that has finished its turn:
+
+| state | meaning |
+|---|---|
+| `running` | the agent is working |
+| `waiting` | finished a turn — review it, or send a follow-up |
+| `blocked` | waiting on a permission prompt or a question |
+| `ended` | the Claude session exited |
+| `done` / `failed` | `--auto` runs only: finished / session died mid-run |
+
+On herdr there's no `--auto`; spawn with `--no-attach` instead and follow up
+with `herdr agent prompt <name> "..."` (see [herdr backend](#herdr-backend)).
+
 Don't run `wk task` from inside a child workspace — that's recursion and
 the orchestrator pattern breaks. Surface sub-task ideas back to the user
 or to the orchestrator instead.

@@ -253,3 +253,41 @@ def test_missing_tmux_degrades(wk, monkeypatch):
     monkeypatch.setenv("PATH", "/nonexistent")
     assert wk.tmux_sessions() == set()
     assert wk.is_wk_session_name("anything") is False
+
+
+# --------------------------------------------------------------------------- #
+# Hook-reported state (`.wk/status`, written by hooks/wk_hook.py)
+# --------------------------------------------------------------------------- #
+
+def _ws(wk, path, alive=True):
+    return wk.Workspace(branch="fix/x", path=path, session="repo-fix-x",
+                        has_session=alive, dirty=False, ahead=0, behind=0)
+
+
+@pytest.mark.parametrize("hook_state,expected", [
+    ("working", "running"),
+    ("waiting", "waiting"),
+    ("needs-input", "blocked"),
+    ("ended", "ended"),
+])
+def test_hook_status_drives_task_state(wk, tmp_path, monkeypatch, hook_state, expected):
+    (tmp_path / ".wk").mkdir()
+    wk._write_task_meta(tmp_path, "p", "")
+    (tmp_path / ".wk" / "status").write_text(json.dumps({"state": hook_state}))
+    monkeypatch.setattr(wk, "_herdr_agent_status", lambda s: "idle")
+    assert wk._task_status(_ws(wk, tmp_path)).state == expected
+
+
+def test_stale_hook_status_ignored_without_session(wk, tmp_path, monkeypatch):
+    (tmp_path / ".wk").mkdir()
+    wk._write_task_meta(tmp_path, "p", "")
+    (tmp_path / ".wk" / "status").write_text(json.dumps({"state": "working"}))
+    assert wk._task_status(_ws(wk, tmp_path, alive=False)).state == "idle"
+
+
+def test_done_sentinel_outranks_hook_status(wk, tmp_path, monkeypatch):
+    (tmp_path / ".wk").mkdir()
+    (tmp_path / ".wk" / "done").touch()
+    (tmp_path / ".wk" / "status").write_text(json.dumps({"state": "working"}))
+    monkeypatch.setattr(wk, "_herdr_agent_status", lambda s: None)
+    assert wk._task_status(_ws(wk, tmp_path)).state == "done"

@@ -805,7 +805,8 @@ directions), you should:
    ```
    Don't poll in a tight loop. Wait for the user to ask for a check,
    or naturally check at decision points.
-4. **Review** — when a task is `done`, read its full output, inspect
+4. **Review** — when a task is `done` (or, for an interactive task,
+   `waiting`: it finished its turn), read its output, inspect
    the diff (`git diff <base>..<task-branch>`), and decide whether
    it's mergeable, needs revision, or should be abandoned.
 5. **Integrate** — for mergeable tasks:
@@ -3382,6 +3383,24 @@ def _read_task_meta(wt: Path) -> Optional[dict]:
         return None
 
 
+# `.wk/status` is written by the wk plugin's Claude Code hooks
+# (hooks/wk_hook.py). Its states, as task-status names them:
+HOOK_STATUS_FILE = "status"
+_HOOK_STATES = {
+    "working": "running",
+    "waiting": "waiting",      # turn finished; the agent is waiting for input
+    "needs-input": "blocked",  # permission prompt / question
+    "ended": "ended",
+}
+
+
+def _read_hook_status(wt: Path) -> Optional[dict]:
+    try:
+        return json.loads((wt / WK_MARKER_DIR / HOOK_STATUS_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
 def _herdr_agent_status(session: str) -> Optional[str]:
     """herdr's lifecycle state for SESSION's agent (idle / working / blocked /
     done / unknown), or None when it isn't a herdr agent. A hint, not a
@@ -3452,8 +3471,15 @@ def _task_status(w: Workspace) -> TaskStatus:
     elif is_task and not w.has_session:
         state = "idle"  # task workspace whose session got killed pre-output
 
+    # The plugin's hooks record the agent's own lifecycle in `.wk/status`. It
+    # outranks the host's view (herdr's states, a live pane) because it knows
+    # a finished turn from a running one; it only counts while the session is
+    # up, since a killed session never got to write "ended".
+    hook = _read_hook_status(w.path)
     agent_status = _herdr_agent_status(w.session) if w.has_session else None
-    if agent_status == "blocked":
+    if not done and hook and w.has_session:
+        state = _HOOK_STATES.get(hook.get("state", ""), state)
+    elif not done and agent_status == "blocked":
         state = "blocked"
 
     prompt_excerpt: Optional[str] = (meta or {}).get("prompt")
@@ -3487,6 +3513,8 @@ _STATE_STYLE = {
     "done": "green",
     "failed": "red",
     "blocked": "magenta",
+    "waiting": "cyan",
+    "ended": "dim",
     "idle": "dim",
 }
 
@@ -3505,6 +3533,9 @@ def task_status(
 
     Designed for orchestrator polling: tells you which tasks are still
     running, which finished, which crashed, and what each one last said.
+    With the wk plugin installed, interactive agents report their own state
+    through Claude Code hooks: `waiting` (finished a turn, ready for review
+    or a follow-up) and `blocked` (needs an answer) come from there.
     """
     require("git")
     require_host()
