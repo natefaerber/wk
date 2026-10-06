@@ -7,6 +7,13 @@ from the [GitHub releases](https://github.com/natefaerber/wk/releases).
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-10-06
+
+### Fixed
+- Commands run outside a git repo (`wk doctor`, the hub) no longer print a
+  spurious `error: not inside a git repository` first. 0.10.0 started reading
+  config on every command to pick the backend.
+
 ## [0.10.0] - 2026-10-06
 
 ### Added
@@ -197,7 +204,8 @@ The "polish round" — easier to use, more agent-drivable.
 ## [0.4.0] - 2026-06-03
 - See the [v0.4.0 release](https://github.com/natefaerber/wk/releases/tag/v0.4.0).
 
-[Unreleased]: https://github.com/natefaerber/wk/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/natefaerber/wk/compare/v0.10.1...HEAD
+[0.10.1]: https://github.com/natefaerber/wk/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/natefaerber/wk/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/natefaerber/wk/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/natefaerber/wk/compare/v0.7.0...v0.8.0
