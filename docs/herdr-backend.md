@@ -1,6 +1,6 @@
 # herdr backend for wk
 
-Status: proposed (2026-10-06). Reviewed by Codex; findings folded in. Targets herdr 0.9.3, Claude Code 2.1.289.
+Status: implemented (2026-10-06) in natefaerber/wk#30, natefaerber/wk#31, natefaerber/wk#32; see "Implementation notes" for where it differs from this plan. Reviewed by Codex; findings folded in. Targets herdr 0.9.3, Claude Code 2.1.289.
 
 ## Decisions
 - Keep tmux, behind a backend seam.
@@ -72,3 +72,34 @@ several with `--no-attach`); completion comes from `.wk/status` (hook-written) i
 `.wk/done`; output comes from the Claude transcript instead of `.wk/output.md`. The orchestrator can
 send follow-ups with `herdr agent prompt`. Cost: an agent that hits a permission prompt waits
 (`blocked`) instead of failing fast, so unattended runs need an explicit permission mode.
+
+## Implementation notes
+
+Where the shipped code differs from the plan above, and what the spikes found.
+
+- **Ownership without `.wk/backend`.** A herdr workspace is a wk session when its
+  label is the session name *and* one of its panes started in a worktree with a
+  `.wk/` marker. herdr has no user options and its display metadata expires
+  (24h TTL), so the marker is the durable half. Existing sessions are driven on
+  whichever host has them; `backend()` only picks the host for new ones.
+- **Layouts.** No sidebar pane on herdr. wide = agent | (terminal over shell);
+  laptop = agent over terminal; minimal = agent | terminal. `relayout` works
+  on herdr (detached `layout.apply` on the current tab); `rebalance` is tmux-only.
+- **Task records.** `.wk/task.json` (prompt excerpt, orchestrator) replaces the
+  `@wk-task*` tmux options on herdr and is written on both hosts.
+- **Hook states.** `.wk/status` uses `working | waiting | needs-input | ended`;
+  `wk task-status` shows them as `running | waiting | blocked | ended`.
+- **Not done:** shipping herdr's own skill (`herdr --skill` already serves it,
+  and the orchestrator doc names the `herdr agent` commands), and the optional
+  `WorktreeCreate` hook.
+
+Spike findings (herdr 0.9.3, isolated server via `herdr --session <name> server`):
+
+- `layout.apply` rejects `tab_id` together with `workspace_id`, and *replaces*
+  the target tab (its panes respawn with new ids).
+- A workspace's `env` reaches its first pane only: not later splits, not new
+  tabs. Every layout leaf carries `WK_*` itself.
+- `agent.start` returns `agent_not_ready` while Claude shows a dialog (folder
+  trust on a new worktree); wk warns and keeps the workspace.
+- `workspace.close` terminates the panes' processes, including the agent.
+
