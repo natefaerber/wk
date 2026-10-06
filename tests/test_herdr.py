@@ -125,9 +125,9 @@ def test_truncated_agent_names_dont_collide(wk):
 # --------------------------------------------------------------------------- #
 
 @pytest.mark.parametrize("profile,labels", [
-    ("wide", ["agent", "terminal", "shell"]),
-    ("laptop", ["agent", "terminal"]),
-    ("minimal", ["agent", "terminal"]),
+    ("wide", ["claude", "work"]),
+    ("laptop", ["claude", "work"]),
+    ("minimal", ["claude", "work"]),
 ])
 def test_every_leaf_gets_env_and_cwd(wk, tmp_path, profile, labels):
     env = {"WK_IN_WORKSPACE": "1"}
@@ -291,3 +291,18 @@ def test_done_sentinel_outranks_hook_status(wk, tmp_path, monkeypatch):
     (tmp_path / ".wk" / "status").write_text(json.dumps({"state": "working"}))
     monkeypatch.setattr(wk, "_herdr_agent_status", lambda s: None)
     assert wk._task_status(_ws(wk, tmp_path)).state == "done"
+
+
+@pytest.mark.parametrize("agent,label", [
+    ("claude -c || claude", "claude"),
+    ("aider --model x", "aider"),
+    ("/opt/bin/codex", "codex"),
+])
+def test_agent_pane_label_names_the_program(wk, agent, label):
+    assert wk.herdr_agent_label(agent) == label
+
+
+def test_custom_agent_pane_is_labelled_by_program(wk, calls, tmp_path):
+    wk.build_herdr_session("repo-feat-x", tmp_path, "aider", "feat/x", wk.LAYOUTS["wide"])
+    apply = next(p for m, p in calls if m == "layout.apply")
+    assert [leaf["label"] for leaf in _leaves(apply["root"])] == ["aider", "work"]

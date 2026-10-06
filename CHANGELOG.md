@@ -7,6 +7,12 @@ from the [GitHub releases](https://github.com/natefaerber/wk/releases).
 
 ## [Unreleased]
 
+### Changed
+- **herdr layouts are the agent plus one `work` shell.** `wide` dropped its
+  second, identical shell (herdr's sidebar already fills tmux's left column),
+  and panes are labelled by what they run (`claude` / `work`) instead of
+  `agent` / `terminal` / `shell`.
+
 ## [0.10.1] - 2026-10-06
 
 ### Fixed

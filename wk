@@ -1290,40 +1290,50 @@ def _herdr_layout_cols() -> Optional[int]:
 
 
 # ── herdr layouts ─────────────────────────────────────────────────
-# herdr draws its own workspace sidebar, so no profile carries a sidebar pane
-# here. Ratios are the first child's share of the split.
-HERDR_WIDE_AGENT_RATIO = 0.62     # agent | (terminal over shell)
-HERDR_LAPTOP_AGENT_RATIO = 0.7    # agent over terminal — narrow screens stack
-HERDR_MINIMAL_AGENT_RATIO = 0.68  # agent | terminal
+# herdr draws its own workspace sidebar, so no profile carries a sidebar
+# pane, and tmux's spare left-column shell has nothing left to sit under:
+# every profile is the agent plus one working shell. Labels say what a pane
+# runs (the agent's name, `work`), matching the user's own herdr layouts.
+# Ratios are the agent's share of the split.
+HERDR_WIDE_AGENT_RATIO = 0.62     # agent | work
+HERDR_LAPTOP_AGENT_RATIO = 0.7    # agent over work — narrow screens stack
+HERDR_MINIMAL_AGENT_RATIO = 0.68  # agent | work
 
 
 def _herdr_leaf(label: str, wt: Path, env: dict[str, str]) -> dict:
     return {"type": "pane", "label": label, "cwd": str(wt), "env": env}
 
 
-def herdr_layout_tree(profile: str, wt: Path, env: dict[str, str]) -> dict:
-    """The `layout.apply` tree for PROFILE. Every leaf carries the WK_* env:
-    herdr gives a workspace's env to its first pane only, not to later
-    splits, so each pane has to be handed it directly."""
-    agent = _herdr_leaf("agent", wt, env)
-    term = _herdr_leaf("terminal", wt, env)
-    if profile == "wide":
-        right = {"type": "split", "direction": "down", "ratio": 0.5,
-                 "first": term, "second": _herdr_leaf("shell", wt, env)}
-        return {"type": "split", "direction": "right", "ratio": HERDR_WIDE_AGENT_RATIO,
-                "first": agent, "second": right}
+def herdr_agent_label(agent: str) -> str:
+    """Pane label for the agent: `claude` for the default, else the custom
+    command's program name."""
+    if agent == DEFAULT_AGENT_CMD:
+        return "claude"
+    try:
+        words = shlex.split(agent)
+    except ValueError:
+        words = agent.split()
+    return Path(words[0]).name if words else "agent"
+
+
+def herdr_layout_tree(profile: str, wt: Path, env: dict[str, str],
+                      agent_label: str = "claude") -> dict:
+    """The `layout.apply` tree for PROFILE; the agent is always `first`.
+    Every leaf carries the WK_* env: herdr gives a workspace's env to its
+    first pane only, not to later splits, so each pane has to be handed it."""
+    agent = _herdr_leaf(agent_label, wt, env)
+    work = _herdr_leaf("work", wt, env)
     if profile == "laptop":
         return {"type": "split", "direction": "down", "ratio": HERDR_LAPTOP_AGENT_RATIO,
-                "first": agent, "second": term}
-    return {"type": "split", "direction": "right", "ratio": HERDR_MINIMAL_AGENT_RATIO,
-            "first": agent, "second": term}
+                "first": agent, "second": work}
+    ratio = HERDR_WIDE_AGENT_RATIO if profile == "wide" else HERDR_MINIMAL_AGENT_RATIO
+    return {"type": "split", "direction": "right", "ratio": ratio,
+            "first": agent, "second": work}
 
 
-def _find_leaf(node: dict, label: str) -> Optional[str]:
-    """Pane id of the leaf labelled LABEL in a `layout.apply` result tree."""
-    if node.get("type") == "pane":
-        return node.get("pane_id") if node.get("label") == label else None
-    return _find_leaf(node.get("first", {}), label) or _find_leaf(node.get("second", {}), label)
+def _agent_pane(applied: dict) -> Optional[str]:
+    """The agent's pane id in a `layout.apply` result (always the root's first child)."""
+    return applied.get("layout", {}).get("root", {}).get("first", {}).get("pane_id")
 
 
 # ── Claude in a herdr pane ────────────────────────────────────────
@@ -1429,7 +1439,7 @@ def build_herdr_session(
     except HerdrError as e:
         die(f"failed to create herdr workspace {session!r}: {e}")
     ws_id = created["workspace"]["workspace_id"]
-    tree = herdr_layout_tree(profile.name, wt, env)
+    tree = herdr_layout_tree(profile.name, wt, env, herdr_agent_label(agent))
     custom = agent != DEFAULT_AGENT_CMD
     if custom:
         tree_agent = tree["first"]
@@ -1443,7 +1453,7 @@ def build_herdr_session(
     except HerdrError as e:
         kill_session(session)
         die(f"failed to lay out herdr workspace {session!r}: {e}; cleaned it up")
-    agent_pane = _find_leaf(applied["layout"]["root"], "agent")
+    agent_pane = _agent_pane(applied)
     if agent_pane:
         if not custom:
             _herdr_start_claude(session, wt, branch, agent_pane, prompt, fresh)
@@ -4119,15 +4129,16 @@ def _relayout_herdr_detached(session: str, ws_id: str, tab_id: str, wt: Path,
     # The label is what makes a herdr workspace a wk session; converting a
     # plain workspace means taking it on.
     herdr_call("workspace.rename", {"workspace_id": ws_id, "label": session})
-    tree = herdr_layout_tree(profile.name, wt, dict(wk_env_pairs(session, branch, wt)))
     agent = agent_cmd()
+    tree = herdr_layout_tree(profile.name, wt, dict(wk_env_pairs(session, branch, wt)),
+                             herdr_agent_label(agent))
     custom = agent != DEFAULT_AGENT_CMD
     if custom:
         tree["first"]["command"] = _shell_wrap(f'{agent}; exec "${{SHELL:-/bin/sh}}" -l')
     applied = herdr_call("layout.apply", {
         "tab_id": tab_id, "tab_label": "wk", "root": tree, "focus": True,
     })
-    agent_pane = _find_leaf(applied["layout"]["root"], "agent")
+    agent_pane = _agent_pane(applied)
     if agent_pane and not custom:
         _herdr_start_claude(session, wt, branch, agent_pane, None, fresh=False)
 
