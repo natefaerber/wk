@@ -36,10 +36,14 @@ tests/              pytest suite for the pure + git-touching helpers.
 .claude-plugin/     Claude Code plugin packaging: plugin.json + marketplace.json
                     (repo is its own `wk-tools` marketplace; ships the /wk skill).
 skills/wk/SKILL.md  The /wk skill the plugin ships (CC-wide "when to drive wk").
+hooks/              Claude Code hooks the plugin ships: wk_hook.py writes .wk/status
+                    and injects .wk/task.md at SessionStart (no-op outside wk).
 ```
 
-The plugin (`.claude-plugin/` + `skills/`) is a thin distribution layer over the
-CLI — it ships the skill, NOT the binary. Users install the CLI separately
+The plugin (`.claude-plugin/` + `skills/` + `hooks/`) is a thin distribution
+layer over the CLI — it ships the skill and hooks, NOT the binary. The hook
+script is stdlib-only Python and must stay silent and exit 0 outside a wk
+worktree: it runs on every Claude session in every repo the plugin is on. Users install the CLI separately
 (mise/install.sh) and the plugin via `/plugin marketplace add natefaerber/wk`.
 The version lives in **three** places that must match the release tag:
 `__version__` in `wk` (surfaced by `wk --version` / `wk version`) and the

@@ -52,8 +52,10 @@ See [CHEATSHEET.md](./CHEATSHEET.md) for every binding and command.
 ### 2. You want Claude Code to drive `wk` for you  → install the plugin
 
 The plugin ships the `/wk` skill so a Claude Code agent knows when and how to
-open worktrees, spawn parallel tasks, and clean up — driving real tmux sessions
-in your terminal.
+open worktrees, spawn parallel tasks, and clean up — driving real tmux (or
+herdr) sessions in your terminal. It also ships hooks that, inside a wk
+workspace only, hand the agent its `.wk/task.md` brief at session start and
+record the agent's state in `.wk/status` for `wk task-status`.
 
 ```
 /plugin marketplace add natefaerber/wk
