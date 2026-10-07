@@ -378,3 +378,40 @@ def test_prune_empty_parents_ignores_paths_outside_root(wk, tmp_path):
     elsewhere.rmdir()
     wk._prune_empty_parents(elsewhere, root)
     assert (tmp_path / "adopted").exists()
+
+
+# --------------------------------------------------------------------------- #
+# session_strip — a configured branch prefix stays out of session names.
+# --------------------------------------------------------------------------- #
+
+def test_session_name_strips_configured_prefix(wk, monkeypatch):
+    monkeypatch.setattr(wk, "_project_prefix", lambda cwd: "myrepo")
+    monkeypatch.setattr(wk, "_session_strip_prefixes", lambda cwd: ("nate/",))
+    assert wk.session_name("nate/lpe-1516-x") == "myrepo-lpe-1516-x"
+    # other branches are untouched, and a bare prefix is never stripped to nothing
+    assert wk.session_name("feat/x") == "myrepo-feat-x"
+    assert wk.session_name("nate/") == "myrepo-nate-"
+
+
+def test_session_strip_from_env(wk, monkeypatch):
+    wk._session_strip_prefixes.cache_clear()
+    monkeypatch.setenv("WK_SESSION_STRIP", "nate/, bob/")
+    assert wk._session_strip_prefixes("/somewhere") == ("nate/", "bob/")
+    wk._session_strip_prefixes.cache_clear()
+
+
+def test_session_strip_from_user_config(wk, monkeypatch, tmp_path):
+    wk._session_strip_prefixes.cache_clear()
+    monkeypatch.delenv("WK_SESSION_STRIP", raising=False)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    (tmp_path / "wk").mkdir()
+    (tmp_path / "wk" / "config").write_text("session_strip = nate/\n")
+    monkeypatch.chdir(tmp_path)  # outside any repo: only the user config applies
+    assert wk._session_strip_prefixes(str(tmp_path)) == ("nate/",)
+    wk._session_strip_prefixes.cache_clear()
+
+
+def test_query_matches_slug_without_strip_prefix(wk, monkeypatch):
+    monkeypatch.setattr(wk, "_session_strip_prefixes", lambda cwd: ("nate/",))
+    assert wk._query_matches("lpe-1-x", "nate/lpe-1-x", session="r-lpe-1-x")
+    assert wk._query_matches("nate-lpe-1-x", "nate/lpe-1-x", session="r-lpe-1-x")

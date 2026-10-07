@@ -7,6 +7,14 @@ from the [GitHub releases](https://github.com/natefaerber/wk/releases).
 
 ## [Unreleased]
 
+### Added
+- **`session_strip`: keep a branch prefix out of session names.** Set
+  `session_strip = nate/` (or `WK_SESSION_STRIP`) and `nate/lpe-1516-fix` runs as
+  `<repo>-lpe-1516-fix` instead of `<repo>-nate-lpe-1516-fix`; the branch and
+  worktree path keep the prefix. The prefix-less slug also resolves as an alias.
+  Turning it on renames sessions for prefixed branches, so a workspace already
+  running under the old name isn't found: `wk close` it first, then reopen.
+
 ## [0.10.3] - 2026-10-06
 
 ### Added

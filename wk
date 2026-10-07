@@ -383,6 +383,30 @@ def _project_prefix(cwd: str) -> str:
     return _normalize_session(Path(r.stdout.strip()).parent.name)
 
 
+@functools.lru_cache(maxsize=None)
+def _session_strip_prefixes(cwd: str) -> tuple[str, ...]:
+    """Branch prefixes left out of session names (`session_strip`, e.g. `nate/`).
+
+    Keyed on CWD and cached like `_project_prefix`: session_name runs in tight
+    loops, and a repo's config can differ from the next repo's.
+    """
+    raw = os.environ.get("WK_SESSION_STRIP") or config_get("session_strip")
+    return tuple(p for p in re.split(r"[,\s]+", raw) if p)
+
+
+def _session_branch(branch: str) -> str:
+    """BRANCH without the first configured `session_strip` prefix it starts with.
+
+    Only the session name changes: the branch and its worktree path keep the
+    prefix, so `nate/lpe-1516-x` gets the session `<repo>-lpe-1516-x`. A branch
+    that is nothing but the prefix keeps it, so a name is never empty.
+    """
+    for prefix in _session_strip_prefixes(os.getcwd()):
+        if branch.startswith(prefix) and len(branch) > len(prefix):
+            return branch[len(prefix):]
+    return branch
+
+
 def session_name(branch: str) -> str:
     """tmux session name for BRANCH, scoped to the current project.
 
@@ -391,8 +415,9 @@ def session_name(branch: str) -> str:
     e.g. via `wk adopt` — don't resolve to one shared tmux session. Within
     a single repo the prefix is constant, so every lookup stays consistent;
     across repos the prefix differs, which is what breaks the collision.
+    A configured `session_strip` prefix comes off the branch first.
     """
-    base = _normalize_session(branch)
+    base = _normalize_session(_session_branch(branch))
     prefix = _project_prefix(os.getcwd())
     return f"{prefix}-{base}" if prefix else base
 
@@ -530,11 +555,13 @@ def _query_matches(query: str, branch_ref: str, session: Optional[str] = None) -
     branch (`feat/login`), the session-form slug (`feat-login`), or the
     full project-scoped session name (`wk-feat-login`). The slug form is
     what kept working before session names were project-prefixed, so we
-    preserve it here.
+    preserve it here; with a `session_strip` prefix configured, the slug
+    without it (`login` for `nate/login`) matches too.
     """
     if session is None:
         session = session_name(branch_ref)
-    return query in (branch_ref, _normalize_session(branch_ref), session)
+    slugs = {_normalize_session(branch_ref), _normalize_session(_session_branch(branch_ref))}
+    return query in (branch_ref, session, *slugs)
 
 
 def _matches_query(query: str, w: "Workspace") -> bool:
