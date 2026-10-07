@@ -416,10 +416,96 @@ def session_name(branch: str) -> str:
     a single repo the prefix is constant, so every lookup stays consistent;
     across repos the prefix differs, which is what breaks the collision.
     A configured `session_strip` prefix comes off the branch first.
+
+    With `session_names = ticket`, a branch carrying an issue key is named
+    after the key instead (see `_ticket_session_name`).
     """
+    cwd = os.getcwd()
     base = _normalize_session(_session_branch(branch))
-    prefix = _project_prefix(os.getcwd())
-    return f"{prefix}-{base}" if prefix else base
+    prefix = _project_prefix(cwd)
+    name = f"{prefix}-{base}" if prefix else base
+    if _session_names_mode(cwd) == "ticket":
+        key = issue_key_in_branch(branch)
+        if key:
+            return _ticket_session_name(branch, key, prefix, name, cwd)
+    return name
+
+
+@functools.lru_cache(maxsize=None)
+def _session_names_mode(cwd: str) -> str:
+    """`session_names` (`WK_SESSION_NAMES`): `branch` (default) or `ticket`."""
+    return (os.environ.get("WK_SESSION_NAMES") or config_get("session_names") or "branch").strip().lower()
+
+
+# session_name runs in tight loops (every worktree, every render tick), and the
+# ticket form needs the open sessions and the repo's worktrees to stay stable:
+# both are read at most every couple of seconds.
+_SESSION_LOOKUP_TTL = 2.0
+_session_lookup_cache: dict[tuple, tuple[float, object]] = {}
+
+
+def _session_lookup(key: tuple, fetch):
+    now = _time.monotonic()
+    hit = _session_lookup_cache.get(key)
+    if hit and now - hit[0] < _SESSION_LOOKUP_TTL:
+        return hit[1]
+    value = fetch()
+    _session_lookup_cache[key] = (now, value)
+    return value
+
+
+def _open_session_paths() -> dict[str, list[Path]]:
+    """Every open wk session / herdr workspace name → the paths it runs in
+    (tmux: its @wk-path; herdr: its panes' spawn cwds)."""
+    out: dict[str, list[Path]] = {}
+    r = run(["tmux", "ls", "-F", "#{session_name}\t#{@wk}\t#{@wk-path}"], check=False)
+    if r.returncode == 0:
+        for line in r.stdout.splitlines():
+            parts = [p.strip() for p in line.split("\t")]
+            if len(parts) >= 3 and parts[1] == "1":
+                out.setdefault(parts[0], []).extend([Path(parts[2])] if parts[2] else [])
+    for label, w in herdr_wk_workspaces().items():
+        out.setdefault(label, []).extend(w.paths)
+    return out
+
+
+def _branch_worktrees() -> dict[str, Path]:
+    """Branch → worktree path for the repo at the cwd, main checkout included.
+    Parsed here rather than via find_existing_worktree, which calls back into
+    session_name through _query_matches."""
+    r = run(["git", "worktree", "list", "--porcelain"], check=False)
+    out: dict[str, Path] = {}
+    if r.returncode != 0:
+        return out
+    path: Optional[Path] = None
+    for line in r.stdout.splitlines():
+        if line.startswith("worktree "):
+            path = Path(line[len("worktree "):])
+        elif line.startswith("branch ") and path is not None:
+            out[line[len("branch "):].removeprefix("refs/heads/")] = path
+    return out
+
+
+def _ticket_session_name(branch: str, key: str, prefix: str, fallback: str, cwd: str) -> str:
+    """The issue KEY as BRANCH's session name, unless something else holds it.
+
+    Candidates in order: `KEY`, `KEY-<repo>`, then the usual branch name. A
+    candidate already open *for this worktree* wins, so lookups keep finding a
+    session whatever it was named when built; otherwise the first free one is
+    taken. So the first workspace for LPE-1516 is `LPE-1516`, and the same
+    ticket opened in another repo while that runs becomes `LPE-1516-<repo>`.
+    """
+    candidates = [key] + ([f"{key}-{prefix}"] if prefix else []) + [fallback]
+    owners = _session_lookup(("open",), _open_session_paths)
+    wt = _session_lookup(("worktrees", cwd), _branch_worktrees).get(branch)
+    if wt is not None:
+        for c in candidates:
+            if any(p == wt or wt in p.parents for p in owners.get(c, ())):
+                return c
+    for c in candidates:
+        if c not in owners:
+            return c
+    return fallback
 
 
 def agent_cmd() -> str:
