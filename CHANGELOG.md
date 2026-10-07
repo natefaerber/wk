@@ -7,6 +7,8 @@ from the [GitHub releases](https://github.com/natefaerber/wk/releases).
 
 ## [Unreleased]
 
+## [0.10.4] - 2026-10-07
+
 ### Added
 - **`session_strip`: keep a branch prefix out of session names.** Set
   `session_strip = nate/` (or `WK_SESSION_STRIP`) and `nate/lpe-1516-fix` runs as
@@ -229,7 +231,8 @@ The "polish round" — easier to use, more agent-drivable.
 ## [0.4.0] - 2026-06-03
 - See the [v0.4.0 release](https://github.com/natefaerber/wk/releases/tag/v0.4.0).
 
-[Unreleased]: https://github.com/natefaerber/wk/compare/v0.10.3...HEAD
+[Unreleased]: https://github.com/natefaerber/wk/compare/v0.10.4...HEAD
+[0.10.4]: https://github.com/natefaerber/wk/compare/v0.10.3...v0.10.4
 [0.10.3]: https://github.com/natefaerber/wk/compare/v0.10.2...v0.10.3
 [0.10.2]: https://github.com/natefaerber/wk/compare/v0.10.1...v0.10.2
 [0.10.1]: https://github.com/natefaerber/wk/compare/v0.10.0...v0.10.1
