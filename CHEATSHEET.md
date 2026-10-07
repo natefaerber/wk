@@ -414,6 +414,11 @@ yours to commit if you want the default shared with your team.
 | `issue_prefixes` | e.g. `LPE:linear, DEV:jira` | `WK_ISSUE_PREFIXES` |
 | `linear_workspace` | e.g. `acme` | — |
 | `jira_site` | e.g. `acme.atlassian.net` | — |
+| `session_strip` | branch prefixes kept out of session names, e.g. `nate/` | `WK_SESSION_STRIP` |
+
+`session_strip` only renames the session (and herdr workspace): `nate/lpe-1516-fix` in
+`credo-backend` runs as `credo-backend-lpe-1516-fix`, while the branch and its worktree
+path keep `nate/`. Separate several prefixes with commas or spaces; the first match wins.
 
 ---
 
