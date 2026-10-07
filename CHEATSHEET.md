@@ -415,10 +415,18 @@ yours to commit if you want the default shared with your team.
 | `linear_workspace` | e.g. `acme` | — |
 | `jira_site` | e.g. `acme.atlassian.net` | — |
 | `session_strip` | branch prefixes kept out of session names, e.g. `nate/` | `WK_SESSION_STRIP` |
+| `session_names` | `branch` (default) \| `ticket` | `WK_SESSION_NAMES` |
 
 `session_strip` only renames the session (and herdr workspace): `nate/lpe-1516-fix` in
 `credo-backend` runs as `credo-backend-lpe-1516-fix`, while the branch and its worktree
 path keep `nate/`. Separate several prefixes with commas or spaces; the first match wins.
+
+`session_names = ticket` names a workspace after the issue key in its branch (needs
+`issue_prefixes`): `nate/lpe-1516-fix` runs as `LPE-1516`. When that name is already open for
+another worktree, the next one becomes `LPE-1516-<repo>`, and if that's taken too, the usual
+`<repo>-<branch>`. A workspace keeps resolving to the name it was built with, so `wk switch`,
+`wk rm` and friends still find it after the clash is gone. Branches without a key are named as
+usual.
 
 ---
 

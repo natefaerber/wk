@@ -7,6 +7,15 @@ from the [GitHub releases](https://github.com/natefaerber/wk/releases).
 
 ## [Unreleased]
 
+### Added
+- **`session_names = ticket`: name workspaces after their ticket.** With
+  `issue_prefixes` configured, a branch carrying an issue key runs as that key
+  (`LPE-1516`) instead of `<repo>-<branch>`. If the key is already open for
+  another worktree, the new one is `LPE-1516-<repo>` (then the usual name); a
+  workspace keeps resolving to the name it was built with. Same caveat as
+  `session_strip`: close running workspaces for ticket branches before turning
+  it on, since their names change.
+
 ## [0.10.4] - 2026-10-07
 
 ### Added

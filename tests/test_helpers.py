@@ -12,6 +12,7 @@ from __future__ import annotations
 import subprocess
 
 import pytest
+from pathlib import Path
 import typer
 
 
@@ -415,3 +416,62 @@ def test_query_matches_slug_without_strip_prefix(wk, monkeypatch):
     monkeypatch.setattr(wk, "_session_strip_prefixes", lambda cwd: ("nate/",))
     assert wk._query_matches("lpe-1-x", "nate/lpe-1-x", session="r-lpe-1-x")
     assert wk._query_matches("nate-lpe-1-x", "nate/lpe-1-x", session="r-lpe-1-x")
+
+
+# --------------------------------------------------------------------------- #
+# session_names = ticket — the issue key names the session, `KEY-<repo>` on a
+# clash, and a session keeps resolving to the name it was built with.
+# --------------------------------------------------------------------------- #
+
+@pytest.fixture
+def ticket_names(wk, monkeypatch):
+    wk._session_lookup_cache.clear()
+    monkeypatch.setattr(wk, "_project_prefix", lambda cwd: "myrepo")
+    monkeypatch.setattr(wk, "_session_strip_prefixes", lambda cwd: ())
+    monkeypatch.setattr(wk, "_session_names_mode", lambda cwd: "ticket")
+    monkeypatch.setattr(wk, "issue_key_in_branch",
+                        lambda b: "LPE-1" if "lpe-1" in b.lower() else None)
+    wt = Path("/repos/myrepo/.worktrees/nate/lpe-1-x")
+    monkeypatch.setattr(wk, "_branch_worktrees", lambda: {"nate/lpe-1-x": wt})
+
+    def with_open(sessions):
+        wk._session_lookup_cache.clear()
+        monkeypatch.setattr(wk, "_open_session_paths", lambda: sessions)
+        return wk.session_name("nate/lpe-1-x")
+    with_open.wt = wt
+    yield with_open
+    wk._session_lookup_cache.clear()
+
+
+def test_ticket_name_when_free(ticket_names):
+    assert ticket_names({}) == "LPE-1"
+
+
+def test_ticket_name_found_again_for_its_worktree(ticket_names):
+    # herdr records pane cwds, which may sit below the worktree root
+    assert ticket_names({"LPE-1": [ticket_names.wt / "apps"]}) == "LPE-1"
+
+
+def test_ticket_name_taken_elsewhere_gets_repo(ticket_names):
+    assert ticket_names({"LPE-1": [Path("/repos/other/.worktrees/lpe-1")]}) == "LPE-1-myrepo"
+
+
+def test_ticket_name_both_taken_falls_back_to_branch_name(ticket_names):
+    elsewhere = [Path("/repos/other")]
+    assert ticket_names({"LPE-1": elsewhere, "LPE-1-myrepo": elsewhere}) == "myrepo-nate-lpe-1-x"
+
+
+def test_ticket_name_keeps_its_suffixed_name_after_the_clash_ends(ticket_names):
+    assert ticket_names({"LPE-1-myrepo": [ticket_names.wt]}) == "LPE-1-myrepo"
+
+
+def test_ticket_mode_leaves_keyless_branches_alone(wk, ticket_names):
+    assert wk.session_name("feat/x") == "myrepo-feat-x"
+
+
+def test_branch_mode_is_the_default(wk, monkeypatch):
+    wk._session_names_mode.cache_clear()
+    monkeypatch.delenv("WK_SESSION_NAMES", raising=False)
+    monkeypatch.setattr(wk, "config_get", lambda key, default="": default)
+    assert wk._session_names_mode("/x") == "branch"
+    wk._session_names_mode.cache_clear()
