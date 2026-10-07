@@ -68,6 +68,26 @@ def write_status(root: Path, event: str, payload: dict) -> None:
     os.replace(tmp, target)  # readers never see a half-written file
 
 
+# The sidebar uses `wk task-status`'s names for these, so the two never disagree.
+SIDEBAR_NAMES = {"working": "running", "needs-input": "blocked"}
+
+
+def report_to_herdr(state: str) -> None:
+    """Inside herdr, also show the state in its sidebar as `$wk_task`. A separate metadata source
+    from wk's own (which posts `$wk_issue`), so neither overwrites the other."""
+    state = SIDEBAR_NAMES.get(state, state)
+    workspace = os.environ.get("HERDR_WORKSPACE_ID")
+    if os.environ.get("HERDR_ENV") != "1" or not workspace:
+        return
+    herdr = os.environ.get("HERDR_BIN_PATH") or "herdr"
+    try:
+        subprocess.run([herdr, "workspace", "report-metadata", workspace,
+                        "--source", "wk-hook", "--token", f"wk_task={state}"],
+                       capture_output=True, timeout=3)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 def brief_context(root: Path) -> str:
     branch = subprocess.run(
         ["git", "-C", str(root), "rev-parse", "--abbrev-ref", "HEAD"],
@@ -99,6 +119,7 @@ def main() -> int:
     if root is None:
         return 0
     write_status(root, event, payload)
+    report_to_herdr(STATES[event])
     if event == "SessionStart" and payload.get("source", "startup") in BRIEF_SOURCES:
         sys.stdout.write(brief_context(root) + "\n")
     return 0

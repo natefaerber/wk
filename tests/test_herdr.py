@@ -306,3 +306,36 @@ def test_custom_agent_pane_is_labelled_by_program(wk, calls, tmp_path):
     wk.build_herdr_session("repo-feat-x", tmp_path, "aider", "feat/x", wk.LAYOUTS["wide"])
     apply = next(p for m, p in calls if m == "layout.apply")
     assert [leaf["label"] for leaf in _leaves(apply["root"])] == ["aider", "work"]
+
+
+# --------------------------------------------------------------------------- #
+# Sidebar metadata
+# --------------------------------------------------------------------------- #
+
+def test_build_posts_issue_key_to_sidebar(wk, calls, tmp_path, claude_home, monkeypatch):
+    monkeypatch.setattr(wk, "issue_key_in_branch", lambda b: "LPE-1544")
+    wk.build_herdr_session("repo-lpe-1544", tmp_path, "aider", "lpe-1544", wk.LAYOUTS["minimal"])
+    meta = [p for m, p in calls if m == "workspace.report_metadata"]
+    assert meta == [{"workspace_id": "w9", "source": "wk", "tokens": {"wk_issue": "LPE-1544"}}]
+
+
+def test_no_issue_key_posts_nothing(wk, calls, tmp_path, monkeypatch):
+    monkeypatch.setattr(wk, "issue_key_in_branch", lambda b: None)
+    wk.build_herdr_session("repo-feat-x", tmp_path, "aider", "feat/x", wk.LAYOUTS["minimal"])
+    assert not any(m == "workspace.report_metadata" for m, _ in calls)
+
+
+def test_sidebar_failure_never_fails_the_build(wk, tmp_path, monkeypatch):
+    monkeypatch.setattr(wk, "issue_key_in_branch", lambda b: "LPE-1")
+
+    def fake(method, params=None, timeout=60.0):
+        if method == "workspace.report_metadata":
+            raise wk.HerdrError("bad", "nope")
+        if method == "workspace.create":
+            return {"workspace": {"workspace_id": "w9"}, "tab": {"tab_id": "w9:t1"}}
+        if method == "layout.apply":
+            return {"layout": {"root": {"first": {"pane_id": "w9:p2"}}}}
+        return {}
+
+    monkeypatch.setattr(wk, "herdr_call", fake)
+    wk.build_herdr_session("repo-lpe-1", tmp_path, "aider", "lpe-1", wk.LAYOUTS["minimal"])
