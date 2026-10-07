@@ -437,6 +437,20 @@ replaces wk's): **wide** = agent \| work, **laptop** = agent over work,
 **minimal** = agent \| work with a narrower shell. The agent pane is labelled
 with its program (`claude`, or your `WK_AGENT_CMD`'s).
 
+**Sidebar values.** wk posts each workspace's ticket key as `$wk_issue`, and the
+plugin's hook posts the agent's state as `$wk_task` (`running` / `waiting` /
+`blocked` / `ended`, the same names as `wk task-status`). Show them by adding a
+row to `[ui.sidebar.spaces]` in your herdr config:
+
+```toml
+[ui.sidebar.spaces]
+rows = [
+  ["state_icon", "workspace"],
+  ["branch", "git_status"],
+  ["$wk_task", "$wk_issue"],
+]
+```
+
 Existing sessions are always driven on the host that has them, so tmux and
 herdr workspaces can coexist. `wk doctor` reports the backend and whether
 herdr's Claude integration (which feeds agent states) is installed.

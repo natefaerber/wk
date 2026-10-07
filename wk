@@ -1300,6 +1300,26 @@ HERDR_LAPTOP_AGENT_RATIO = 0.7    # agent over work — narrow screens stack
 HERDR_MINIMAL_AGENT_RATIO = 0.68  # agent | work
 
 
+# herdr's sidebar can show values programs post on a workspace (`$name` in its
+# `[ui.sidebar.spaces] rows`). wk posts `wk_issue`; the plugin's hook posts
+# `wk_task` under its own source, so the two never overwrite each other.
+HERDR_METADATA_SOURCE = "wk"
+
+
+def herdr_report_workspace(ws_id: str, branch: str) -> None:
+    """Post the workspace's ticket key to herdr's sidebar. Best-effort: the
+    sidebar is decoration, never a reason to fail building a workspace."""
+    key = issue_key_in_branch(branch)
+    if not key:
+        return
+    try:
+        herdr_call("workspace.report_metadata", {
+            "workspace_id": ws_id, "source": HERDR_METADATA_SOURCE, "tokens": {"wk_issue": key},
+        })
+    except HerdrError:
+        pass
+
+
 def _herdr_leaf(label: str, wt: Path, env: dict[str, str]) -> dict:
     return {"type": "pane", "label": label, "cwd": str(wt), "env": env}
 
@@ -1439,6 +1459,7 @@ def build_herdr_session(
     except HerdrError as e:
         die(f"failed to create herdr workspace {session!r}: {e}")
     ws_id = created["workspace"]["workspace_id"]
+    herdr_report_workspace(ws_id, branch)
     tree = herdr_layout_tree(profile.name, wt, env, herdr_agent_label(agent))
     custom = agent != DEFAULT_AGENT_CMD
     if custom:
@@ -4129,6 +4150,7 @@ def _relayout_herdr_detached(session: str, ws_id: str, tab_id: str, wt: Path,
     # The label is what makes a herdr workspace a wk session; converting a
     # plain workspace means taking it on.
     herdr_call("workspace.rename", {"workspace_id": ws_id, "label": session})
+    herdr_report_workspace(ws_id, branch)
     agent = agent_cmd()
     tree = herdr_layout_tree(profile.name, wt, dict(wk_env_pairs(session, branch, wt)),
                              herdr_agent_label(agent))

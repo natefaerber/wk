@@ -261,6 +261,9 @@ is the session name AND one of its panes was started in a worktree carrying
 (`herdr_call`), one JSON request per connection. On herdr the default agent is
 launched through `agent.start` as a named agent pinned to `.wk/session-id`
 (`claude_session_args`); `wk task --auto` and `wk rebalance` are tmux-only.
+Sidebar values go through `workspace.report_metadata` under two sources —
+`wk` (`$wk_issue`, posted at build) and `wk-hook` (`$wk_task`, posted by
+`hooks/wk_hook.py`) — kept apart so neither overwrites the other's tokens.
 
 ### Orchestrator detection
 Branches in `{main, master, develop, trunk}` (override via

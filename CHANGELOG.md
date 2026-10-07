@@ -7,6 +7,13 @@ from the [GitHub releases](https://github.com/natefaerber/wk/releases).
 
 ## [Unreleased]
 
+### Added
+- **wk values in herdr's sidebar.** wk posts a workspace's ticket key as
+  `$wk_issue`, and the plugin's hook posts the agent's state as `$wk_task`
+  (`running` / `waiting` / `blocked` / `ended`) on every Claude event. Add
+  them to `[ui.sidebar.spaces] rows` in your herdr config to see them; the
+  CHEATSHEET has the snippet. Best-effort: a herdr error never fails a build.
+
 ## [0.10.2] - 2026-10-06
 
 ### Changed

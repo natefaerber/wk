@@ -84,3 +84,29 @@ def test_hooks_json_points_at_the_script():
     for event in ("SessionStart", "UserPromptSubmit", "Notification", "Stop", "SessionEnd"):
         cmd = cfg["hooks"][event][0]["hooks"][0]["command"]
         assert "${CLAUDE_PLUGIN_ROOT}/hooks/wk_hook.py" in cmd
+
+
+def test_inside_herdr_posts_state_to_sidebar(wt, tmp_path):
+    log = tmp_path / "herdr-args"
+    fake = tmp_path / "herdr"
+    fake.write_text(f'#!/bin/sh\necho "$@" >> {log}\n')
+    fake.chmod(0o755)
+    env = {"PATH": "/usr/bin:/bin", "HERDR_ENV": "1", "HERDR_WORKSPACE_ID": "w3",
+           "HERDR_BIN_PATH": str(fake)}
+    r = subprocess.run([sys.executable, str(HOOK)], env=env, capture_output=True, text=True,
+                       input=json.dumps({"hook_event_name": "Notification", "cwd": str(wt)}))
+    assert r.returncode == 0
+    assert log.read_text().split() == ["workspace", "report-metadata", "w3",
+                                       "--source", "wk-hook", "--token", "wk_task=blocked"]
+
+
+def test_outside_herdr_posts_nothing(wt, tmp_path, monkeypatch):
+    monkeypatch.delenv("HERDR_ENV", raising=False)
+    log = tmp_path / "herdr-args"
+    fake = tmp_path / "herdr"
+    fake.write_text(f'#!/bin/sh\necho "$@" >> {log}\n')
+    fake.chmod(0o755)
+    env = {"PATH": "/usr/bin:/bin", "HERDR_BIN_PATH": str(fake)}
+    subprocess.run([sys.executable, str(HOOK)], env=env, capture_output=True, text=True,
+                   input=json.dumps({"hook_event_name": "Stop", "cwd": str(wt)}))
+    assert not log.exists()
