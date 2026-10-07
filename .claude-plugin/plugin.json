@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "wk",
   "description": "Drive wk — a tmux + git-worktree workspace manager — from Claude Code. Ships the /wk skill and workspace hooks (brief at session start, agent state in .wk/status); the wk CLI installs separately (see README).",
-  "version": "0.10.4",
+  "version": "0.10.5",
   "author": { "name": "Nate Faerber" },
   "homepage": "https://github.com/natefaerber/wk",
   "repository": "https://github.com/natefaerber/wk",

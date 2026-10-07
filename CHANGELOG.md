@@ -7,6 +7,8 @@ from the [GitHub releases](https://github.com/natefaerber/wk/releases).
 
 ## [Unreleased]
 
+## [0.10.5] - 2026-10-07
+
 ### Added
 - **`session_names = ticket`: name workspaces after their ticket.** With
   `issue_prefixes` configured, a branch carrying an issue key runs as that key
@@ -240,7 +242,8 @@ The "polish round" — easier to use, more agent-drivable.
 ## [0.4.0] - 2026-06-03
 - See the [v0.4.0 release](https://github.com/natefaerber/wk/releases/tag/v0.4.0).
 
-[Unreleased]: https://github.com/natefaerber/wk/compare/v0.10.4...HEAD
+[Unreleased]: https://github.com/natefaerber/wk/compare/v0.10.5...HEAD
+[0.10.5]: https://github.com/natefaerber/wk/compare/v0.10.4...v0.10.5
 [0.10.4]: https://github.com/natefaerber/wk/compare/v0.10.3...v0.10.4
 [0.10.3]: https://github.com/natefaerber/wk/compare/v0.10.2...v0.10.3
 [0.10.2]: https://github.com/natefaerber/wk/compare/v0.10.1...v0.10.2
